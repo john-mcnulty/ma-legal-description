@@ -1,0 +1,8 @@
+# Normalize to LF in the repository and in the working tree.
+#
+# Everything here is text, and two things break on CRLF regardless of the
+# platform you edit on: the git pre-commit hook (a /bin/sh script, which
+# will not run with CRLF line endings under Git Bash or WSL), and diffs
+# between a Windows author and everyone else. Settling this in the first
+# commit avoids a whole-file line-ending diff later.
+* text=auto eol=lf

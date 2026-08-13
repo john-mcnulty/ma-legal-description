@@ -1,0 +1,24 @@
+# ma-registry — everything, including the optional pieces.
+#     python -m pip install -r requirements-full.txt
+#     python -m playwright install chromium      # <- separate step, see below
+
+-r requirements.txt
+
+# --- Plymouth and Middlesex South only ---------------------------------
+# Those two registries are ASP.NET WebForms sites driven through a real
+# browser (Middlesex South needs a HEADFUL one — it sits behind bot
+# protection that 403s headless browsers on the search POST).
+#
+# Installing this package does NOT install a browser. That second command
+# above is the step people skip, and `--doctor` checks for it specifically
+# because the failure otherwise surfaces mid-run.
+playwright>=1.40
+
+# --- Optional ----------------------------------------------------------
+# anthropic: single-shot API extraction (`--extraction api`), which reads
+#   the deed PDF without round-tripping through your Claude Code session.
+#   NOT needed for any safety check. Without it the plugin runs in
+#   claude-code mode and Claude reads the downloaded PDFs directly.
+# python-docx: `--docx` output. Absent, --docx is skipped with a note.
+anthropic>=0.40
+python-docx>=1.1

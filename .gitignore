@@ -1,0 +1,39 @@
+__pycache__/
+*.pyc
+
+# --- Client data: belt and braces -------------------------------------
+# scripts/scrub_check.py already BLOCKS a commit containing any of these.
+# This list is the second layer, so they never reach the index at all —
+# a .gitignore is not a substitute for the gate (it is trivially bypassed
+# with `git add -f`, and it does nothing about what is already tracked),
+# but between the two, an accident has to defeat both.
+#
+# The reason this matters more than usual: a run writes deed PDFs, page
+# images, a report, a result JSON and a run log into its output folder,
+# and if that folder is ever pointed at a checkout, every one of those
+# files is a recorded instrument tied to a named person and address.
+*.pdf
+*.jpg
+*.jpeg
+*.png
+*.docx
+* - result.json
+*result.*.json
+legal_description_run_log.json
+run_log*
+registry_profile.json
+
+# Never, under any circumstances, the pseudonymization map or the tools
+# that carry the real names. They live OUTSIDE this repository by design.
+*namemap*
+*apply_scrub*
+*verify_scrub*
+*scrub_inventory*
+*PRIVATE*
+
+# Credentials and local environments
+.env
+*.pem
+*.key
+.venv/
+venv/

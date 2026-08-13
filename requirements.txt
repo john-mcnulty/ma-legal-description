@@ -1,0 +1,16 @@
+# ma-registry — REQUIRED dependencies.
+#
+# This is the minimum that makes the tool work, and on its own it gives you
+# a fully functional Norfolk and Barnstable setup: no browser, no API key.
+# Those two counties run on a pure-HTTP engine, and every safety check —
+# deed selection, the registry-abstract wrong-parcel guard, the grantor
+# check and its classification — runs with nothing more than this.
+#
+# For Plymouth, Middlesex South, or the optional extras, use:
+#     python -m pip install -r requirements-full.txt
+#
+# Then confirm what you actually have:
+#     python scripts/legal_desc_fetch.py --doctor
+
+requests>=2.31
+beautifulsoup4>=4.12

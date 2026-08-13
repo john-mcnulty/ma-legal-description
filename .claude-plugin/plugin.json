@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "ma-registry",
+  "displayName": "MA Registry Tools",
+  "version": "0.1.0",
+  "description": "Finds the vesting deed for a Massachusetts property and extracts a paste-ready legal description from the county registry of deeds.",
+  "author": {
+    "name": "John McNulty",
+    "email": "john.mcnulty80@gmail.com"
+  },
+  "license": "MIT",
+  "keywords": [
+    "massachusetts",
+    "registry-of-deeds",
+    "real-estate",
+    "legal-description",
+    "title",
+    "conveyancing"
+  ],
+  "userConfig": {
+    "output_dir": {
+      "type": "directory",
+      "title": "Output folder",
+      "description": "Where reports, legal-description text files, and downloaded deed PDFs are saved. Runs never write anywhere else.",
+      "required": true
+    },
+    "extraction_mode": {
+      "type": "string",
+      "title": "Deed text extraction",
+      "description": "'claude-code' reads the deed PDF in this session (no API key, no extra cost) — the registry search, the wrong-parcel guard and the grantor check never need an API key in any mode. 'api' calls the Anthropic API directly for a faster single-shot run and requires ANTHROPIC_API_KEY. 'auto' uses the API when that key is present and otherwise behaves like 'claude-code'.",
+      "default": "claude-code"
+    },
+    "copy_to_clipboard": {
+      "type": "boolean",
+      "title": "Copy legal description to clipboard",
+      "description": "After a successful run, place the paste-ready legal description on the clipboard for pasting into Word or your document system.",
+      "default": true
+    },
+    "write_docx": {
+      "type": "boolean",
+      "title": "Also write a .docx",
+      "description": "Write the legal description as a Word document alongside the .txt. Requires the python-docx package; silently skipped if unavailable.",
+      "default": false
+    },
+    "show_timings": {
+      "type": "boolean",
+      "title": "Show run timings",
+      "description": "Record how long each stage takes and print a timing summary at the end of the report. Timings stay on your machine and are never transmitted.",
+      "default": true
+    }
+  }
+}

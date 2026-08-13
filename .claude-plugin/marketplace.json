@@ -1,0 +1,30 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "ma-registry",
+  "description": "Massachusetts registry-of-deeds tools for real estate closings.",
+  "owner": {
+    "name": "John McNulty",
+    "email": "john.mcnulty80@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "ma-registry",
+      "description": "Finds the vesting deed for a Massachusetts property and extracts a paste-ready legal description from the county registry of deeds. Runs entirely without an API key.",
+      "author": {
+        "name": "John McNulty",
+        "email": "john.mcnulty80@gmail.com"
+      },
+      "category": "productivity",
+      "keywords": [
+        "massachusetts",
+        "registry-of-deeds",
+        "real-estate",
+        "legal-description",
+        "title",
+        "conveyancing"
+      ],
+      "source": "./",
+      "license": "MIT"
+    }
+  ]
+}

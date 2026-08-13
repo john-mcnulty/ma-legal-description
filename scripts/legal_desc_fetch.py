@@ -1,0 +1,10027 @@
+#!/usr/bin/env python3
+"""
+legal_desc_fetch.py — fast-path for Legal Description Search Workflow
+Version: 3.30
+
+v3.30 changes (two open backlog items, both of the same family — MISSING
+INFORMATION MUST NOT READ AS A NEGATIVE ANSWER):
+
+  1. RESULT WRITTEN TO DISK (`<base-name> - result.json`, item 9b).
+     stdout was the only output channel, so a run that was not redirected
+     — or whose tail overflowed the caller's output limit — lost book,
+     page and grantor_check.needs_review, and the only recovery was
+     re-running the whole search (36% of one bad run's wall clock on the
+     Ellsworth run; it then happened again on Grant). `_write_result_json`
+     writes beside the PDFs before printing. A re-run REFRESHES the file
+     (the re-run is the recovery path, so the never-overwrite rule used
+     for hand-editable deliverables would be exactly wrong here), except
+     that an unsuccessful run will not clobber a successful record — it
+     diverts to a timestamped sibling and says so. Non-fatal throughout.
+     New result field `result_file`.
+
+  2. PER-SEARCH GRANTOR ACCOUNTING + PLYMOUTH PREFIX BROADENING (item 11).
+     Hits are de-duplicated across search names and tagged with the FIRST
+     search that found them, so on a co-owned parcel where both owners
+     signed everything, every line reads "via: <named seller>" and the
+     co-owner pass is indistinguishable from never having run — the Grant
+     / 23 Harrowgate Dr run had to be re-verified by hand before its
+     report could say the co-owner had not conveyed. `grantor_check.searches`
+     now records {name, rows_returned, rows_new, status} per search on
+     BOTH platforms, with a readable note and a report block, so
+     "searched, all rows duplicate" / "searched, zero rows" / "never
+     searched" render differently. Second half: Plymouth's party field is
+     a PREFIX match, so 'GRANT LAUREN S' cannot reach an instrument
+     indexed 'GRANT LAUREN' (49 rows vs 14) — a trailing middle initial
+     is now dropped from Plymouth search names, the broad form being a
+     strict superset that replaces rather than adds a search.
+
+  Header note: v3.29 (server-side grantor date window + all-years lien
+  sweep) shipped without this docstring being bumped; the version line
+  read 3.28 through that release. Its changes are documented inline at
+  the `_grantor_window_start` / `_PLYMOUTH_LIEN_DOC_TYPES` definitions.
+
+v3.28 changes (three gaps from Salgado / 87 Marchmont St Hyannis, 2026-08-12 —
+the run returned the correct deed at exit 0 and still needed three things
+finished by hand):
+
+  1. DEED-GROUP (*DD) FALLBACK FOR A CAPPED GRANTOR SEARCH. The broad
+     surname-only SALGADO search capped at 150 rows, and Barnstable's grantor
+     search is already town-scoped, so v3.20's town-scoped retry had
+     nowhere narrower to go: the check reported INCOMPLETE with no path
+     forward — the exact outcome that machinery exists to prevent.
+     Document type is the other axis. `_alis_grantor_check_http` gains
+     Phase B2: a capped search with no usable town retry (or whose town
+     retry also capped) re-runs restricted to `*DD`, merged not
+     substituted. Complete `*DD` RESOLVES the cap for a broad
+     surname-only search — that search keeps conveyance types only, so
+     nothing it would have kept is missing — and only closes the DEED-OUT
+     question for a full-name search, which stays in incomplete_searches
+     for its non-conveyance rows and says so. New check_meta list
+     `deed_group_retries`. Live: capped/150 -> complete 36 rows.
+
+  2. CO-OWNER SEARCH NAMES FROM THE REGISTRY ABSTRACT
+     (`_alis_abstract_party_pairs`). The v3.14 co-owner check reads
+     `grantees_full`, i.e. the PDF extraction, so it silently never ran
+     when extraction failed — and worse, a co-owner REMOVED by the vesting
+     deed is named only on its GRANTOR side, where `grantees_full` could
+     never have found them. Salgado: grantee "SALGADO, MARIA TERESA",
+     grantors "DESALGADO, MARIA ISABEL" + "SALGADO, MARIA TERESA" — the
+     departing party is indexed under a different surname, so neither the
+     full-name nor the broad surname-only SALGADO search could reach a
+     deed-out by her. The abstract lists every party on both sides in index
+     format, needs no API, and is already fetched. Grantees are always
+     added; grantors only when some party appears on BOTH sides (the
+     re-vesting / co-owner-removal pattern), so an arm's-length seller is
+     never searched. `result["abstract"]` now carries grantors/grantees.
+
+  3. EXTRACTION DEGRADES AFTER A FAILURE THAT WILL RECUR
+     (`_extraction_fatal_reason` + `_mark_extraction_unavailable`). A valid
+     key on an account with no credit returns HTTP 400 "Your credit balance
+     is too low" for every call: v3.27's pre-flight probe passed (the
+     credentials were fine), and the run then made the same doomed call for
+     the main deed and for every candidate sample. A present key is not a
+     usable key. The first account/credential-class failure now latches
+     `extraction_unavailable` on the result; the later extraction sites —
+     the auto-retarget's re-extraction, the grantor-hit samples and
+     --verify-grantor-hit — skip their calls and name the PDFs to Read
+     instead. Transient failures (rate limit, timeout, 5xx) and
+     per-document ones do NOT latch. `extraction_mode` still reports what
+     was resolved pre-flight and `extraction_error` stays set, because this
+     one IS a failure rather than the chosen mode.
+
+  Also: Barnstable VILLAGE names (Hyannis, Centerville, Osterville, …) map
+  to BARN, so a correctly-scoped run stops emitting an "unrecognised town"
+  NOTE; and `_alis_indexed_name_pair` strips every parenthetical group, not
+  only "(&…)", so an index name like "COYNE, MARTIN H. (JR.&AL)" no
+  longer parses to the unsearchable first name "MARTIN H. (JR.&AL)".
+
+v3.27 changes (no-API extraction is a first-class MODE, not a failure):
+  Running without ANTHROPIC_API_KEY used to mean a full search followed by
+  an `extraction_error` — the shape of a broken run. Since v3.22/v3.23 that
+  framing is simply wrong: abstracts and index-based classification moved
+  the wrong-parcel guard, the auto-retarget, the grantor check and the
+  cross-references off the model entirely. The API's remaining job is
+  reading the deed PDFs — which Claude can do directly.
+
+  0. REPO-ONLY: `--deliver-text-file <path>` re-enters v3.19 delivery with
+     the legal description Claude transcribed from the PDFs, so a
+     claude-code run still produces the same three-form .txt (+ --copy /
+     --docx) instead of hand-assembling the paste forms. The note it emits
+     says plainly that the text was not read off the deed by the script.
+  1. NEW `--extraction {auto,api,claude-code}` (default auto) +
+     `_resolve_extraction_mode()`, resolved BEFORE any network work:
+       auto         API when credentials exist, else claude-code with a
+                    friendly note. A key-holder's run is unchanged; a
+                    keyless install now works out of the box.
+       api          Forces the API; missing credentials is a hard,
+                    actionable pre-flight error ("No search was
+                    performed") naming both remedies.
+       claude-code  Skips the API entirely. `extraction_error` stays null
+                    and the notes name the exact PDFs to read.
+     `--no-extract-pdf-text` remains as a deprecated alias. New JSON field
+     `extraction_mode`.
+  2. BUG FIXED, found by the live keyless run: `_anthropic_client()`
+     reported a usable client when there were no credentials. The
+     installed SDK constructs `Anthropic()` happily with ANTHROPIC_API_KEY
+     unset (api_key=None) or empty (api_key='') and only raises at request
+     time, so the probe's own docstring ("may only surface on the first
+     request") described what always happened. It now checks the resolved
+     api_key/auth_token, which is what lets `auto` degrade up front
+     instead of after a full search.
+  3. The notes state honestly what a keyless run keeps and loses:
+     unaffected are the search, deed selection, the registry-abstract
+     address check (wrong-parcel guard + auto-retarget), the grantor check
+     with needs_review classification, cross-references and the PDF
+     downloads; by hand are the legal description from the deed PDFs, and
+     the page-1 sample for any candidate/grantor hit whose abstract
+     carried no address.
+     Live-validated keyless (Kalmar, 33 s): auto-retargeted to the correct
+     Bk 35430/139 over the seller's other same-town parcel, and still
+     flagged the Bk 40928/96 deed-out CRITICAL — identical safety output
+     to the API run, minus the legal description.
+
+v3.26 changes (cross-references consumed + abstract-vs-PDF address check):
+  Four code paths collected the registries' cross-reference lists and NONE
+  of them consumed it: ALIS Recorded `Ref By:`/`Refers to Book:` (v3.22),
+  ALIS Land Court `Parent doc:`/`Related doc:` (v3.25), the Plymouth detail
+  panel's References table (v3.24), and Middlesex South's (v3.8). Each
+  rendered differently, so nothing downstream could read them uniformly.
+
+  1. NEW: _normalize_cross_references() / _classify_cross_reference() /
+     _cross_reference_note(). All four sources normalise to one
+     `cross_references` list: {kind, instrument, book, page, doc_number,
+     certificate, date, direction, source, raw}. `direction` is the part a
+     title reader acts on — `later` (a subsequent instrument references
+     this deed: the homesteads/discharges/deeds recorded against the parcel
+     afterwards), `earlier` (this deed's prior deed or Land Court parent
+     certificate), `related`. `kind` buckets the instrument text
+     (discharge / homestead / deed / mortgage / death_cert / probate /
+     assignment / lien / plan / taking / notice / other — longest needle
+     first, so DISCHARGE beats DIS). An unparseable line is still returned
+     with `raw` set and the rest null: dropping a cross-reference is the
+     same "missing information read as absence" mistake as v3.20's null
+     addresses.
+  2. Report gains a **Recorded Cross-References** table (its own section —
+     it is a lead list, not a finding).
+  3. SCOPE UNCHANGED, and stated in the output: this workflow does not
+     verify discharges. A discharge-type cross-reference is the index
+     saying such an instrument exists, NOT proof a mortgage was
+     discharged; both the note and the report say so explicitly. The
+     consumers are /title-rundown and the discharge search.
+  4. Abstract-vs-PDF address disagreement is now flagged (WARNING). Both
+     addresses have been reported since v3.22 and have always agreed; a
+     disagreement means a misindexed abstract or a wrong-parcel PDF, and
+     must not pass silently because one of the two matched. Compared on
+     the street parsed from --base-name (loose containment when none).
+
+v3.25 changes (Land Court abstracts — the keying was in the ABS icon's href):
+  v3.22/v3.23 abstracts were Recorded Land only, because probing the Land
+  Court abstract with the Recorded Land parameters returned HTTP 500 and
+  the working keying was unknown. Discovered 2026-08-12 by reading the ABS
+  icon's href off a live LC results page (pure HTTP, no browser): the LC
+  abstract uses the SAME recording-date + control-number keying, just
+  `WSIQTP=LC09A` + `WSKYCD=D` instead of `LR09A`/`B` (the href's extra
+  `W9IMID`/`W9ABR` params are optional). Confirmed identical on Norfolk
+  and Barnstable.
+
+  1. _alis_abstract_url() now builds the LC URL for land_court rows;
+     _alis_parse_abstract_html() routes pages without "Bk-Pg:" to the new
+     _alis_parse_lc_abstract_text() (own label vocabulary: Address:/Descr:/
+     Grantor:/Grantee:/Consideration:/Ctf#:/Doc date:, with Address
+     PRECEDING Town — the Recorded Land page pairs them in the opposite
+     order; multi-group documents repeat the block). Same output shape,
+     plus `certificate` (numeric Ctf# only — "See parent list" stays None)
+     and refs from Parent doc:/Related doc: (the parcel's chain).
+  2. Everything gated on the old "" URL simply turns on for Registered
+     Land: the selected-row STEP 2.5 abstract (address verification with
+     no PDF and no API — closes the wrong-parcel-guard gap for Land Court,
+     the Kilbride failure surface), candidate resolution, grantor-hit
+     samples, and v3.23 classification (LC rows previously classified from
+     town/type/date only). certificate_of_title fills from the abstract's
+     Ctf# when the index row lacked one.
+  3. Live samples that drove the parser: Norfolk Doc 1183426 — the
+     Kilbride / 29 Fox Meadow Road deed itself (Address, Ctf# 174905,
+     consideration, parties, Parent doc 438,116); Barnstable Doc 982447
+     (COC: no Consideration, non-numeric Ctf#, Related doc + Parent doc).
+     Fixture: abstract_fixtures/lc_abstract_norfolk_doc1183426.html, test
+     alis_lc_abstract_test.py.
+
+v3.24 changes (Plymouth detail-panel References — user-pointed, 2026-08-12):
+  The Plymouth detail panel was already read for the full grantor/grantee
+  list and Consideration, but its References cross-ref list (later
+  homesteads, discharges, death certificates and related deeds recorded
+  against the selected deed) was parsed on Middlesex South (v3.8) and the
+  ALIS abstracts (v3.22 `refs`) yet dropped on Plymouth — the one registry
+  reading the panel without it. _read_detail_panel now returns
+  `references`; the Plymouth result gains `detail_references` + a
+  "Detail panel references" note. Free title signal for the discharge
+  workflow; no extra navigation (same panel, one more slice).
+
+v3.23 changes (ALIS grantor-hit classification — the common-name pile, ALIS
+edition):
+  The v3.20 town-scoped retries made the ALIS grantor check COMPLETE but
+  left it unreadable on a common name: the Keegan live run (2026-08-12, log
+  2026-08-12-003) returned 322 instruments in grantor_check.deeds, and
+  unlike Plymouth (v3.21) there was no classification — every row had to be
+  read by hand. The blocker was always that the ALIS index has no address
+  column; v3.22 removed it, because the Document Abstract answers "which
+  parcel?" for one GET per hit, no PDF and no model call.
+
+  1. NEW: _alis_classify_grantor_hit / _alis_grantor_sort_key /
+     _alis_grantor_hit_str / _alis_finalize_grantor_check /
+     _alis_classify_fetch_abstracts — the Plymouth v3.21 trio ported to the
+     ALIS path, sharing the same tier names, tags, needs_review rule, and
+     JSON shape (grantor_check.needs_review + .summary) so both registries
+     read identically. Hit lines gain the abstract address and a parcel tag.
+  2. Abstracts are fetched IN PARALLEL (8 workers, own Session each) for the
+     rows an address can actually reclassify: post-acquisition conveyance
+     hits (the deed-out candidates) and rows in the subject town. Cap
+     _ALIS_CLASSIFY_ABSTRACT_CAP = 250 — deliberately NOT the 5-hit
+     _GRANTOR_HIT_SAMPLE_CAP, which now only bounds PDF sampling (still the
+     fallback for blank-Addr rows). Rows beyond the cap classify from
+     town/type/date alone, which errs toward needs_review.
+  3. NOTHING IS DROPPED (v3.11 rule): full-name hits carry the seller's own
+     mortgages/homesteads/liens and are classified and ordered, never
+     filtered. A row with no abstract address is NEVER "a different parcel"
+     on that basis alone (the Keegan/v3.20 lesson) — it is parcel-unknown and
+     stays in needs_review when its town matches (or it is a post-acq
+     conveyance). The index Desc cell can only ESCALATE a hit to
+     possible_subject, never dismiss one.
+  4. The STEP 8 _hit_address_note closure is hoisted to module level
+     (_alis_hit_address_note) so classification and sampling emit identical
+     CRITICAL / POSSIBLE / UNVERIFIED wording; rows classification already
+     assessed are marked so the sampler does not duplicate their notes, and
+     the sampler reuses classification's cached abstracts instead of
+     re-fetching. Sampling now runs on the sorted rows, so the 5-sample
+     budget goes to the most relevant conveyance hits.
+  5. Report: the GRANTOR CHECK section leads with the needs_review set, then
+     the full tagged list. Fixed in passing: "POSSIBLE SUBJECT PROPERTY"
+     notes (v3.16) were missing from the report's note-prefix filter and
+     never rendered as flags.
+  6. SPEED — the v3.20 regression fixed. The Keegan validation ran 4m39s
+     against the 25–65s benchmark because three capped county-wide grantor
+     searches each re-ran town-scoped at up to 20 pages, serially.
+     _alis_grantor_check_http now fetches in parallel (Phase A: live
+     county-wide searches; Phase B: scoped retries; own Session + own notes
+     list per worker) and merges serially in pair order, so notes, dedupe
+     order and via-labels stay deterministic. The retry is never skipped
+     based on the truncated county-wide set's contents.
+  7. Connection-refused now maps to registry_unavailable: a hard-down
+     registry (TCP refused — observed Norfolk 2026-08-11/12, WinError
+     10061) raises AlisRegistryUnavailableError from _alis_http_get exactly
+     like the v3.17 nightly-backup maintenance page, so the run exits 1
+     with status registry_unavailable ("retry later, conclude nothing")
+     instead of a generic error.
+
+v3.22 changes (ALIS Document Abstract — the address was in the index all along):
+  The workflow had an explicit rule to SKIP the ALIS Document Abstract page
+  ("all required metadata is on the results and image list pages"). That
+  enumeration — Bk/Pg, date, parties, page count — missed the one field that
+  matters most for parcel identification: `Addr:`. Meanwhile v3.14/3.15 were
+  downloading a page-1 PDF and paying a vision-model call per candidate and
+  per grantor hit to re-derive exactly that.
+
+  Worse, the derived version has a failure mode the index does not. Keegan
+  Bk15978/412's page 1 reads only "SEE ATTACHED FULL LEGAL", so its sampled
+  address came back null and the candidate was silently dropped — the entire
+  v3.20 defect. Its abstract carries "Town: WEYMOUTH  Addr: 402 SEDGEFIELD STREET"
+  as plain text. One GET would have prevented it.
+
+  1. NEW: _alis_abstract_url() / _alis_parse_abstract_html() /
+     _alis_fetch_abstract_http() / _alis_abstract_address_strings(). The
+     abstract URL is keyed by recording date + control number, both already
+     parsed off the results grid, so no extra navigation is needed. Parsing
+     is positional over the page's labels, which handles repeated Town:/Addr:
+     pairs (multi-parcel deeds — Bk5311/226 lists two) and missing fields
+     alike. Also yields Doc$ consideration, page count, grantors/grantees and
+     the Ref By:/Refers to Book: cross-references.
+  2. CANDIDATES: the abstract is consulted BEFORE any PDF work. When it names
+     an address there is nothing left to learn from a page-1 scan, so both the
+     download and its model call are skipped; when it does not (the `Addr:`
+     field is often blank — Bk11873/154 has none), the run falls through to
+     the existing page-1 sample and, still, v3.20 deep sampling. An absent
+     address means UNVERIFIED, never "a different parcel".
+  3. GRANTOR HITS: same treatment, and this is where the saving is largest —
+     assessing 5 hits cost 5 downloads + 5 vision calls purely to ask "which
+     parcel?". Live Keegan run: 4 of 5 answered from the abstract.
+  4. THE WRONG-PARCEL GUARD NO LONGER NEEDS THE CLAUDE API. STEP 6 was gated
+     on PDF extraction having succeeded; it now runs whenever any address is
+     available from either source, so the guard survives
+     --no-extract-pdf-text, a missing ANTHROPIC_API_KEY, and extraction
+     failure. This is what makes the planned no-API extraction mode safe.
+  5. New result fields: `abstract` (url/addresses/consideration/pages/refs)
+     and `deed_property_address_abstract`; each candidate and grantor-hit
+     sample gains `abstract_addresses` + `abstract_url`. `consideration` is
+     filled from Doc$ when the index and PDF did not supply it.
+  Fixed in passing: the AUTO-RETARGETED note read the address out of
+  `sample_extraction` and so printed None for candidates the abstract had
+  resolved without a sample; it now reports the address actually used and
+  names its source.
+
+  RECORDED LAND ONLY. The Land Court abstract is keyed differently and returns
+  HTTP 500 for these parameters (probed live 2026-08-12); Land Court rows fall
+  through to the existing sampling path untouched.
+
+  Live-validated 2026-08-12 on the Keegan run that produced the v3.20 defect:
+  correctly selected Bk 15978/412, 4 of 6 candidates and 4 of 5 grantor hits
+  resolved from abstracts, and the abstract's "196 BRAMBLETON LANE, MILTON"
+  independently agreed with a sibling instrument's PDF-extracted address.
+
+v3.21 changes (Plymouth grantor-check classification — the common-name pile):
+  Found live 2026-08-12, James Merrick / 52 Kingsbury Rd, Hingham. The Plymouth
+  grantor check returned 93 instruments for `MERRICK JAMES` — roughly forty of
+  them 1870s Hull deeds belonging to a 19th-century namesake, the rest other
+  parcels and other towns spanning 1762–2026 — with no filtering, ordering or
+  tagging of any kind. Every row had to be assessed by hand. Exactly three
+  touched the subject parcel, and none of those was a conveyance.
+
+  The ALIS engine has had conveyance-type and pre-acquisition-date filters
+  since v3.11/v3.16; the Plymouth path never got them. Ported here, and
+  strengthened: the Plymouth results grid carries a street + town cell per
+  row, so the parcel question is answerable straight from the index with no
+  PDF sampling at all (the ALIS index has no address, which is why v3.15/3.16
+  had to download page-1 samples to ask the same question).
+
+  NOTHING IS DROPPED — Plymouth runs full-name searches only (named seller +
+  each grantee off the deed), and per the ALIS rule a full-name hit is kept
+  regardless of type or date, because the seller's OWN mortgages, homesteads
+  and liens arrive through exactly those searches. Hits are CLASSIFIED and
+  ORDERED instead:
+
+  1. _plymouth_classify_grantor_hit() tags each hit with a parcel tier —
+     subject / possible_subject (street name matches, number unconfirmed) /
+     unknown_same_town / other_same_town / other_parcel / other_town — plus
+     pre_acquisition and conveyance booleans. A row with NO indexed address is
+     never treated as a different parcel on that basis alone; it is only
+     deprioritised when its TOWN also differs (the Keegan lesson from v3.20:
+     missing information is not a non-match).
+  2. needs_review = any hit at (or not excludable from) the subject parcel, OR
+     any conveyance-type instrument recorded on/after the acquisition date —
+     the two ways a deed-out can present. New JSON: grantor_check.needs_review
+     and grantor_check.summary (tier counts). grantor_check.deeds still holds
+     EVERY hit, now ordered most-relevant first with a tag appended per line.
+  3. A conveyance at the subject parcel recorded on/after acquisition emits a
+     CRITICAL note (the deed-out this check exists to find); a non-conveyance
+     there emits an encumbrance note instead, so a homestead is not mistaken
+     for a conveyance.
+
+  On the Merrick set this cuts the review pile from 93 rows to 5 — the three
+  subject-parcel homestead declarations plus the two post-acquisition Brockton
+  instruments (a different parcel, but a post-acquisition conveyance, so it is
+  surfaced rather than assumed away). Regression-tested offline against the
+  real 93-hit result set (tools/plymouth_grantor_filter_test.py).
+
+  Classification requires a street parsed from --base-name. Entity/trust
+  sellers with no parseable street fall back to pre-v3.21 behaviour: every hit
+  reported unclassified, with a note saying so.
+
+v3.20 changes (Keegan/402 Sedgefield St Weymouth fixes — unverifiable candidates
+and the grantor-check pagination cap):
+  Found live 2026-08-10, Richard Keegan / 402 Sedgefield St, Weymouth (Norfolk).
+  The run returned the SUPERSEDED 1998 purchase deed (Bk 11873/154) at
+  exit 0 with no warning; the operative deed was the 2002 re-vesting deed
+  Bk 15978/412 (Keegan & Keegan → themselves, tenants by the entirety).
+
+  1. NULL SAMPLE ADDRESS = UNVERIFIABLE, NOT A NON-MATCH. The 2002 deed's
+     page 1 read only "SEE ATTACHED FULL LEGAL"; its address lived on an
+     attached exhibit page the candidate page-1 sample never downloaded,
+     so sample_extraction.property_address came back null and the v3.14
+     auto-retarget silently dropped the candidate. The only candidate that
+     self-described its address was the older deed, which won by default.
+     Now: candidates with no sampled address are deep-sampled
+     (_alis_extend_candidate_samples — first _CANDIDATE_SAMPLE_MAX_PAGES
+     pages, light extraction over all of them) before matching, and any
+     candidate that STILL has no address triggers an explicit
+     WARNING/CRITICAL note naming it (CRITICAL when it is recorded later
+     than the selected deed and could supersede it).
+
+  2. MULTIPLE ADDRESS MATCHES ARE RANKED BY RECORDED DATE. Several
+     matching candidates are the same parcel's chain of deeds to this
+     owner (purchase deed + later re-vesting deed); the most recently
+     recorded match is selected as the operative vesting instrument
+     (previously: gave up and asked for a manual --book/--page pick).
+     Falls back to the manual note when dates are missing or tied. New
+     helper _alis_same_party_reconveyance(): grantor == grantee on the
+     selected candidate (Keegan: 'KEEGAN, RICHARD H' → 'KEEGAN, RICHARD H.')
+     is flagged as a re-vesting deed — affirmative evidence it supersedes
+     the purchase deed.
+
+  3. TOWN-SCOPED RETRY WHEN THE GRANTOR CHECK CAPS. On a common name the
+     county-wide grantor search (Norfolk uses town=*ALL by design) hit the
+     5-page/150-row cap on all three Keegan searches — and a truncated
+     check cannot support a clean-title statement. Now _alis_search_http
+     reports truncation via `meta`, and _alis_grantor_check_http re-runs a
+     capped search scoped to the subject town (retry_town, cap
+     _ALIS_RETRY_MAX_PAGES=20 pages) and MERGES the results — the *ALL
+     pass is kept, not replaced (it catches a seller who moved within the
+     county). Keegan town-scoped: 69 and 31 rows, complete. A deed-out of
+     the subject parcel is indexed under the subject town, so a complete
+     scoped pass closes the subject-parcel question. grantor_check gains
+     capped_searches / incomplete_searches; a zero-hit check with an
+     incomplete search renders as CRITICAL "Grantor check INCOMPLETE" in
+     the report, never as "Clean".
+
+v3.19 changes (Step 7 delivery — paste-out forms, clipboard, .docx):
+  On a successful run with a populated legal_description, main() now performs
+  the skill's Step 7 for EVERY registry (central hook, non-fatal):
+  _deliver_legal_description() writes "Legal Description - <base_name>.txt"
+  containing three labelled forms — verbatim (line breaks preserved),
+  paste-ready, and paste-ready + "For title, see ..." derivation clause
+  (Recorded Land Bk/Pg wording vs Land Court Doc#/Certificate wording;
+  missing values become ___ blanks, never guesses).
+
+  The paste-ready reflow (_reflow_legal_description) is CONSERVATIVE —
+  whitespace only: hard-wrapped lines joined (blank-line paragraph breaks
+  kept, so multi-parcel descriptions survive), line-break hyphen splits
+  rejoined, space runs collapsed, curly quotes / primes / dashes / exotic
+  spaces normalized to ASCII. It never corrects spelling, expands
+  abbreviations, fixes apparent OCR errors, or re-punctuates — a silently
+  "improved" metes-and-bounds call is invisible in review and wrong in a
+  recorded instrument.
+
+  --copy places the paste-ready form on the clipboard via OS-native tools
+  (PowerShell Set-Clipboard reading a UTF-8 temp file / pbcopy /
+  xclip|xsel|wl-copy — no pip dependency). --docx also writes a .docx via
+  python-docx (skipped with a note if the package is absent). New JSON
+  fields: txt_file, docx_file, clipboard_copied, legal_description_paste_ready.
+  Existing .txt/.docx files are never overwritten (same policy as the report
+  draft); every delivery failure is a note, never a run error.
+
+v3.18 changes (Avenu server-side truncation detection — silent wrong parcel):
+  Found live 2026-07-28, Town of Hingham / 319 Halstead St, Hingham. A grantee
+  search on a MUNICIPALITY returned exactly 1000 rows — the registry's
+  server-side result cap — and the script reported a deed from it at exit 0
+  with no warning at all.
+
+  Two things make this dangerous, and neither was detected:
+    1. The cap is applied BEFORE the Rec Date sort. Sorting therefore only
+       reorders the OLDEST 1000 rows; every newer instrument, including the
+       vesting deed, never reaches the browser. The newest row in that sorted
+       set was from 1981.
+    2. Because the cap is applied server-side, page 10 has no Next link — so
+       the pager walk terminated by exactly the same signal as a genuine last
+       page. The existing `capped` warning only fires when Next STILL EXISTS at
+       max_pages, so it stayed silent.
+  ~870 of the 1000 rows were town-wide TKG/TAKING/NOTC/ESMT municipal
+  instruments. From what was left the script selected DEED Bk 4102/519 (Bouve
+  family -> Hingham Town Of, 6/27/1980) — a real deed for an unrelated parcel —
+  with selected_row_is_not_a_deed=false and no warning. None of the existing
+  guards can catch this: the town/street filters test rows that were RETURNED,
+  and the grid's addr cell is empty on old municipal rows.
+
+  Fix: _read_all_result_rows_paginated() now detects truncation on two
+  independent signals — the site's own banner ("Your search results have been
+  limited to the first 1000 records", read via _avenu_truncation_banner() while
+  a results page is still on screen) and a row count reaching _AVENU_ROW_CAP
+  (1000). Either sets the new result field `results_truncated_at_cap` and emits
+  a CRITICAL note saying the set is unusable for deed selection. The flag is
+  STICKY: run_plymouth passes one result dict to every search it runs, and a
+  clean address-search retry must not erase an earlier truncated name search.
+  Wired into all three Plymouth paginated reads (grantee search, street/town
+  mismatch address retry, v3.3 address fallback).
+
+  Claude-side handling: treat a truncated result set as UNVERIFIED regardless
+  of exit code — do not report a deed selected from it. Narrow the search
+  (property address search, or a more specific party name). When the address
+  index has no deed either, trace the chain from the prior record owner named
+  on an MLC / tax lien / 6(d) certificate at the address, and check Registered
+  Land (Land Court), which the fast path does not search.
+
+v3.17 changes (registry maintenance-page detection — false deed_not_found fix):
+  Found live 2026-07-16 (~11:30 PM ET), Laura Bennett / 190 Ridgemont Rd
+  Dennis Port: the Barnstable registry was offline for its nightly backup and
+  served a 264-byte HTTP 200 maintenance page ("The Barnstable Public Search
+  program is currently unavailable due to nightly backup or periodic
+  maintenance") for every request. Both engines parsed it as zero result rows
+  and returned deed_not_found / exit 2 — a FALSE NEGATIVE for a seller with a
+  recorded deed (Bk 37211/188, found by the same search in May 2026). On an
+  unattended run this would have produced a "no deed found for the named
+  seller" conclusion on a real closing file.
+
+  Fix: _alis_registry_unavailable_html() detects the Browntech outage page
+  (small HTML body containing "currently unavailable" + "maintenance"/
+  "backup"). The HTTP engine checks every response in _alis_http_get — the
+  single choke point for search pages, pagination, grantor checks, and PDF
+  downloads — retries in case the window is just closing, then raises
+  AlisRegistryUnavailableError. The dispatch maps that to a new status
+  `registry_unavailable` (exit 1) WITHOUT the auto Playwright fallback (the
+  browser would load the same page and false-negative identically). Both
+  Playwright runners check page content after the grantee-search goto for
+  the same reason. Norfolk runs identical Browntech software and gets the
+  fix through the shared helpers.
+
+v3.16 changes (speed: light-model sampling, post-acquisition sample gate,
+search/extraction overlap, script-generated report draft):
+  Four latency fixes, approved 2026-07-16. The registry interaction was
+  never the bottleneck — the multimodal extraction calls and the chat-side
+  report composition were.
+
+  1. LIGHT MODEL FOR PAGE-1 SAMPLES. Candidate samples and grantor-hit
+     samples only extract an address and party names from one page — that
+     never needed the main extraction model. They now run on
+     _EXTRACT_MODEL_LIGHT (claude-haiku-4-5) via
+     _extract_pdf_fields_light(), which retries once on the main model on
+     any failure so a light-model hiccup can't blind the address checks.
+     The MAIN deed and --verify-grantor-hit full extractions stay on
+     _EXTRACT_MODEL_MAIN (claude-opus-4-8) — the verbatim legal
+     description is the deliverable and keeps the strongest reader.
+     SAFEGUARD (found live, Renwick Bk39044/162): the light model read the
+     deed-out's address as 'Cloverfield Avenue' with NO street number, which
+     the strict number+name match would have dismissed as a different
+     parcel — a false reassurance on a genuine deed-out. Two fixes: the
+     address comparison gained a middle tier (street-NAME match without a
+     confirmable number → "POSSIBLE SUBJECT PROPERTY ... treat as a
+     likely deed-out until verified", never "different parcel"), and any
+     light-model sample landing in that tier is re-extracted with the
+     main model before the note is emitted.
+
+  2. GRANTOR-HIT SAMPLES: PRE-ACQUISITION HITS NOT SAMPLED. A conveyance
+     recorded before the seller acquired the subject property cannot be a
+     deed-out of it. Renwick live run: 3 of 5 sampled hits (1996 Tarrant Dr,
+     2016/2017 Selkirk St) predate the 06-30-2017 acquisition — three
+     extractions that could not change the answer. Such hits stay in
+     grantor_check.deeds (full-name hits are still reported regardless of
+     date) but no longer get a sample download + extraction. Hits whose
+     date fails to parse are still sampled (safe default).
+
+  3. GRANTOR SEARCHES OVERLAP EXTRACTION. v3.14 serialized the grantor
+     check after extraction so the retarget and co-owner names could feed
+     it — but the USER-NAME and BROAD-SURNAME searches depend on neither.
+     STEP 4.5 now prefetches those two searches on a worker thread (own
+     requests.Session) while the extraction API calls run; STEP 7 joins,
+     reuses the prefetched rows, and only the indexed-name / co-owner
+     searches still hit the registry serially. All filtering (acquisition
+     exclusion, pre-acq drop) still happens at STEP 7 with the FINAL row,
+     so the retarget-correctness reasoning from v3.14 is unchanged.
+     Prefetch fails soft: on any error the check just searches live.
+
+  4. SCRIPT-GENERATED MARKDOWN REPORT DRAFT. When the run succeeds with a
+     populated legal_description, _write_markdown_report() renders the
+     Step 6 report ("Legal Description - <base_name>.md", the skill's
+     documented structure: LEGAL DESCRIPTION / Deed Metadata / Title
+     Flags / Screenshots Saved) directly into the output folder and
+     reports it as result["report_file"]. The Title Flags section is
+     assembled from the extraction title_flags, a multi-grantee
+     all-must-sign flag, the grantor-check hits + sample address
+     assessments, and the address-verification/auto-retarget notes — each
+     tagged for attorney review. The draft carries a "DRAFT — generated
+     by legal_desc_fetch.py; review before sending" marker: Claude's job
+     shrinks to reviewing/adjusting judgment calls instead of composing
+     the whole report token-by-token. An existing report file is NEVER
+     overwritten (a re-run after manual edits must not destroy them) — a
+     note says so and the run proceeds without a draft.
+
+v3.15 changes (ALIS grantor-check hits become fetchable — samples + targeted
+verification):
+  From the Brandt run (2026-07-13): the grantor check correctly surfaced a
+  real deed-out (Bk36890/431, Brandt → Almeida) but confirming it required
+  hand-rolled requests calls outside the script — --book/--page only matches
+  rows from the GRANTEE-search candidate list, and grantor_check.deeds were
+  text strings with no image behind them. Two additions (HTTP engine only):
+
+  1. AUTO-SAMPLE OF CONVEYANCE-TYPE GRANTOR HITS. Every grantor-check hit
+     whose doc_type is a conveyance (same _is_non_conveyance_instrument
+     test the candidate guard uses; blank types excluded) gets a page-1
+     sample PDF (label "grantorhit_Bk<b>_Pg<p>" / "grantorhit_Doc<n>") and
+     a light extraction (_GRANTOR_HIT_SCHEMA: property_address, lot_or_unit,
+     grantors, grantees), capped at 5 hits with a truncation note. Results
+     land in grantor_check.samples (grantor_check.deeds strings unchanged).
+     Each sampled address is compared against the street parsed from
+     --base-name: a match emits a CRITICAL "conveys the SUBJECT property"
+     note (a genuine deed-out of the subject parcel); a non-match emits a
+     "different parcel" note. Mirrors the multiple_deed_candidates
+     sample_file/sample_extraction mechanism.
+
+  2. --verify-grantor-hit BOOK/PAGE (Land Court: document number). Fully
+     fetches ONE grantor-check hit — all pages downloaded + full
+     _DEED_SCHEMA extraction — into the new result field
+     grantor_hit_verification (index metadata, files, extraction, and the
+     same subject-address comparison). The hit must appear in the grantor
+     check's results (same searches, exclusions, and pagination caps); if
+     it doesn't, a note lists the hits that were found. Combine with
+     --book/--page to keep the main deed selection pinned on re-runs.
+
+  Both are non-fatal: sampling/verification errors append notes and never
+  break the main result. STEP 8 in run_alis_http, after the grantor check.
+
+v3.14 changes (ALIS auto-retarget by extracted address + co-owner grantor check):
+  The two approved follow-ups to the v3.10 inline PDF extraction. Both close
+  manual steps that v3.10 exposed (HTTP engine only, like v3.9's
+  multi-candidate plumbing they build on).
+
+  1. AUTO-RETARGET BY EXTRACTED ADDRESS. When multiple_deed_candidates
+     fires, the script already extracts every candidate's property address
+     from its page-1 sample — but kept the most-recent-deed heuristic's pick
+     anyway, so Claude had to notice the mismatch and re-run with
+     --book/--page (a second ~55s invocation; Renwick 2026-07-11, Brandt
+     2026-07-13). Now, after extraction, the MAIN deed's extracted address
+     is checked against the street parsed from --base-name
+     (_parse_street_from_base_name — the v3.12 Plymouth guard's parser):
+       - match → "Address verified" note, done;
+       - mismatch and EXACTLY ONE candidate's sample_extraction address
+         matches → the script re-runs image-list/download/extraction for
+         that instrument in the same invocation (STEP 3+4 refactored into
+         _alis_fetch_deed_files() so it can run twice), swaps the top-level
+         fields, demotes the heuristic pick to selected:false in
+         multiple_deed_candidates (its page-1 file + extracted address are
+         preserved there), and emits a loud "AUTO-RETARGETED" note;
+       - zero or several matches → prior behavior + a note telling Claude
+         to pick via the sample extractions.
+     Guard rails: fires only when a street parses from --base-name, never
+     when --book/--page was passed, never when the main-deed extraction
+     failed. Retargeted files are saved under "deed_Bk<b>_Pg<p>" (Land
+     Court: "deed_Doc<n>") so the wrong pick's files are not overwritten.
+     New result field: auto_retargeted (bool). Single-candidate runs get
+     the same address check as a note-only signal ("Address verified" /
+     "ADDRESS MISMATCH ... nothing to retarget to").
+
+  2. CO-OWNER NAMES FROM THE DEED FEED THE GRANTOR CHECK. The grantor check
+     searched (a) the user-supplied seller name, (b) the exact indexed
+     grantee name from the selected row, (c) broad surname (Recorded Land
+     only). A co-owner with a DIFFERENT surname who conveys alone was
+     invisible; on Land Court even same-surname co-owners were missed (no
+     broad search there, and the LC index shows one grantee + "(&AL)").
+     v3.10's grantees_full has every co-owner's full name from the deed
+     itself (Kowalczyk → ["Tomasz Adam Kowalczyk", "Marta Lynn Kowalczyk"]).
+     Each entry is parsed to a (LAST, FIRST) pair
+     (_grantee_full_name_pair: natural order, capacity language and
+     generational suffixes stripped, entity/trust names skipped), deduped
+     against pairs already covered by an existing full-name prefix, and
+     searched like any full-name pair — hits tagged
+     "via: <LAST>, <FIRST> (co-owner from deed)". This fulfills the
+     "Plymouth model" from the retired Land Court grantor-check spec.
+
+  ORDERING: extraction now runs BEFORE the grantor check (STEP 5, was
+  STEP 6). The two were sequential anyway, so this costs nothing and buys
+  both features their inputs: the auto-retarget must finish before the
+  grantor check so the check runs against the CORRECT acquisition
+  instrument (indexed grantee name + acquisition-date/book exclusions all
+  come from the selected row), and the co-owner pairs only exist after
+  extraction. _alis_grantor_check_http() accepts an optional third
+  per-pair element carrying an explicit via-label.
+
+v3.13 changes (Plymouth pagination — the results grid was only ever page 1):
+  The Avenu grid defaults to 20 rows/page.  Every Plymouth read took the first
+  page and stopped, so on a busy seller or a busy street the older instruments
+  — including the vesting deed — were simply invisible.  Live proof
+  2026-07-13: a grantee search for GRANT PETER reports "122 rows"; the script
+  saw 20.
+
+  The v3.7 "pager walk" that was supposed to prevent this never ran: it looked
+  for standard ASP.NET 'Page$N' GridView links, and this grid has none.  Its
+  real controls (found live) are __doPostBack targets
+  DocList1$PageView100Btn (100 rows/page) and DocList1$LinkButtonNext.  The
+  walk was dead code in every caller, including the grantor check.
+
+  - _read_all_result_rows_paginated() rewritten: switches to 100 rows/page,
+    then follows Next until it disappears (the last page renders 'Previous'
+    but no 'Next').  Rows are tagged with `_pager_page`.  Caps at 10 pages
+    (= the site's own 1000-row limit) and warns if the cap is hit.
+  - _read_all_result_rows() now scans to ctl102 (was ctl51) — at 100 rows/page
+    the old cap would have dropped half of every full page.
+  - The grantee search, the street/town-mismatch address retry, and the v3.3
+    address fallback all read paginated now (previously page 1 only).  The
+    grantor check inherits the fix for free.
+
+  ORDER OF OPERATIONS MATTERS (both learned live):
+  - Page size BEFORE sort.  The 100/Page postback re-renders from the default
+    index order and DISCARDS the Rec Date sort.
+  - Waits must key on CONTENT, not on selectors.  Every one of these controls
+    is an UpdatePanel postback, and the OLD grid keeps satisfying
+    'ctl02 exists' / networkidle while the stale rows are still on screen — so
+    the previous waits returned early and callers read pre-postback data.  New
+    _avenu_grid_fingerprint() / _avenu_wait_for_grid_change() block until the
+    rendered rows actually change.
+
+  - _sort_results_by_date_desc(): direction is now validated by REC DATE, not
+    by book number.  Plymouth book numbers are non-monotonic with date (v2.7's
+    own finding), so the old b02<b03 check could not tell asc from desc — it
+    reported "descending applied" on a grid that was ascending.  Combined with
+    the stale-read bug above it was clicking the header a second time and
+    toggling the sort back.  Confirmed live: the Rec Date sort is server-side
+    and GLOBAL across the whole result set (page 1 is strictly newer than page
+    2), so it is a real tool for reaching the newest/oldest instrument.
+  - _plymouth_ensure_row_visible(): ctl numbers are unique only WITHIN a pager
+    page, and the walk parks the grid on the LAST page — so clicking a row
+    selected from page 1 by its recorded ctl would open the WRONG deed's detail
+    panel and images.  The selected row is now re-located (replaying the search
+    and paging forward if needed) and its ctl re-derived by instrument identity
+    before any click.
+
+v3.12 changes (Plymouth street-level wrong-parcel detection):
+  Ports the ALIS "retarget by address" idea to Plymouth's grantee name-search
+  path. Plymouth's wrong-parcel guard was TOWN-scoped only: _select_best_row()
+  filtered candidates by town, and run_plymouth() fired the address-search
+  retry only when the selected row's town differed from the expected town. A
+  seller who owns SEVERAL PROPERTIES IN THE SAME TOWN defeated it completely —
+  every candidate matched the town, so the most-recently-recorded deed won
+  regardless of which parcel it conveyed, with exit 0 and no warning.
+  (Reference: Peter Grant, 2026-07-13 — subject property 18 Kestrel Ave,
+  Hingham; the name search selected a DEED for 23 Harrowgate Dr, Hingham. Caught
+  only by the human address check in the skill's Step 6 preamble.)
+
+  - New _street_matches_filter(): substring match of the street-name word
+    parsed from --base-name against the grid's Street cell ("KESTREL" ⊂
+    "18 KESTREL AVE"), tolerating suffix variance (AVE/AVENUE/DR) and the
+    "&OTHERS" multi-parcel marker.
+  - _select_best_row() takes street_filter=: after the town filter, narrows to
+    rows naming the expected street. Falls back to the town-only set when no
+    row matches, so it can only ever disambiguate — never zero out a result.
+  - run_plymouth() now computes town_mismatch AND street_mismatch, and both
+    trigger the SAME existing address-search retry (previously town-only).
+    The street check runs only when the town matched (a town mismatch is the
+    stronger signal and is still reported on its own terms), and unlike the
+    town check it fires even on a single-row result — one row naming a
+    different street is a real wrong parcel, not an abbreviation artifact.
+    Retry notes name which signal fired ("street mismatch" vs "town mismatch").
+  - If a street mismatch is detected but street info can't be parsed for the
+    retry, a loud VERIFY MANUALLY warning is emitted rather than silently
+    returning the wrong deed.
+  - Guard rails: only active when a street name parsed from --base-name (so
+    entity/trust sellers and malformed base-names behave exactly as before);
+    the explicit --force-address-search path is untouched.
+
+  Also in v3.12 — FINAL-SELECTION CONVEYANCE GUARD + new result field
+  `selected_row_is_not_a_deed` (bool). The v3.3 misindexed-name fallback only
+  guards the NAME-search path, so any row reached via an address search (incl.
+  the new street-mismatch retry, and the pre-existing --force-address-search
+  and trust/LLC fallbacks) could report a non-conveyance instrument as the
+  vesting deed with status "success" and no warning — the address-row filter
+  falls back to "using all rows" when the address has no DEED-type row. Now a
+  path-independent check runs on the FINAL selection and emits a CRITICAL note
+  telling Claude not to extract a legal description from it, and to check
+  Registered Land / a misindexed grantee name. Surfaced by the same Grant run:
+  the retry reached the correct parcel (18 Kestrel Ave) but the address index
+  held only MTG/DISCHARGE/ASSIGNMENT rows, so an ASSIGNMENT was selected.
+
+v3.10 changes (inline ALIS PDF extraction via Claude API):
+  Closes the last manual step in Norfolk/Barnstable runs: previously the
+  script returned PDF paths and Claude had to Read each scanned deed to get
+  the legal description, signing date, consideration, etc. — ~30–60 s and
+  several tool calls per run. Now the script extracts those fields itself.
+
+  - ALIS deed PDFs are image-based scans with no text layer (pypdf/pdfplumber
+    return nothing), so extraction calls the Claude API (model
+    claude-opus-4-8, multimodal) via the anthropic SDK. Each deed's page
+    PDFs are sent as base64 document blocks in ONE request; the response is
+    constrained with structured outputs (output_config.format json_schema),
+    so the result is guaranteed-parseable JSON — no text parsing.
+  - Extracted per deed: legal_description (verbatim), property_address,
+    signing_date, consideration, document_number, certificate_of_title
+    (Land Court), grantors_full / grantees_full (full names incl. middle
+    names + trustee capacity), tenancy, prior_deed_reference,
+    recording_stamp (Bk/Pg sanity check), title_flags (trust/divorce/
+    TIC/homestead/estate recitals).
+  - multiple_deed_candidates page-1 samples get a lighter extraction
+    (property address + parties) so the wrong-parcel check needs no Read
+    calls either. Main deed + candidates extract concurrently (threads).
+  - Results land in result["pdf_extraction"]; high-value fields are also
+    promoted to top level (legal_description, signing_date, grantees_full,
+    ...) and fill index nulls (consideration, document_number).
+  - Gated: on by default on the HTTP engine; --no-extract-pdf-text opts
+    out. Fails soft — missing anthropic SDK, missing ANTHROPIC_API_KEY, or
+    an API error sets result["extraction_error"] and adds a note telling
+    Claude to fall back to Reading the PDFs; files are saved regardless.
+
+v3.9 changes (Norfolk audit fixes — pure-HTTP ALIS engine, grantor-check
+pagination + name variants, multi-candidate deed selection):
+  From the 2026-07-09 Norfolk audit (Renwick / 72 Cloverfield Ave Weymouth,
+  run 2026-07-09-003) plus the 2026-05-22 Kowalczyk Land Court grantor-check
+  spec. Three fixes, all ALIS (Norfolk + Barnstable):
+
+  1. PURE-HTTP ENGINE (default). The Browntech ALIS sites need no browser:
+     search results, pagination, Document Image List, and deed PDFs are all
+     plain GETs (verified live on both registries 2026-07-11). New sync
+     `_alis_*_http` helpers on requests + BeautifulSoup and a shared
+     run_alis_http() runner replace Playwright for norfolk/barnstable runs —
+     seconds instead of ~3 min, no browser fragility. `--engine
+     {auto,http,playwright}` (default auto) picks HTTP and falls back to the
+     unchanged Playwright path on hard HTTP failure (e.g. WAF) or missing
+     requests/bs4. Playwright import is now lazy-checked so the HTTP path
+     works without Playwright installed.
+     Mechanics discovered live: results-per-page param WSSRPP (10/20/30 —
+     we request 30); next page = GET WW400R.HTM with the results form's
+     hidden fields + WSIQTP=LR01N (Recorded Land) / LC01N (Land Court),
+     mirroring doVarButton2() in the site's validate.js.
+
+  2. GRANTOR CHECK: pagination + name variants + Land Court full name.
+     ALIS paginates at 10 rows and sorts/groups by the EXACT indexed name
+     string ("RENWICK, MICHELE D" sorts after every "RENWICK, MICHELE"), so the
+     old page-1-only, last-name-only check missed the critical 2020
+     Renwick→Cardoso deed out (Bk 39044/162) and, on Land Court, returned
+     pages of unrelated namesakes (Kowalczyk run — 10 unrelated certificates
+     reported, the seller's real Doc#1462018/1483473 missed).
+     _alis_grantor_check_http() now (a) walks pagination (30/page, cap 5
+     pages/search, with a truncation note if the cap is hit); (b) searches
+     BY FULL NAME — the user-supplied seller name AND the exact indexed
+     grantee name from the selected deed row (carries the middle initial);
+     (c) on Recorded Land ALSO keeps the broad surname-only search (catches
+     same-surname joint owners); on Land Court full-name searches only, per
+     the Kowalczyk spec — the broad search is what produced namesake noise.
+     Results are deduped across searches and each hit is tagged with the
+     search that found it. The acquisition instrument is excluded by
+     book+page (was: book only) / document number.
+
+  3. MULTI-CANDIDATE DEED SELECTION (wrong-parcel guard). When the grantee
+     search yields multiple distinct conveyance instruments (Renwick: heuristic
+     picked the Tara Gardens condo Bk 35507/244 over subject Lot 38
+     Bk 34918/103 — ALIS Desc is too low-signal to disambiguate), the JSON
+     now includes `multiple_deed_candidates` with every candidate's index
+     metadata plus a downloaded page-1 PDF per candidate, so Claude can
+     verify the address on each and re-run with the new `--book`/`--page`
+     args to target the right instrument. HTTP engine only.
+
+v3.5 changes (Plymouth hyphenated / compound-surname retry):
+  - Problem: Plymouth's name search uses a SINGLE combined "LASTNAME FIRSTNAME"
+    field that prefix-matches the concatenated index string. When the seller's
+    true surname is hyphenated (e.g. "WHITFIELD-BARROW"), a search built from a
+    partial surname fails: "WHITFIELD ALAN" does NOT prefix-match the index entry
+    "WHITFIELD-BARROW ALAN D" — after "WHITFIELD" the index continues "-BARROW", not
+    " ALAN". Searching the other component ("BARROW ALAN") fails too, since the
+    index does not begin with "BARROW". Both of the user's runs for 28 East
+    Street, Hingham (seller Alan Whitfield-Barrow, Bk 58120/377) returned 0 rows.
+  - Fix: new _plymouth_compound_surname_retry(). When the combined grantee name
+    search returns 0 results, the script retries with the SURNAME ONLY (no first
+    name). A surname-only search "WHITFIELD" prefix-matches "WHITFIELD-BARROW ..." and
+    returns the row. The returned rows are then filtered by the seller's first
+    name (first token, matched against the grantee Name column, e.g. "ALAN" in
+    "WHITFIELD-BARROW ALAN D") so an unrelated same-prefix surname is not selected.
+    The surviving rows flow through the normal deed-type filter, Python date
+    sort, and town-aware selection unchanged.
+  - Ordering: the compound-surname retry runs BEFORE the trust/LLC address-search
+    fallback, because a name-index match is more precise than an address search
+    and does not depend on parseable street info. If it finds nothing, the
+    address fallback still fires as before.
+  - Result JSON gains "found_via_compound_surname" (bool). The grantor check is
+    unaffected — it already derives names from the detail-panel grantees, which
+    carry the full hyphenated surname ("WHITFIELD-BARROW ALAN D").
+  - SCOPE: Plymouth-only. The ALIS registries (Norfolk/Barnstable) use SEPARATE
+    last/first fields with begins-with surname matching, so a surname component
+    generally already matches a hyphenated surname there; if a live ALIS case
+    ever proves otherwise, port this retry into _alis_* (follow-up).
+  - Reference fix run: 14 Fernwold Street, Hingham (seller "Alan Whitfield", true
+    surname "Whitfield-Barrow", Bk 58120/377).
+
+v3.4 changes (Plymouth misindexed-name / no-deed address fallback):
+  - Problem: a grantee name search can miss the true vesting deed when the
+    registry MISINDEXED the grantee under a misspelled name. On 60 Aldergate St,
+    Middleborough (run 2026-06-23-001) the deed-in (Bk 51338/204) was indexed
+    "HANNIGAN" instead of "HENNIGAN", so the only HENNIGAN grantee hit was a
+    Certificate of Redemption (type "CR"). The script reported the redemption as
+    the vesting deed and never found that the seller had since sold the property.
+  - Fix has two parts:
+      1. Deed-type filtering now also strips tax-title redemptions ("CR"), tax
+         takings ("TT"/"TAX"), municipal lien certificates ("MLC"), easements
+         ("ESMT"), and UCCs — none of which convey title — so they can never be
+         selected as a vesting deed.
+      2. New _is_non_conveyance_instrument() + _plymouth_address_fallback(): if
+         the row selected from the name search is still not a conveyance deed
+         (e.g. only a redemption survived because the real deed is misindexed),
+         the script retries with an address search, which is index-name-
+         independent. The most-recent deed-type row is selected — that is the
+         vesting deed in the normal case, or the OUT-conveyance when the seller
+         has already sold (surfacing that the seller is no longer the record
+         owner). Falls back gracefully with a VERIFY-MANUALLY note when no
+         street info is available or the address search finds no deed.
+  - _is_non_conveyance_instrument() is SHARED across all fast-path registries.
+    Its vocabulary covers both the terse Avenu/20-20 codes (Plymouth/Suffolk:
+    "CR", "TT", "MLC", "ESMT"...) and the spelled-out Browntech ALIS labels
+    (Norfolk/Barnstable: "MORTGAGE", "CERTIFICATE OF REDEMPTION"...). It now
+    backs every deed-type filter: the Plymouth name filter, all three Plymouth
+    address-search filters, and ALIS _alis_select_deed_row(). This stops ANY
+    fast-path county from selecting a redemption/tax-taking/lien as a deed —
+    Norfolk/Barnstable previously excluded only mortgages/discharges/etc. and
+    shared the same latent bug.
+  - SCOPE NOTE: the address-search REMEDY (recovering the deed when a name is
+    misindexed) is still Plymouth-only — there is no ALIS address-search path in
+    the script yet. On Norfolk/Barnstable the shared classifier prevents picking
+    a non-deed but cannot yet recover a misindexed deed; that fallback is a
+    separate follow-up (requires building an ALIS address search + confirming
+    the Browntech sites expose one).
+  - Reference fix run: 2026-06-24-001 (60 Aldergate St, Middleborough).
+
+v3.3 changes (ALIS Land Court column mapping):
+  - _alis_parse_results() now maps result-table columns per registry section.
+    Recorded Land and Land Court share a column layout EXCEPT:
+      * column 1: Recorded Land = Reverse Party; Land Court = Certificate #
+      * column 6: Recorded Land = "Book-Page";   Land Court = "Doc#-Sequence"
+    The parser previously read column 1 as reverse_party and column 6 as
+    book/page for both — so a Land Court row reported the Certificate of
+    Title as the grantor and the Document Number as the book number.
+    Each row now carries a `land_court` flag plus correctly separated
+    `certificate` and `document_number` fields. Downstream consumers
+    (_alis_select_deed_row, _alis_grantor_check, run_norfolk, run_barnstable)
+    branch on the flag; the result JSON gains a `certificate_of_title` field
+    and reports `document_number` from the index for Land Court deeds. The
+    grantor check excludes the acquisition document by document_number on
+    Land Court (by book on Recorded Land), and `grantors` is left empty for
+    Land Court deeds since that index has no opposite-party column.
+
+v3.2 changes (ALIS Land Court field-name fix):
+  - _alis_url() now emits the correct name-index field names for Land Court
+    searches. Recorded Land uses W9SNM/W9GNM with results handler WW401R00;
+    Land Court uses W9SN8/W9GN8 with results handler WW401L00. The function
+    previously hardcoded the Recorded Land names for both — a Land Court
+    search built with W9SNM/W9GNM silently returned zero results because the
+    LC form ignores the unknown parameters. This caused the Land Court
+    fallback in run_norfolk()/run_barnstable() to never find registered-land
+    deeds (confirmed on the Norfolk Kowalczyk run 2026-05-22, where a
+    registered-land property in Randolph was missed and had to be located
+    via manual browser search). Fix applies to both registries since
+    _alis_url() is shared.
+
+v3.1 changes (ALIS PDF link robustness):
+  - _alis_get_pdf_hrefs() now returns a dict with primary + fallback PDF hrefs
+    plus the Document Image List URL. Permissive fallback handles non-standard
+    short single-file naming (e.g. /WwwImg/D1UJ.PDF on a 1988 Foxborough deed,
+    Bk7906/Pg271) where there is no [PREFIX]0001.PDF pattern to match. The
+    numbered-page pattern remains the primary path for multi-page deeds.
+  - On exit 1 paths ("no PDF links found" or "PDF download failed for all
+    pages"), the JSON now includes top-level "image_list_url" and
+    "all_pdf_hrefs_on_image_list" so Claude can recover with a direct fetch
+    instead of re-navigating from the search results page.
+  - Applies to both Barnstable and Norfolk (shared _alis_* code path).
+
+
+Plymouth County form structure (confirmed from live DOM inspection 2026-04-27):
+  Name:       #SearchFormEx1_ACSTextBox_LastName1  — single "LAST FIRST" combined field
+  Party type: #SearchFormEx1_ACSRadioButtonList_PartyType1  — <select>: I=Grantee, D=Grantor
+  Search btn: #SearchFormEx1_btnSearch
+  Results:    AJAX — wait for a[href*="GridView_Document$ctl02$ButtonRow"] before reading DOM
+  Detail panel: click Book link → panel appears → wait for a[href*="TabController1"]
+  View Images: __doPostBack('TabController1$ImageViewertabitem','') sets server session silently
+               then navigate to ImageViewerEx.aspx to load viewer
+  Image:      #ImageViewer1_docImage — <img> with authenticated src URL
+
+Barnstable & Norfolk Counties (Browntech ALIS):
+  Both run identical ALIS software — only the base URL and town codes differ.
+  Shared helpers prefixed `_alis_*` accept a `base_url` parameter and serve
+  both registries. Direct-URL search, PDF fetch via page.request.get().
+
+Usage:
+  python legal_desc_fetch.py --registry plymouth --last MARCHETTI --first WILLIAM \\
+      --base-name "12 Cranmore Hill Lane Unit 203 Scituate - Marchetti" \\
+      --output "/path/to/your/output/folder"
+
+Output:  JSON to stdout
+Exit 0:  success
+Exit 2:  deed not found
+Exit 1:  error
+
+Plymouth trust-vested fallback (v2.5+):
+  If name search returns 0 results, the script automatically retries with a
+  property address search. Street number and street name are parsed from
+  --base-name (first numeric token + second token) if not supplied via
+  --street-number and --street. Use for trust- or LLC-vested properties.
+"""
+
+import asyncio
+import json
+import argparse
+import os
+import sys
+import re
+import time
+# Aliased: several functions in this file bind a local named `html`
+# (`html = resp.text`), which would shadow the stdlib module.
+import html as _html
+from pathlib import Path
+from urllib.parse import quote
+from datetime import datetime
+from datetime import date as _dt_date, timedelta as _dt_timedelta
+
+# Playwright is only required for the browser-driven paths (Plymouth,
+# Middlesex South, Suffolk stub, and the ALIS fallback engine). The default
+# ALIS HTTP engine runs without it, so a missing install is reported only
+# when a Playwright path is actually selected (see main()).
+try:
+    from playwright.async_api import async_playwright, Page, BrowserContext
+    _PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    async_playwright = None
+    Page = None
+    BrowserContext = None
+    _PLAYWRIGHT_AVAILABLE = False
+
+_PLAYWRIGHT_INSTALL_MSG = (
+    "Playwright not installed. "
+    "Run: python -m pip install playwright && python -m playwright install chromium"
+)
+
+# requests + BeautifulSoup power the ALIS pure-HTTP engine (v3.9).
+try:
+    import requests
+except ImportError:
+    requests = None
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
+
+_HTTP_AVAILABLE = requests is not None and BeautifulSoup is not None
+_HTTP_INSTALL_MSG = (
+    "requests/beautifulsoup4 not installed. "
+    "Run: python -m pip install requests beautifulsoup4"
+)
+
+# anthropic SDK powers inline PDF extraction (v3.10). Optional — without it
+# (or without credentials) the script still runs and Claude falls back to
+# Reading the PDFs.
+try:
+    import anthropic
+except ImportError:
+    anthropic = None
+
+import base64
+from concurrent.futures import ThreadPoolExecutor
+
+
+PLYMOUTH_SEARCH = "https://titleview.org/plymouthdeeds/"
+PLYMOUTH_VIEWER = "https://titleview.org/plymouthdeeds/ImageViewerEx.aspx"
+
+BARNSTABLE_BASE = "https://search.barnstabledeeds.org"
+NORFOLK_BASE    = "https://www.norfolkresearch.org"
+
+# Norfolk County ALIS town codes. Each Norfolk municipality has its own code
+# (unlike Barnstable where BARN covers all villages). Codes are mostly the first
+# Full town code list enumerated 2026-05-16 from the Norfolk LC01D (Land Court)
+# form dropdown — codes appear to be shared between Recorded and Land Court forms.
+# ✓ = confirmed on a live Recorded Land run. Unknown towns fall back to *ALL.
+# Barnstable County ALIS town codes. Full list enumerated 2026-05-20 from the
+# Barnstable LR01D form dropdown. BARN covers all Barnstable villages (Hyannis,
+# Centerville, Osterville, Cotuit, etc.); other towns have their own codes.
+# ✓ = confirmed on a live run.
+_BARNSTABLE_TOWN_CODES: dict[str, str] = {
+    "BARNSTABLE":    "BARN",   # covers all Barnstable villages ✓
+    "BOURNE":        "BOUR",   # ✓ (skill notes)
+    "BREWSTER":      "BREW",
+    "CHATHAM":       "CHAT",
+    "DENNIS":        "DENN",   # ✓ confirmed 2026-05-20 (Bennett)
+    "EASTHAM":       "EAST",
+    "FALMOUTH":      "FALM",   # ✓ (skill notes)
+    "HARWICH":       "HARW",
+    "MASHPEE":       "MASH",   # ✓ (skill notes)
+    "ORLEANS":       "ORLE",
+    "PROVINCETOWN":  "PROV",
+    "SANDWICH":      "SAND",   # ✓ (skill notes)
+    "TRURO":         "TRUR",
+    "WELLFLEET":     "WELL",
+    "YARMOUTH":      "YARM",   # ✓ (skill notes)
+    # v3.28 — Barnstable's VILLAGES, which is how these addresses are
+    # written ("87 Marchmont Street, Hyannis"). All record under BARN, so the
+    # fallback already produced the right code — but it produced it with a
+    # NOTE saying the town was unrecognised, which reads like a defect on a
+    # run that was in fact correctly scoped (Salgado, 2026-08-12).
+    "HYANNIS":          "BARN",   # ✓ confirmed live 2026-08-12 (Salgado)
+    "HYANNISPORT":      "BARN",
+    "CENTERVILLE":      "BARN",
+    "OSTERVILLE":       "BARN",
+    "COTUIT":           "BARN",
+    "MARSTONS MILLS":   "BARN",
+    "WEST BARNSTABLE":  "BARN",
+    "CUMMAQUID":        "BARN",
+}
+
+
+def _barnstable_resolve_town(town_arg: str, base_name: str) -> tuple[str, list[str]]:
+    """
+    Resolve --town arg to an ALIS town code for Barnstable County.
+
+    Returns (code, notes_list). Accepts:
+      - empty string → derive town from base_name; fall back to BARN if unrecognized
+      - town name (any case): looked up in _BARNSTABLE_TOWN_CODES → ALIS code
+      - ALIS code (3-5 uppercase letters): trusted, returned as-is
+      - "*ALL": returned as-is
+    """
+    notes: list[str] = []
+    raw = (town_arg or "").strip()
+    if raw.upper() == "*ALL":
+        return "*ALL", notes
+    candidate = raw.upper() if raw else _parse_town_from_base_name(base_name).upper()
+    if not candidate:
+        notes.append("No --town provided and could not parse town from base_name. Defaulting to BARN.")
+        return "BARN", notes
+    if candidate in _BARNSTABLE_TOWN_CODES:
+        return _BARNSTABLE_TOWN_CODES[candidate], notes
+    if 3 <= len(candidate) <= 5 and candidate.isalpha():
+        return candidate, notes
+    notes.append(
+        f"NOTE: town '{candidate}' not in _BARNSTABLE_TOWN_CODES. "
+        f"Defaulting to BARN (Barnstable villages). "
+        f"To filter by town, pass --town with the ALIS code or add an entry to _BARNSTABLE_TOWN_CODES."
+    )
+    return "BARN", notes
+
+
+_NORFOLK_TOWN_CODES: dict[str, str] = {
+    "AVON":         "AVON",
+    "BELLINGHAM":   "BELL",
+    "BRAINTREE":    "BRAI",   # ✓ confirmed live run 2026-04 (Sarno)
+    "BROOKLINE":    "BRKL",
+    "CANTON":       "CANT",
+    "COHASSET":     "COHS",
+    "DEDHAM":       "DEDH",
+    "DORCHESTER":   "DORC",
+    "DOVER":        "DOVE",
+    "FOXBOROUGH":   "FOXB",   # ✓ confirmed live run 2026-05-16 (Sarno)
+    "FRANKLIN":     "FRKL",
+    "HOLBROOK":     "HLBK",
+    "HYDE PARK":    "HYDE",
+    "MEDFIELD":     "MEDF",
+    "MEDWAY":       "MDWY",
+    "MILLIS":       "MILS",
+    "MILTON":       "MLTN",
+    "NEEDHAM":      "NDHM",
+    "NORFOLK":      "NORF",
+    "NORWOOD":      "NRWD",
+    "PLAINVILLE":   "PLNV",
+    "QUINCY":       "QUIN",   # ✓ confirmed via skill notes
+    "RANDOLPH":     "RAND",
+    "ROXBURY":      "ROXB",
+    "SHARON":       "SHRN",
+    "STOUGHTON":    "STOU",
+    "WALPOLE":      "WALP",
+    "WELLESLEY":    "WELL",
+    "WEST ROXBURY": "WROX",
+    "WESTWOOD":     "WSTD",
+    "WEYMOUTH":     "WEYM",   # WEYB returned no results 2026-06-10; WEYM confirmed correct (LC01D form)
+    "WRENTHAM":     "WREN",
+}
+
+
+def _norfolk_resolve_town(town_arg: str, base_name: str) -> tuple[str, list[str]]:
+    """
+    Resolve --town arg to an ALIS town code for Norfolk County.
+
+    Returns (code, notes_list). The code is suitable for the W9TOWN URL parameter;
+    notes_list is empty on a clean resolve and contains a hint string when
+    falling back to *ALL or when an unknown candidate is passed through.
+
+    Accepts:
+      - empty string → derive town from base_name (e.g. "...Braintree - Smith" → "BRAINTREE")
+      - town name (any case): looked up in _NORFOLK_TOWN_CODES → ALIS code
+      - ALIS code (4-5 uppercase letters): trusted, returned as-is
+      - "*ALL": returned as-is
+      - unrecognized name longer than 5 chars: NOTE logged, fall back to *ALL
+    """
+    notes: list[str] = []
+    raw = (town_arg or "").strip()
+    if raw.upper() == "*ALL":
+        return "*ALL", notes
+    candidate = raw.upper() if raw else _parse_town_from_base_name(base_name).upper()
+    if not candidate:
+        notes.append(
+            "No --town provided and could not parse town from base_name. "
+            "Falling back to *ALL (all Norfolk towns)."
+        )
+        return "*ALL", notes
+    if candidate in _NORFOLK_TOWN_CODES:
+        return _NORFOLK_TOWN_CODES[candidate], notes
+    if 4 <= len(candidate) <= 5 and candidate.isalpha():
+        # Trust as ALIS code (user passed it explicitly or it's a short town name
+        # that happens to match the code pattern).
+        return candidate, notes
+    notes.append(
+        f"NOTE: town '{candidate}' not in _NORFOLK_TOWN_CODES. "
+        f"Falling back to *ALL — results will include all Norfolk towns. "
+        f"To filter, pass --town with the ALIS code (e.g. --town BRAI for Braintree) "
+        f"or add an entry to _NORFOLK_TOWN_CODES."
+    )
+    return "*ALL", notes
+
+
+# Plymouth County grid uses short abbreviations for town names.  Most match via
+# substring check (e.g. SCIT ⊂ SCITUATE).  A few do not — those need an entry
+# here.  As of v2.9, dict entries are only required when a seller owns MULTIPLE
+# Plymouth County properties (multi-result name search); single-result runs
+# accept any unrecognized abbreviation and log a NOTE prompting the addition.
+# Add new entries as observed from WARNING/NOTE messages in run output.
+_PLYMOUTH_TOWN_ABBREVS: dict[str, str] = {
+    "CARVER":        "CRVR",   # confirmed 2026-05-14 (address-search result row)
+    "DUXBURY":       "DXBY",   # confirmed 2026-05-11 (grantor check output)
+    "HALIFAX":       "HLFX",   # confirmed 2026-05-11
+    "HINGHAM":       "HNGHM",  # confirmed 2026-05-13
+    "MIDDLEBOROUGH": "MIDDO",  # confirmed 2026-05-13 (Novak run)
+    "PLYMOUTH":      "PLMTH",  # confirmed 2026-05-14
+    "KINGSTON":      "KGSTN",  # confirmed 2026-06-19 (Reyes/Beckwith run)
+    "MARSHFIELD":    "MSHFD",  # confirmed 2026-07-08 (KDM Realty Corp run)
+}
+
+
+# ---------------------------------------------------------------------------
+# Image download helpers
+# ---------------------------------------------------------------------------
+
+async def _download_viewer_image(page: Page, output_path: Path) -> str:
+    """
+    Download the deed image currently shown in the Plymouth image viewer.
+    Strategy 1: fetch the img src URL via the authenticated browser session.
+    Strategy 2: Playwright element screenshot fallback.
+    Returns: 'src_download' | 'screenshot' | 'failed'
+    """
+    img_src = await page.get_attribute("#ImageViewer1_docImage", "src")
+    if img_src:
+        if img_src.startswith("/"):
+            img_url = f"https://titleview.org{img_src}"
+        elif img_src.startswith("http"):
+            img_url = img_src
+        else:
+            img_url = f"https://titleview.org/plymouthdeeds/{img_src}"
+        try:
+            response = await page.request.get(img_url)
+            if response.ok:
+                output_path.write_bytes(await response.body())
+                return "src_download"
+        except Exception:
+            pass
+
+    img_el = await page.query_selector("#ImageViewer1_docImage")
+    if img_el:
+        await img_el.screenshot(path=str(output_path))
+        return "screenshot"
+
+    return "failed"
+
+
+async def _parse_page_count(page: Page) -> int:
+    """Read the total-pages label in the Plymouth image viewer."""
+    label = (await page.text_content("#ImageViewer1_lblPageNum") or "").strip()
+    m = re.search(r"of\s+(\d+)|/\s*(\d+)", label, re.IGNORECASE)
+    if m:
+        return int(m.group(1) or m.group(2))
+    return 1
+
+
+# ---------------------------------------------------------------------------
+# Plymouth County search helper
+# ---------------------------------------------------------------------------
+
+async def _plymouth_search(page: Page, combined_name: str, party_type: str,
+                           date_from: tuple = None,
+                           doc_type_values: list = None) -> bool:
+    """
+    Navigate to Plymouth search, set party type, enter name, click Search.
+    Ensures Name Search mode is active — the server may remember Property Search
+    mode from a previous address-search call in the same browser session, which
+    hides the name field. Switches back via __doPostBack if necessary.
+    Returns True if the page loaded, False on timeout.
+
+    v3.29 — optional SERVER-SIDE narrowing, used by the grantor check only
+    (see _GRANTOR_WINDOW_LOOKBACK_DAYS):
+      date_from       : (Y, M, D) recorded-date floor → ACSTextBox_DateFrom.
+      doc_type_values : option values for ACSDropDownList_DocumentType, which
+                        despite the id is a MULTI-select listbox of 586
+                        entries. Used by the lien sweep.
+    Both controls live on the Advanced panel and are hidden until
+    BtnAdvanced is clicked — they exist in the DOM either way and are posted
+    with the form (DateFrom is prefilled with the index floor, 8/6/1686), but
+    Playwright will not fill a hidden input, so the panel is opened on demand.
+    Neither is touched unless asked for, so the grantee search is unchanged.
+    """
+    await page.goto(PLYMOUTH_SEARCH, wait_until="domcontentloaded", timeout=30000)
+    try:
+        await page.wait_for_selector("#SearchFormEx1_ACSTextBox_LastName1", timeout=5000)
+    except Exception:
+        # Form is in Property Search (or other) mode — switch to Name Search (LinkButton00)
+        await page.wait_for_function("() => typeof __doPostBack === 'function'", timeout=10000)
+        await page.evaluate("() => __doPostBack('Navigator1$SearchCriteria1$LinkButton00', '')")
+        await page.wait_for_selector("#SearchFormEx1_ACSTextBox_LastName1", timeout=15000)
+
+    if date_from or doc_type_values:
+        if not await page.is_visible("#SearchFormEx1_ACSTextBox_DateFrom"):
+            await page.click("#SearchFormEx1_BtnAdvanced")
+            await page.wait_for_selector("#SearchFormEx1_ACSTextBox_DateFrom",
+                                         state="visible", timeout=15000)
+        if date_from and date_from > (0, 0, 0):
+            await page.fill("#SearchFormEx1_ACSTextBox_DateFrom",
+                            f"{date_from[1]}/{date_from[2]}/{date_from[0]}")
+        if doc_type_values:
+            await page.select_option(
+                "#SearchFormEx1_ACSDropDownList_DocumentType", doc_type_values)
+
+    await page.select_option("#SearchFormEx1_ACSRadioButtonList_PartyType1", party_type)
+    await page.fill("#SearchFormEx1_ACSTextBox_LastName1", combined_name)
+    await page.click("#SearchFormEx1_btnSearch")
+    return True
+
+
+async def _plymouth_compound_surname_retry(
+    page: Page,
+    seller_last: str,
+    result: dict,
+) -> bool:
+    """
+    Retry a Plymouth grantee search using the SURNAME ONLY (blank first name),
+    to catch hyphenated / compound surnames the combined 'LAST FIRST' field
+    misses.
+
+    Plymouth's name field prefix-matches the concatenated 'LASTNAME FIRSTNAME'
+    index string.  When the true surname is hyphenated (e.g. 'WHITFIELD-BARROW'),
+    a search for 'WHITFIELD ALAN' fails — after 'WHITFIELD' the index continues
+    '-BARROW', not ' ALAN'.  A surname-only search 'WHITFIELD' prefix-matches
+    'WHITFIELD-BARROW ...' and returns the row.  The caller must still filter the
+    returned rows by first name (the surname prefix can match unrelated people).
+
+    Returns True if the retry produced results, False otherwise.
+    """
+    await _plymouth_search(page, seller_last.upper().strip(), "I")
+    if await _has_results(page, timeout_ms=15000):
+        result["notes"].append(
+            f"Compound-surname retry: surname-only search "
+            f"'{seller_last.upper().strip()}' (blank first name) returned results "
+            f"— will filter rows by first name. Handles hyphenated surnames "
+            f"(e.g. 'WHITFIELD' → 'WHITFIELD-BARROW') that the combined name field misses."
+        )
+        return True
+    result["notes"].append(
+        f"Compound-surname retry: surname-only search "
+        f"'{seller_last.upper().strip()}' also returned no results."
+    )
+    return False
+
+
+async def _plymouth_address_search(
+    page: Page,
+    street_number: str,
+    street_name: str,
+    town: str = "",
+    result: dict | None = None,
+) -> bool:
+    """
+    Submit a Plymouth property address search (trust-vested fallback).
+
+    The search page defaults to Name Search mode from a clean browser context.
+    Property Search mode is reached by clicking LinkButton05 in the Navigator's
+    Search Criteria panel. Confirmed from live DOM: LinkButton05 text = "Property Search".
+
+    Use the first word of the street name for the broadest match
+    (e.g. "WEXFORD" matches "Wexford Avenue").
+    Returns True if the form was submitted; False on navigation timeout.
+
+    Timing (v3.6): this path costs a full page reload PLUS a second
+    __doPostBack to switch UI modes — structurally heavier than the plain
+    name search, which only needs one. If `result` is passed, per-phase
+    timings are appended to result["notes"] as a "[timing]" line so slow
+    phases are visible in the JSON output instead of just total run time.
+    """
+    t0 = time.monotonic()
+    await page.goto(PLYMOUTH_SEARCH, wait_until="domcontentloaded", timeout=30000)
+    t1 = time.monotonic()
+    # Switch to Property Search mode by firing the __doPostBack directly.
+    # LinkButton05 ("Property Search") lives inside a collapsed accordion panel
+    # so it cannot be clicked; calling __doPostBack bypasses the visibility check.
+    await page.wait_for_function("() => typeof __doPostBack === 'function'", timeout=15000)
+    t2 = time.monotonic()
+    await page.evaluate("() => __doPostBack('Navigator1$SearchCriteria1$LinkButton05', '')")
+    # Wait for the property search form to render after the AJAX postback
+    await page.wait_for_selector("#SearchFormEx1_ACSTextBox_StreetNumber", timeout=15000)
+    t3 = time.monotonic()
+    await page.fill("#SearchFormEx1_ACSTextBox_StreetNumber", street_number)
+    await page.fill("#SearchFormEx1_ACSTextBox_StreetName", street_name)
+    if town:
+        # v3.6: explicit short timeouts. A label/value mismatch here is an
+        # expected, handled case (falls through to "proceed without it"),
+        # not an error worth Playwright's 30s default actionability wait —
+        # timing data showed this pair of mismatched select_option() calls
+        # silently burning ~60s (2x default timeout) on every town-mismatch
+        # address-search retry.
+        try:
+            await page.select_option(
+                "#SearchFormEx1_ACSDropDownList_Towns",
+                label=re.sub(r'\s+', ' ', town).strip().title(),
+                timeout=3000,
+            )
+        except Exception:
+            try:
+                await page.select_option(
+                    "#SearchFormEx1_ACSDropDownList_Towns", value=town.upper(),
+                    timeout=3000,
+                )
+            except Exception:
+                pass  # town filter unavailable — proceed without it
+    t4 = time.monotonic()
+    await page.click("#SearchFormEx1_btnSearch")
+    t5 = time.monotonic()
+    if result is not None:
+        result["notes"].append(
+            "[timing] plymouth_address_search: "
+            f"goto_search_page={t1-t0:.2f}s doPostBack_ready={t2-t1:.2f}s "
+            f"mode_switch_postback={t3-t2:.2f}s fill_form={t4-t3:.2f}s "
+            f"submit_click={t5-t4:.2f}s total={t5-t0:.2f}s "
+            "(submit_click excludes the results-grid wait, logged separately "
+            "by the caller's _has_results call)"
+        )
+    return True
+
+
+# Terse Avenu/20-20 (Plymouth, Suffolk) document-type codes that do NOT convey
+# title.  ALIS (Norfolk, Barnstable) spells its types out as whole words, so
+# those are matched by substring instead (see _NON_CONVEYANCE_SUBSTR below).
+_NON_CONVEYANCE_CODES = {
+    "CR",          # Certificate / Instrument of Redemption (tax-title)
+    "TT",          # Tax Taking
+    "TAX",         # Tax lien / taking
+    "MLC",         # Municipal Lien Certificate
+    "ESMT",        # Easement
+    "MTG",         # Mortgage
+    "DIS",         # Discharge
+    "REL",         # Release (of mortgage/lien — not a conveyance)
+    "ASST",        # Assignment (Avenu code; ALIS uses ASSIGN)
+    "TKG",         # Taking (eminent domain / tax)
+    "NOTC",        # Notice
+    "LIEN",        # Lien
+    "ATTACH",      # Attachment
+    "ASSIGN",      # Assignment
+    "DCLN HMS",    # Declaration of Homestead
+    "TR CRTF",     # Trustee's Certificate (not the conveyance itself)
+    "BKCY",        # Bankruptcy
+    "UCC",         # UCC financing statement
+    "PLAN",        # Plan
+    "AFFI",        # Affidavit
+    "SUBORD",      # Subordination
+}
+
+# Substrings that mark a non-conveyance instrument in ALIS full-word labels
+# (and as a safety net for any spelled-out Avenu label).  Checked only AFTER
+# the "DEED" allowlist, so a real deed (which always contains "DEED") is never
+# mis-flagged even if its label also contains one of these words.
+_NON_CONVEYANCE_SUBSTR = (
+    "REDEM",        # REDEMPTION / CERTIFICATE OF REDEMPTION
+    "TAX TAKING", "TAKING", "TAX LIEN", "TAX TITLE",
+    "MORTGAGE", "DISCHARGE", "ASSIGNMENT", "RELEASE", "ATTACHMENT",
+    "EASEMENT", "LIEN", "NOTICE", "HOMESTEAD", "PLAN", "BANKRUPT",
+    "AFFIDAVIT", "CERTIFICATE", "SUBORDINAT", "TERMINAT", "FINANCING",
+)
+
+# Terse codes / labels that DO convey title but do not contain the word "DEED".
+# Avenu truncates "UNIT DEED" to "UNIT DEE".
+_CONVEYANCE_CODES = {"UNIT DEE"}
+
+
+def _is_non_conveyance_instrument(deed_type: str) -> bool:
+    """
+    True for index document-types that do NOT convey title (tax-title
+    redemption, tax taking, municipal lien certificate, mortgage, discharge,
+    easement, etc.).
+
+    Shared across all fast-path registries.  It detects when a grantee name
+    search could only surface a non-deed instrument — which happens when the
+    actual vesting deed was misindexed under a misspelled grantee name.
+    Reference: 60 Aldergate St, Middleborough, where the vesting deed (Bk
+    51338/204) was misindexed "HANNIGAN" vs "HENNIGAN", so the only HENNIGAN
+    grantee hit was a Certificate of Redemption (type "CR").
+
+    Vocabulary covers BOTH the terse Avenu/20-20 codes used by Plymouth/Suffolk
+    (e.g. "CR", "TT", "MLC") AND the spelled-out labels used by Browntech ALIS
+    on Norfolk/Barnstable (e.g. "MORTGAGE", "CERTIFICATE OF REDEMPTION").  Any
+    type containing "DEED" is treated as a conveyance and returns False.
+    """
+    t = (deed_type or "").upper().strip()
+    if not t:
+        return True  # blank/unknown type — treat as non-deed so caller can verify
+    if "DEED" in t or t in _CONVEYANCE_CODES:
+        return False
+    if any(s in t for s in _NON_CONVEYANCE_SUBSTR):
+        return True
+    if t in _NON_CONVEYANCE_CODES:
+        return True
+    # Compound terse codes like "DIS REL" (discharge+release): non-conveyance
+    # when every whitespace token is itself a known non-conveyance code.
+    tokens = t.split()
+    return len(tokens) > 1 and all(tok in _NON_CONVEYANCE_CODES for tok in tokens)
+
+
+async def _plymouth_address_fallback(
+    page: Page,
+    street_number: str,
+    street_name: str,
+    town: str,
+    result: dict,
+) -> dict | None:
+    """
+    Run a Plymouth property-address search and return the most recently
+    recorded deed-type row, or None.
+
+    An address search is index-name-independent, so it recovers the vesting (or
+    most-recent) deed when a grantee name search misses it — most often because
+    the grantee was misindexed under a misspelled name.  When the named seller
+    has since conveyed the property out, the most-recent deed surfaced here is
+    the out-conveyance, which is exactly the signal that the seller is no longer
+    the record owner (v3.3).
+    """
+    await _plymouth_address_search(page, street_number, street_name, town, result=result)
+    t_submit = time.monotonic()
+    has_results = await _has_results(page, timeout_ms=15000)
+    t_results = time.monotonic()
+    result["notes"].append(
+        f"[timing] plymouth_address_fallback: wait_for_results_grid="
+        f"{t_results-t_submit:.2f}s"
+    )
+    if not has_results:
+        result["notes"].append("Address-search fallback: no results.")
+        return None
+    # v3.13 — page size before sort (the 100/page postback drops the sort), then
+    # walk every pager page so an older deed is not stranded on page 2+.
+    await _avenu_set_page_size_100(page)
+    await _sort_results_by_date_desc(page)
+    t_sort = time.monotonic()
+    addr_rows = await _read_all_result_rows_paginated(
+        page, notes=result["notes"], flags=result
+    )
+    t_read = time.monotonic()
+    result["notes"].append(
+        f"[timing] plymouth_address_fallback: sort_by_date={t_sort-t_results:.2f}s "
+        f"read_rows={t_read-t_sort:.2f}s"
+    )
+    result["notes"].append(
+        f"Address-search fallback returned {len(addr_rows)} row(s)."
+    )
+    deed_rows = [
+        r for r in addr_rows
+        if not _is_non_conveyance_instrument(r.get("deed_type", ""))
+    ]
+    if deed_rows:
+        addr_rows = deed_rows
+        result["notes"].append(
+            f"Address-search fallback: filtered to {len(addr_rows)} deed-type row(s)."
+        )
+    if not addr_rows:
+        result["notes"].append(
+            "Address-search fallback: no deed-type rows after filtering."
+        )
+        return None
+    try:
+        row = max(
+            addr_rows,
+            key=lambda r: (int(r.get("book") or 0), int(r.get("doc_number") or 0)),
+        )
+    except (ValueError, TypeError):
+        row = addr_rows[0]
+    result["notes"].append(
+        f"Address-search fallback selected Bk{row['book']} {row['deed_type']} "
+        f"{row['recorded_date']} addr={row['street']!r} town={row['town']!r}."
+    )
+    return row
+
+
+async def _has_results(page: Page, timeout_ms: int = 20000) -> bool:
+    """Wait for the AJAX results grid to load. Returns True if results found."""
+    try:
+        await page.wait_for_selector(
+            'a[href*="GridView_Document$ctl02$ButtonRow"]',
+            timeout=timeout_ms
+        )
+        return True
+    except Exception:
+        return False
+
+
+async def _sort_results_by_date_desc(page: Page) -> bool:
+    """
+    Sort the Plymouth search results grid by Rec Date descending (most recent first).
+
+    Strategy:
+      1. Click the 'Rec Date' column header using page.click() — avoids stale-
+         handle errors that occur with ElementHandle.click() after AJAX re-renders.
+      2. Wait for the AJAX grid to re-render.
+      3. Compare book numbers of ctl02 vs ctl03: if ctl02 < ctl03 the sort is
+         still ascending; click again for descending.
+      4. Return True when descending is confirmed (or after two clicks).
+
+    Selector: Avenu/20-20 ASP.NET GridView sort links fire __doPostBack with an
+    argument like 'Sort$Rec Date'.  Exact href confirmed on first live run.
+    Falls back gracefully if no matching header is found.
+    """
+    _SELECTORS = [
+        'a[href*="Sort$Rec Date"]',           # most likely: __doPostBack sort arg
+        'a[href*="Sort"][href*="Rec Date"]',  # fallback: href contains both tokens
+        'th a:has-text("Rec Date")',           # last resort: text in header cell
+    ]
+
+    async def _find_working_selector() -> str:
+        """Return the first selector that matches an element, or ''."""
+        for sel in _SELECTORS:
+            el = await page.query_selector(sel)
+            if el:
+                return sel
+        return ""
+
+    async def _click_header_and_wait() -> bool:
+        """
+        Click the Rec Date header and wait for the re-sorted grid to actually land.
+
+        v3.13: waits for the grid FINGERPRINT to change, not for a selector or
+        networkidle.  The old grid satisfies 'ctl02 exists' instantly, so the
+        previous wait returned while the pre-sort rows were still on screen —
+        the direction check below then read stale rows, wrongly concluded
+        "ascending", and clicked again, toggling the grid back to ascending.
+        (Live 2026-07-13: a "descending" sort returned rows starting at 1757.)
+        """
+        sel = await _find_working_selector()
+        if not sel:
+            return False
+        before = await _avenu_grid_fingerprint(page)
+        try:
+            # page.click() handles its own retry logic — no stale-handle risk
+            await page.click(sel, timeout=5000)
+        except Exception:
+            return False
+        return await _avenu_wait_for_grid_change(page, before)
+
+    async def _rec_date(ctl: str) -> tuple:
+        """Parsed Rec Date of a row, as a sortable (y, m, d).  (0,0,0) if unread."""
+        try:
+            el = await page.query_selector(
+                f'a[href*="GridView_Document$ctl{ctl}$ButtonRow_Rec Date"]'
+            )
+            return _parse_deed_date((await el.inner_text()).strip()) if el else (0, 0, 0)
+        except Exception:
+            return (0, 0, 0)
+
+    async def _is_descending() -> bool:
+        """True when the grid's first rows run newest → oldest."""
+        d02, d03 = await _rec_date("02"), await _rec_date("03")
+        if d02 == (0, 0, 0) or d03 == (0, 0, 0):
+            return False  # can't tell
+        return d02 >= d03
+
+    if not await _click_header_and_wait():
+        return False  # header not found — caller falls back to book-number selection
+
+    # v3.13 — validate the direction by REC DATE, not by book number.
+    #
+    # The old check compared ctl02's book number to ctl03's and clicked again if
+    # b02 < b03.  But Plymouth's digitized old records have book numbers that are
+    # NON-MONOTONIC with date (v2.7's own finding: a 1978 deed at Bk32450 sits
+    # alongside a 2002 deed at Bk22572) — the very reason row selection was moved
+    # to a Python date sort.  Using that same broken proxy to decide whether the
+    # grid is ascending meant the function could return True ("descending
+    # confirmed") while the grid was actually ASCENDING.  Observed live
+    # 2026-07-13: a sorted GRANT PETER search returned rows starting at 1757.
+    #
+    # The Rec Date column is the thing being sorted, so read it directly.
+    if not await _is_descending():
+        if not await _click_header_and_wait():
+            return False
+    return await _is_descending()
+
+
+async def _read_all_result_rows(page: Page, cols: dict = None) -> list:
+    """
+    Read all result rows (ctl02–ctl11) from the Grantee search results grid.
+    Returns a list of row dicts, ordered as the registry returns them.
+
+    v3.6: the entire grid is read in ONE page.evaluate() call so every cell
+    comes from the same DOM snapshot — JS executes atomically on the page's
+    main thread, so an UpdatePanel re-render cannot interleave mid-read.
+    The prior per-cell query_selector loop (~90 round trips) could race with
+    the re-render triggered by the date-sort header click, producing chimera
+    rows: Book/Page cells from the pre-sort grid glued to Type/Date/Doc#
+    cells of the post-sort grid.  (Observed 2026-07-08, KDM Realty Corp,
+    Marshfield: DEED Doc#41886 reported at Bk46013/Pg9; actual Bk8827/Pg315.)
+    The snapshot is re-taken until two consecutive reads are identical, so a
+    read that lands on a mid-render DOM state is discarded.
+
+    v3.7: reads up to 50 rows (ctl02–ctl51) instead of 10.  The Avenu grid
+    renders ALL result rows on one page at least up to 14 rows (confirmed
+    live 2026-07-08: KDM REALTY CORP grantor search rendered ctl02–ctl15 with
+    no pager) — the old ctl11 cap silently dropped rows 11+, hiding the
+    oldest instruments on long-held properties.
+
+    v3.8: optional `cols` overrides the column-header map for Avenu sites
+    whose grids use different column names (Middlesex South: 'File Date'
+    instead of 'Rec Date', 'Type Desc' for the spelled-out type, no Town /
+    Doc # / Reverse Party columns — unmatched columns read as '').
+    """
+    _COLS = cols or {
+        "book": "Book", "page": "Page", "doc_number": "Doc",
+        "deed_type": "Type", "recorded_date": "Rec Date",
+        "street": "Street", "town": "Town",
+        "reverse_party": "Reverse Party", "name": "Name",
+    }
+
+    async def _snapshot() -> list:
+        return await page.evaluate(
+            """(cols) => {
+                const rows = [];
+                // v3.13: scan to ctl102 — the grid is switched to 100 rows/page
+                // (_plymouth_set_page_size_100), so the old ctl51 cap would have
+                // silently dropped rows 51-100 of every full page.
+                for (let i = 2; i < 103; i++) {
+                    const ctl = String(i).padStart(2, '0');
+                    const cell = (col) => {
+                        const el = document.querySelector(
+                            `a[href*="GridView_Document$ctl${ctl}$ButtonRow_${col}"]`);
+                        return el ? el.innerText.trim() : '';
+                    };
+                    if (!cell('Book')) break;
+                    const row = { ctl: ctl };
+                    for (const [key, col] of Object.entries(cols)) row[key] = cell(col);
+                    rows.push(row);
+                }
+                return rows;
+            }""",
+            _COLS,
+        )
+
+    prev = await _snapshot()
+    for _ in range(4):
+        await page.wait_for_timeout(300)
+        cur = await _snapshot()
+        if cur == prev:
+            return cur
+        prev = cur
+    return prev
+
+
+# Avenu results-grid pager controls (Plymouth, Suffolk, Middlesex South).
+# Discovered live 2026-07-13: the grid does NOT use the standard ASP.NET
+# GridView 'Page$N' pager that _read_all_result_rows_paginated searched for
+# (v3.7-v3.12) — so that pager walk never matched anything and every caller
+# silently saw only the FIRST PAGE.  The real controls are these __doPostBack
+# targets.  Default page size is 20; 100/Page is available and cuts the number
+# of pages 5x.
+_AVENU_PAGESIZE_100 = "DocList1$PageView100Btn"
+_AVENU_NEXT         = "DocList1$LinkButtonNext"
+# 10 pages x 100 rows = 1000, which is also the site's own hard result cap
+# ("Your search results have been limited to the first 1000 records").
+_AVENU_MAX_PAGES    = 10
+_AVENU_ROW_CAP      = 1000
+
+
+async def _avenu_truncation_banner(page: Page) -> str:
+    """
+    The site's own truncation notice, if it is on screen (v3.18).
+
+    Avenu caps a result set server-side and says so in plain text —
+    "Your search results have been limited to the first 1000 records".  Returns
+    the matched sentence, or "" when the result set is complete.
+    """
+    try:
+        return await page.evaluate(
+            """() => {
+                const t = (document.body.innerText || '');
+                const m = t.match(/[^.\\n]*limited to the first[^.\\n]*/i);
+                return m ? m[0].trim() : '';
+            }"""
+        )
+    except Exception:
+        return ""
+
+
+async def _avenu_grid_fingerprint(page: Page) -> str:
+    """
+    Identity of what the grid is CURRENTLY showing: row count + the first and
+    last row's Book/Doc cells.
+
+    Every pager control is an ASP.NET UpdatePanel postback, and the OLD grid
+    stays in the DOM until the re-render lands.  Waiting on a selector that the
+    old grid also satisfies (e.g. 'ctl02 exists') therefore returns instantly
+    and the caller reads STALE rows — which silently re-reads page 1 forever, or
+    reads a 20-row page believing the 100/page switch took effect.  Callers wait
+    for this fingerprint to CHANGE instead.
+    """
+    return await page.evaluate(
+        """() => {
+            const cell = (ctl, col) => {
+                const el = document.querySelector(
+                    `a[href*="GridView_Document$ctl${ctl}$ButtonRow_${col}"]`);
+                return el ? el.innerText.trim() : '';
+            };
+            let n = 0, last = '';
+            for (let i = 2; i < 103; i++) {
+                const ctl = String(i).padStart(2, '0');
+                if (!cell(ctl, 'Book')) break;
+                n++;
+                last = cell(ctl, 'Book') + '/' + cell(ctl, 'Doc');
+            }
+            return n + '|' + cell('02', 'Book') + '/' + cell('02', 'Doc') + '|' + last;
+        }"""
+    )
+
+
+async def _avenu_wait_for_grid_change(page: Page, before: str, timeout_ms: int = 15000) -> bool:
+    """
+    Block until the grid's fingerprint differs from `before`, i.e. the postback's
+    re-render has actually landed.
+
+    This is the ONLY reliable "the grid updated" signal on these pages.  Waiting
+    on a selector ('ctl02 exists') or on networkidle does not work: the OLD grid
+    satisfies the selector immediately, so the wait returns while the stale rows
+    are still on screen and the caller reads them.  That is what made the Rec
+    Date sort appear to fail — the direction check ran against pre-sort rows,
+    concluded "still ascending", and clicked the header a second time, toggling
+    the grid back to ascending.
+    """
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        await page.wait_for_timeout(250)
+        try:
+            if await _avenu_grid_fingerprint(page) != before:
+                # Let the re-render settle so _read_all_result_rows' own
+                # two-identical-snapshots check converges on the NEW grid.
+                await page.wait_for_timeout(500)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _avenu_postback_and_wait(page: Page, target: str, timeout_ms: int = 15000) -> bool:
+    """
+    Fire an Avenu grid postback and wait until the grid content actually changes.
+
+    Returns False if the control is absent or the grid never changed (treat as
+    "nothing happened"), True once the new content is on screen.
+    """
+    if not await page.query_selector(f'a[href*="{target}"]'):
+        return False
+    before = await _avenu_grid_fingerprint(page)
+    try:
+        await page.evaluate(f"() => __doPostBack('{target}','')")
+    except Exception:
+        return False
+    return await _avenu_wait_for_grid_change(page, before, timeout_ms)
+
+
+async def _avenu_set_page_size_100(page: Page) -> bool:
+    """
+    Switch the results grid to 100 rows/page (default is 20).
+
+    The site hides the page-size link for the size that is already active, so an
+    absent link means either "already at 100" or "result set fits on one page".
+    Either way there is nothing to do.  Safe to call unconditionally.
+    """
+    return await _avenu_postback_and_wait(page, _AVENU_PAGESIZE_100)
+
+
+async def _avenu_click_next_page(page: Page) -> bool:
+    """
+    Advance the results grid to the next pager page.
+
+    Returns False when there is no Next link — which is how the LAST page is
+    detected (on the final page the site renders 'Previous' but no 'Next').
+    """
+    return await _avenu_postback_and_wait(page, _AVENU_NEXT)
+
+
+async def _read_all_result_rows_paginated(
+    page: Page,
+    max_pages: int = _AVENU_MAX_PAGES,
+    flags: dict = None,
+    cols: dict = None,
+    notes: list = None,
+) -> list:
+    """
+    Read result rows across ALL pager pages (v3.13 — real pager, was dead code).
+
+    v3.7-v3.12 looked for ASP.NET 'Page$N' links, which this grid does not use,
+    so the walk never fired: every caller (grantor check, and after v3.13 the
+    grantee/address searches too) saw only the first page.  Live confirmation
+    2026-07-13: a grantee search for GRANT PETER reports "122 rows" but
+    rendered only the first 20 — 102 rows, including any older vesting deed,
+    were invisible.
+
+    Now: switches to 100 rows/page, then walks with the Next button until it
+    disappears (the last page has no Next).  Each row is tagged with
+    `_pager_page` (1-based) because ctl numbers are only unique WITHIN a page —
+    a caller that needs to click a row's Book link must first bring that pager
+    page back on screen (see _plymouth_relocate_row).
+
+    max_pages caps the walk at 10 pages (= 1000 rows at 100/page, which is also
+    the site's own hard result cap).  A note is added if the cap is hit.
+
+    v3.18 — SERVER-SIDE TRUNCATION DETECTION.  The walk terminating normally is
+    NOT evidence that the result set is complete.  Avenu caps a search at 1000
+    rows server-side, and because the cap is applied before the grid is built,
+    page 10 legitimately has no Next link — so the walk ends by the same signal
+    as a genuine last page and `capped` (which only fires when Next still exists
+    at max_pages) stayed False.  Worse, the cap is applied BEFORE the Rec Date
+    sort, so sorting only reorders the oldest 1000 rows and every newer
+    instrument is invisible.  Live 2026-07-28, Town of Hingham / 319 Halstead St:
+    a municipality grantee search returned exactly 1000 rows whose newest row was
+    from 1981; the caller then selected a 1980 deed for an unrelated parcel and
+    reported it at exit 0 with no warning.
+
+    When `flags` is passed, `flags["results_truncated_at_cap"]` is set True on
+    either signal (the site's own banner, or a row count at the cap) and a
+    CRITICAL note is emitted.  Callers must treat a truncated set as unusable
+    for deed selection.
+    """
+    # Idempotent — a no-op when the caller already switched to 100/page (which
+    # run_plymouth does BEFORE sorting, since this postback drops the sort).
+    await _avenu_set_page_size_100(page)
+
+    rows: list = []
+    prev_page_key = None
+    pages_read = 0
+    capped = False
+    banner = ""
+
+    for page_num in range(1, max_pages + 1):
+        page_rows = await _read_all_result_rows(page, cols=cols)
+        if not page_rows:
+            break
+
+        # Whole-page identity.  Rows are NOT deduplicated individually: the grid
+        # renders one row per party, so a deed with two grantees is two rows that
+        # legitimately share (book, doc) — and two rows can even share the party
+        # name.  Only a repeat of the ENTIRE page means the postback was a no-op.
+        page_key = [
+            (r.get("book"), r.get("doc_number"), r.get("name"), r.get("deed_type"))
+            for r in page_rows
+        ]
+        if page_key == prev_page_key:
+            break
+        prev_page_key = page_key
+
+        for r in page_rows:
+            r["_pager_page"] = page_num
+        rows.extend(page_rows)
+        pages_read = page_num
+
+        # Check for the site's truncation banner BEFORE leaving the page — it is
+        # rendered with the grid, so it is only reliably readable while a results
+        # page is on screen.
+        if not banner:
+            banner = await _avenu_truncation_banner(page)
+
+        if not await _avenu_click_next_page(page):
+            break  # no Next link => last page (OR the server-side cap, see below)
+        if page_num == max_pages:
+            capped = True
+
+    # v3.18 — two independent truncation signals.  The row count matters on its
+    # own: the banner is not always rendered, and a run that reaches exactly the
+    # cap is truncated whether or not the site says so.
+    truncated = bool(banner) or len(rows) >= _AVENU_ROW_CAP
+    if flags is not None:
+        # STICKY — never downgraded by a later search.  run_plymouth passes the
+        # same result dict to every search it runs (name, then an address-search
+        # retry), and a clean retry must not erase the fact that an earlier
+        # search was truncated: the CRITICAL note for it stays in notes either
+        # way, and a flag that contradicts its own note is worse than a flag that
+        # over-warns.  A false alarm costs a manual check; a cleared flag costs a
+        # wrong parcel.
+        flags["results_truncated_at_cap"] = (
+            bool(flags.get("results_truncated_at_cap")) or truncated
+        )
+
+    if notes is not None:
+        if capped:
+            notes.append(
+                f"WARNING: pager walk hit the {max_pages}-page cap ({len(rows)} rows). "
+                f"Older instruments may still be unread."
+            )
+        if pages_read > 1:
+            notes.append(
+                f"Pager walk: read {len(rows)} row(s) across {pages_read} page(s)."
+            )
+        if truncated:
+            notes.append(
+                f"CRITICAL: the registry TRUNCATED this search at its {_AVENU_ROW_CAP}-row "
+                f"server-side cap ({len(rows)} rows read"
+                + (f"; site says: {banner!r}" if banner else "")
+                + "). The cap is applied BEFORE the Rec Date sort, so the rows read are "
+                "NOT the most recent ones and any newer instrument — including the "
+                "vesting deed — is invisible. This result set is UNUSABLE for deed "
+                "selection: do not report a deed chosen from it. Narrow the search "
+                "(property address search, or a more specific party name). Common cause: "
+                "the party is a municipality or other high-volume entity."
+            )
+    return rows
+
+
+def _same_instrument(a: dict, b: dict) -> bool:
+    """Two grid rows refer to the same recorded instrument."""
+    return (
+        a.get("book") == b.get("book")
+        and a.get("doc_number") == b.get("doc_number")
+        and a.get("name") == b.get("name")
+    )
+
+
+async def _plymouth_ensure_row_visible(
+    page: Page,
+    target: dict,
+    research,
+    cols: dict = None,
+) -> str:
+    """
+    Make sure `target`'s row is on the CURRENTLY DISPLAYED pager page, and return
+    its live ctl.
+
+    ctl numbers are unique only WITHIN a pager page, and the pager walk leaves
+    the grid parked on the LAST page.  So a row selected from page 1 can no
+    longer be clicked by the ctl it was read with — that ctl now addresses a
+    different row on the last page.  Clicking it would open the detail panel and
+    image viewer for the WRONG DEED.  (_open_detail_panel's expected_book check
+    would catch it and fail, but failing is not the same as being right.)
+
+    Strategy:
+      1. If the row is already on screen (common case: single-page result set,
+         or the row happened to be on the last page), just re-derive its ctl.
+      2. Otherwise replay the search and SCAN pages from the first until the row
+         is found, matching on instrument identity — never on the stale ctl.
+
+    The scan deliberately does not jump straight to the row's recorded
+    `_pager_page`: the replayed grid is re-sorted from scratch, and if its row
+    order differs at all from the walk's, that page number points somewhere else.
+    Scanning is a couple of extra postbacks and is correct regardless of ordering.
+
+    Returns the live ctl, or "" if the row could not be brought back.
+    """
+    for r in await _read_all_result_rows(page, cols=cols):
+        if _same_instrument(r, target):
+            return r["ctl"]
+
+    await research()
+    await _avenu_set_page_size_100(page)
+    for _ in range(_AVENU_MAX_PAGES):
+        for r in await _read_all_result_rows(page, cols=cols):
+            if _same_instrument(r, target):
+                return r["ctl"]
+        if not await _avenu_click_next_page(page):
+            break
+    return ""
+
+
+def _town_matches_filter(tf: str, t: str) -> bool:
+    """
+    Return True if grid town abbreviation `t` matches filter string `tf`.
+
+    Tries three strategies in order:
+    1. Substring in either direction — handles SCIT/SCITUATE, PLYM/PLYMOUTH, etc.
+    2. Known-abbreviation lookup — handles HLFX/HALIFAX, DXBY/DUXBURY, etc.
+    3. Reverse lookup (abbreviation passed as tf, full name in grid) — safety net.
+
+    Both `tf` and `t` must already be uppercased by the caller.
+    """
+    if tf in t or t in tf:
+        return True
+    abbrev = _PLYMOUTH_TOWN_ABBREVS.get(tf)
+    if abbrev and abbrev == t:
+        return True
+    # reverse: caller may have passed an abbreviation; check if it maps to t's full name
+    for full, ab in _PLYMOUTH_TOWN_ABBREVS.items():
+        if ab == tf and full == t:
+            return True
+    return False
+
+
+def _street_matches_filter(street_filter: str, street: str) -> bool:
+    """
+    Return True if the grid's Street cell `street` refers to the street named by
+    `street_filter` (the first street-name word parsed from --base-name).
+
+    The grid renders the street as "18 KESTREL AVE", "23 HARROWGATE DR",
+    "18 KESTREL AVE &OTHERS", etc., so a substring check on the street-name word
+    is sufficient and tolerates the varying suffix (AVE/AVENUE/DR/ST) and the
+    "&OTHERS" multi-parcel marker.  Both arguments are uppercased here, so the
+    caller need not.
+    """
+    sf = (street_filter or "").upper().strip()
+    s = (street or "").upper().strip()
+    if not sf or not s:
+        return False
+    return sf in s
+
+
+def _select_best_row(
+    rows: list,
+    town_filter: str,
+    prefer_first: bool = False,
+    street_filter: str = "",
+) -> dict | None:
+    """
+    Pick the best-matching result row given an optional town filter string and
+    (v3.12) an optional street filter.
+
+    When town_filter is provided, always try to find a town-matching row first —
+    even after a date-descending sort (prefer_first=True).  The seller may own
+    property in multiple towns; without a town filter the most-recently-recorded
+    deed could be for the wrong property.
+
+    v3.12 — street_filter narrows the town-matched set further.  A seller who owns
+    several properties in the SAME town defeats the town filter entirely: every
+    candidate row matches the town, so the most-recently-recorded one wins even if
+    it is a different parcel.  (Reference: Peter Grant, Hingham, 2026-07-13 — the
+    name search selected a DEED for 23 Harrowgate Dr while the subject property was
+    18 Kestrel Ave; both rows carried town HNGHM, so the town-mismatch retry never
+    fired.)  When street_filter is supplied, rows whose Street cell names that
+    street are preferred; if none do, the town-matched set is used unchanged so a
+    property with missing/odd street data still selects as before.
+
+    prefer_first=True  — rows are expected to be date-sorted descending (e.g. by
+                         Python sort in run_plymouth v2.7+); return the first
+                         matching row (most recently recorded for the correct
+                         town/street), or rows[0] if no match.
+    prefer_first=False — fallback when sort unavailable: pick the row with the
+                         highest book number as a proxy for most-recently-recorded.
+
+    Town matching: uses _town_matches_filter(), which handles substring cases
+    ("Scituate" ↔ "SCIT", "Plymouth" ↔ "PLYMO") and known non-substring
+    abbreviations ("Halifax" ↔ "HLFX", "Duxbury" ↔ "DXBY").
+    Street matching: uses _street_matches_filter() (substring on the street-name word).
+    """
+    if not rows:
+        return None
+
+    def _pick(candidates: list) -> dict:
+        if prefer_first:
+            return candidates[0]  # first = most recently recorded (rows are date-desc)
+        try:
+            return max(candidates, key=lambda r: int(r["book"]))
+        except (ValueError, TypeError):
+            return candidates[0]
+
+    if town_filter:
+        tf = town_filter.upper()
+
+        def town_matches(row: dict) -> bool:
+            t = (row.get("town") or "").upper()
+            return bool(t) and t != "NONE" and _town_matches_filter(tf, t)
+
+        matched = [r for r in rows if town_matches(r)]
+        if matched:
+            # v3.12 — same-town multi-property disambiguation.  Fall back to the
+            # town-only set when no row names the expected street, so this can
+            # only ever narrow a genuinely ambiguous set, never zero it out.
+            if street_filter:
+                street_matched = [
+                    r for r in matched
+                    if _street_matches_filter(street_filter, r.get("street", ""))
+                ]
+                if street_matched:
+                    matched = street_matched
+            return _pick(matched)
+        # No town match — fall through; caller handles the warning and retry
+
+    if prefer_first:
+        return rows[0]
+
+    try:
+        return max(rows, key=lambda r: int(r["book"]))
+    except (ValueError, TypeError):
+        return rows[0]
+
+
+async def _open_detail_panel(page: Page, ctl: str = "02", expected_book: str = "") -> bool:
+    """
+    Click the Book link for the given ctl row to open the detail panel.
+    If expected_book is provided, waits until the panel's Book/Page header
+    contains that book number — prevents reading stale panel data left over
+    from a previous row click (e.g., after a sort re-render).
+    """
+    try:
+        await page.click(f'a[href*="GridView_Document$ctl{ctl}$ButtonRow_Book"]')
+        await page.wait_for_selector('a[href*="TabController1"]', timeout=10000)
+        if expected_book:
+            # Wait up to 5s for the panel to show the correct book number
+            try:
+                await page.wait_for_function(
+                    f"() => document.body.innerText.includes('{expected_book}')",
+                    timeout=5000
+                )
+            except Exception:
+                pass  # proceed anyway — panel text check is best-effort
+        return True
+    except Exception:
+        return False
+
+
+async def _read_detail_panel(page: Page) -> dict:
+    """
+    Extract full grantor/grantee list and Consideration from the detail panel.
+    Panel is #DocDetails1 region (AJAX, same page).
+    """
+    grantors = []
+    grantees = []
+
+    gg_links = await page.query_selector_all('a[href*="DocDetails1$GridView_GrantorGrantee"]')
+    for link in gg_links:
+        name = (await link.inner_text()).strip()
+        if not name:
+            continue
+        # Role ("Grantor" / "Grantee") is in the last <td> of the same <tr>
+        try:
+            row_handle = await link.evaluate_handle("el => el.closest('tr')")
+            tds = await row_handle.query_selector_all("td")
+            role = (await tds[-1].inner_text()).strip() if tds else ""
+        except Exception:
+            role = ""
+        if "Grantor" in role:
+            grantors.append(name)
+        elif "Grantee" in role:
+            grantees.append(name)
+
+    # Consideration — in the header table of the detail panel
+    consideration = ""
+    references = []
+    try:
+        panel_text = await page.inner_text('[id*="DocDetails"]')
+        m = re.search(r"([\d,]+\.\d{2})\s*$", panel_text.strip(), re.MULTILINE)
+        if not m:
+            m = re.search(r"Consideration.*?([\d,]+\.\d{2})", panel_text, re.IGNORECASE | re.DOTALL)
+        if m:
+            consideration = m.group(1)
+        # v3.24 — the panel's References cross-ref list (e.g. "References - 2:
+        # 29868/325 DECLARATION OF HOMESTEAD 2005"), naming later homesteads,
+        # discharges, death certificates and related deeds against this
+        # instrument. Same title signal as the Middlesex South detail-panel
+        # References (v3.8) and the ALIS abstract's Ref By: list (v3.22);
+        # Plymouth was the one registry where the panel was read but this
+        # section dropped. Same slice parse as _msouth_read_detail_header.
+        ref_idx = panel_text.find("References")
+        if ref_idx >= 0:
+            references = [s.strip() for s in
+                          panel_text[ref_idx:ref_idx + 400].splitlines()
+                          if s.strip()]
+    except Exception:
+        pass
+
+    return {
+        "grantors": grantors,
+        "grantees": grantees,
+        "consideration": consideration,
+        "references": references,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Name parsing helpers
+# ---------------------------------------------------------------------------
+
+def _parse_name_for_search(full_name: str) -> str:
+    """
+    Convert a user-provided name in 'First [Middle] Last' order to Plymouth
+    'LAST FIRSTMIDDLE' search format (no spaces between first/middle parts).
+
+    Examples:
+      'William J. Marchetti'    → 'MARCHETTI WILLIAMJ'
+      'Thomas A. Marchetti'     → 'MARCHETTI THOMASA'
+      'A. Ralph Marchetti, Jr.' → 'MARCHETTI ARALPH'
+
+    Use this ONLY for user-provided seller names (--last / --first args).
+    Do NOT use for names returned by the registry (detail panel) — use
+    _clean_registry_name() instead.
+    """
+    name = full_name.upper().strip()
+    name = re.sub(r'\b(JR|SR|II|III|IV|ESQ|PHD|MD)\.?\b', '', name, flags=re.IGNORECASE)
+    name = re.sub(r'[,.]', '', name)
+    name = re.sub(r'\s+', ' ', name).strip()
+    parts = name.split()
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0]
+    last = parts[-1]
+    first_parts = ''.join(parts[:-1])
+    return f"{last} {first_parts}"
+
+
+def _clean_registry_name(registry_name: str) -> str:
+    """
+    Clean a name already in Plymouth registry format ('LAST FIRST MI' or
+    'LAST FIRST MI JR') for use as a Grantor search term.
+
+    Strips suffixes (JR, SR, etc.) and punctuation; does NOT reorder parts.
+
+    Examples:
+      'MARCHETTI WILLIAM J'    → 'MARCHETTI WILLIAM J'
+      'MARCHETTI THOMAS A'     → 'MARCHETTI THOMAS A'
+      'MARCHETTI A RALPH JR'   → 'MARCHETTI A RALPH'
+    """
+    name = registry_name.upper().strip()
+    name = re.sub(r'\b(JR|SR|II|III|IV|ESQ|PHD|MD)\.?\b', '', name, flags=re.IGNORECASE)
+    name = re.sub(r'[,.]', '', name)
+    name = re.sub(r'\s+', ' ', name).strip()
+    return name
+
+
+def _parse_street_from_base_name(base_name: str) -> tuple:
+    """
+    Parse street number and first street-name word from a base_name string.
+    Format: "NUM STREET [REST] - LASTNAME"
+    Returns (street_number, street_name_first_word_uppercase) or ("", "").
+
+    Examples:
+      "121 Wexford Avenue Hingham - Castellano" → ("121", "WEXFORD")
+      "62 Halyard Way Plymouth - Donnelly"     → ("62",  "HALYARD")
+      "12 Cranmore Hill Lane Unit 203 Scituate - Marchetti" → ("12", "CRANMORE")
+    """
+    part = base_name.split(" - ")[0].strip()
+    tokens = part.split()
+    # Accept "155", "155R", "12A" etc. — Massachusetts rear-lot addresses use letter suffixes
+    if len(tokens) >= 2 and re.match(r'^\d+[A-Za-z]{0,2}$', tokens[0]):
+        return tokens[0], tokens[1].upper()
+    return "", ""
+
+
+def _parse_deed_date(date_str: str) -> tuple:
+    """
+    Parse a Plymouth deed recorded-date string into a sortable (year, month, day) tuple.
+    Plymouth format: "M/D/YYYY" (e.g. "9/27/1978", "8/5/2002").
+    Falls back to year-only extraction. Returns (0, 0, 0) on total failure.
+    Used for Python-side date sort — more reliable than book-number comparison.
+    """
+    s = (date_str or "").strip()
+    for fmt in ("%m/%d/%Y", "%m-%d-%Y", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            return (dt.year, dt.month, dt.day)
+        except ValueError:
+            continue
+    m = re.search(r'\b(19|20)\d{2}\b', s)
+    return (int(m.group()), 0, 0) if m else (0, 0, 0)
+
+
+def _parse_town_from_base_name(base_name: str) -> str:
+    """
+    Extract the town name from a base_name string formatted as
+    '[Address] [Town] - [LastName]'.  Returns the last purely-alphabetic
+    token before the ' - ' separator (typically the town name).
+
+    Examples:
+      "155R Seabright Road Scituate - Marston"            → "SCITUATE"
+      "62 Halyard Way Plymouth - Donnelly"           → "PLYMOUTH"
+      "12 Cranmore Hill Lane Unit 203 Scituate - Marchetti" → "SCITUATE"
+    """
+    part = base_name.split(" - ")[0].strip()
+    alpha_tokens = [t for t in part.split() if t.isalpha() and len(t) > 1]
+    return alpha_tokens[-1].upper() if alpha_tokens else ""
+
+
+# v3.29 — Plymouth ACSDropDownList_DocumentType option values for the
+# all-years LIEN SWEEP: instruments against the PERSON that can reach
+# after-acquired property, and so are NOT answered by a date window starting
+# at acquisition. Enumerated live 2026-08-13 from the 586-entry listbox.
+#
+# PLYMOUTH CARRIES TWO PARALLEL VOCABULARIES and you need both. The 100xxx
+# range holds the terse codes the results grid actually displays; the 301xxx
+# range holds spelled-out names for the same concepts. They are DIFFERENT
+# options and selecting one does not select the other. The first cut of this
+# list took "301058 = BANKRUPTCY" and missed "100021 = BKCY" — the code this
+# seller's four bankruptcy filings (1990/1995/1999/2001) are actually indexed
+# under — so the live sweep returned two attachments and silently no
+# bankruptcies. A sweep that quietly misses the thing it exists to find is
+# worse than no sweep: pair every concept across both ranges.
+#
+# Creating and continuing instruments only. Terminations (DIS ATT, DIS LIEN,
+# REL ATT, PAR REL OF LIEN, the *EXON exoneration variants, DISCHARGE OF
+# ATTACHMENT) are excluded — they cannot encumber, and this workflow does not
+# verify discharges either way. Power-of-attorney entries (P OF ATTY, DEED &
+# P OF ATTY, REVOCATION OF P OF ATTY) match a naive "ATT" pattern and are
+# deliberately NOT here. Parcel-level tax title/receipt entries are also out:
+# they run with the land, so a pre-acquisition one belongs to a prior owner
+# and this seller's grantor index would not carry it anyway.
+_PLYMOUTH_LIEN_DOC_TYPES = [
+    # Attachment family — terse (100xxx) and spelled (301xxx)
+    "100019",   # ATTACHMENT
+    "301056",   # ATTACHEMENT  (the registry's own misspelling, a real option)
+    "100344",   # CERTIFICATE OF ATTACHMENT
+    "100128",   # AFFT ATT
+    "100153",   # AMDT ATT
+    "100219",   # ASST ATT
+    "100381",   # DCRE ATT
+    "100435",   # EXTN ATT
+    "100470",   # MDFN ATT
+    "100486",   # MOTN ATT
+    "100507",   # NOTC ATT
+    "301162",   # NOTICE OF ATT
+    "100524",   # ORDR ATT
+    "100585",   # PR ATT
+    # Execution / judgment
+    "301127",   # EXECUTION
+    "301047",   # ASST EXECUTION
+    "301134",   # JUDGMENT
+    # Bankruptcy — BOTH spellings (see note above)
+    "100021",   # BKCY      ← the code the grid actually shows
+    "301058",   # BANKRUPTCY
+    # Liens
+    "100042",   # LIEN
+    "301052",   # ASST LIEN
+    "300955",   # TAX LIEN
+    "300994",   # PR LIEN
+    "100663",   # SUBD LIEN
+    "100672",   # SUBD TAX LIEN
+    # Levy
+    "100088",   # LEVY
+]
+
+
+async def _grantor_check_search(
+    g_page: Page,
+    search_name: str,
+    original_book: str,
+    original_doc: str = "",
+    date_from: tuple = None,
+    doc_type_values: list = None,
+) -> list:
+    """
+    Run a Grantor search for search_name, return rows that are NOT the original deed.
+    Fixes vs v2.0:
+      - No '_0' suffix on column name (matches 'ButtonRow_Doc. #_0' correctly)
+      - ctl numbering uses f'{n:02d}' (handles n >= 10)
+    v3.6: rows are read via the atomic _read_all_result_rows snapshot, and the
+    original-deed skip requires a doc-number match when available (book alone
+    wrongly excluded same-book purchase-money mortgages).
+    """
+    await _plymouth_search(g_page, search_name, "D", date_from=date_from,
+                           doc_type_values=doc_type_values)
+    rows = []
+    if not await _has_results(g_page, timeout_ms=15000):
+        return rows
+
+    # Sort descending so post-acquisition deeds appear first (most relevant to title)
+    await _sort_results_by_date_desc(g_page)  # best-effort; non-fatal if header not found
+
+    # v3.6: atomic grid snapshot (see _read_all_result_rows).  The prior
+    # per-cell loop here had the same UpdatePanel race as the grantee grid —
+    # a blank Book cell read mid-render caused an early break that silently
+    # dropped grantor-check rows (observed 2026-07-08: 7 hits on run 1 vs 4
+    # on run 3 for the identical KDM REALTY CORP search).
+    # v3.7: reads all rendered rows (up to 50/page) and walks pager pages if
+    # present — the old ctl11 cap hid the oldest instruments (1989 MTG, 1994
+    # ASST, 1995 Commonwealth TKG) on the 36-year-held KDM parcel.
+    for r in await _read_all_result_rows_paginated(g_page):
+        # Skip only the original deed itself (indexed under both party
+        # types).  Matching on book alone is too aggressive: it dropped a
+        # same-day purchase-money mortgage recorded in the same book as the
+        # vesting deed (Bk08827 Doc#41887 MTG vs deed Doc#41886).
+        if r["book"] == original_book and (
+            not original_doc or not r["doc_number"] or r["doc_number"] == original_doc
+        ):
+            continue
+        rows.append({
+            "book":          r["book"],
+            "doc_number":    r["doc_number"],
+            "deed_type":     r["deed_type"],
+            "recorded_date": r["recorded_date"],
+            "grantee":       r["reverse_party"],
+            "street":        r["street"],
+            "town":          r["town"],
+            "searched_name": search_name,
+        })
+
+    return rows
+
+
+# v3.21 — Plymouth grantor-hit classification, most-relevant tier first.
+# The ORDER of this tuple is the report/JSON sort order.
+_PLYMOUTH_HIT_TIERS = (
+    "subject",             # street number AND name match the subject street
+    "possible_subject",    # street name matches, number missing/unconfirmed
+    "unknown_same_town",   # no address indexed, but the subject town
+    "other_same_town",     # a different street in the subject town
+    "other_parcel",        # a different street in a different town
+    "other_town",          # no address indexed, and a different town
+)
+
+_PLYMOUTH_HIT_TAGS = {
+    "subject":           "SUBJECT PROPERTY",
+    "possible_subject":  "possible subject — street name matches, number unconfirmed",
+    "unknown_same_town": "parcel unknown (no address indexed) — subject town",
+    "other_same_town":   "other street, subject town",
+    "other_parcel":      "other parcel",
+    "other_town":        "other town, no address indexed",
+}
+
+
+def _plymouth_classify_grantor_hit(row: dict, st_num: str, st_word: str,
+                                   subject_town: str, acq_date: tuple) -> dict:
+    """
+    v3.21 — classify ONE Plymouth grantor-check hit against the subject
+    parcel. Ported from the ALIS grantor-check filters (v3.11/v3.16) and
+    strengthened: the Plymouth results grid carries a street + town cell
+    per row, so the parcel question is answerable straight from the index
+    with no PDF sampling (ALIS has no address in its index at all).
+
+    Motivating run: James Merrick / 52 Kingsbury Rd, Hingham (2026-08-12).
+    A grantor search on the common name `MERRICK JAMES` returned 93
+    instruments — about forty of them 1870s Hull deeds belonging to a
+    19th-century namesake — and every one had to be assessed by hand. Only
+    three touched the subject parcel.
+
+    NOTHING IS EVER DROPPED. Plymouth runs full-name searches only (named
+    seller + each grantee off the deed), and per the ALIS rule a full-name
+    hit is kept regardless of type or date — the seller's OWN mortgages,
+    homesteads and liens arrive through exactly these searches. This
+    classifies and ORDERS the hits instead, and marks the short set that
+    genuinely needs judgment.
+
+    Returns {parcel, pre_acquisition, conveyance, needs_review, tag}.
+
+    `needs_review` is True when the hit is at (or cannot be excluded from)
+    the subject parcel, OR when it is a conveyance-type instrument recorded
+    on/after the acquisition date — the two ways a deed-out can present. A
+    row with no indexed address is NEVER treated as a different parcel on
+    that basis alone; it is only deprioritised when its TOWN also differs
+    (the Keegan lesson: missing information is not a non-match).
+    """
+    street = (row.get("street") or "").strip()
+    town   = (row.get("town") or "").strip().upper()
+    town_match = bool(subject_town) and _town_matches_filter(subject_town.upper(), town)
+
+    if _alis_address_matches(st_num, st_word, street):
+        parcel = "subject"
+    elif _alis_street_word_matches(st_word, street):
+        parcel = "possible_subject"
+    elif street:
+        parcel = "other_same_town" if town_match else "other_parcel"
+    else:
+        parcel = "unknown_same_town" if town_match else "other_town"
+
+    row_date = _parse_deed_date(row.get("recorded_date") or "")
+    # A row whose date will not parse is treated as post-acquisition — the
+    # safe direction for a deed-out check.
+    pre_acq = bool(acq_date > (0, 0, 0) and (0, 0, 0) < row_date < acq_date)
+    conveyance = not _is_non_conveyance_instrument(row.get("deed_type") or "")
+
+    needs_review = (
+        parcel in ("subject", "possible_subject", "unknown_same_town")
+        or (conveyance and not pre_acq)
+    )
+    tag = _PLYMOUTH_HIT_TAGS[parcel] + (" | pre-acquisition" if pre_acq else "")
+    return {
+        "parcel": parcel,
+        "pre_acquisition": pre_acq,
+        "conveyance": conveyance,
+        "needs_review": needs_review,
+        "tag": tag,
+    }
+
+
+def _plymouth_grantor_sort_key(row: dict) -> tuple:
+    """
+    v3.21 — order grantor hits most-relevant first: subject parcel before
+    unknown before other; post-acquisition before pre-acquisition;
+    conveyances before non-conveyances; then newest first. Without this the
+    one row that matters sits wherever the registry's date sort left it
+    (Merrick: the three subject-parcel rows were #3, #4 and #5 of 93).
+    """
+    c = row.get("classification") or {}
+    try:
+        tier = _PLYMOUTH_HIT_TIERS.index(c.get("parcel", "other_town"))
+    except ValueError:
+        tier = len(_PLYMOUTH_HIT_TIERS)
+    y, m, d = _parse_deed_date(row.get("recorded_date") or "")
+    return (tier, c.get("pre_acquisition", False), not c.get("conveyance", False),
+            -y, -m, -d)
+
+
+def _plymouth_grantor_hit_str(row: dict) -> str:
+    """v3.21 — one grantor-check hit as its report/JSON line, classification
+    tag appended when the hit could be classified."""
+    c = row.get("classification")
+    return (
+        f"Bk{row['book']} {row['deed_type']} {row['recorded_date']} "
+        f"| Grantee: {row['grantee']} | {row['street']}, {row['town']} "
+        f"| Doc#{row['doc_number']} | [found via: {row['searched_name']}]"
+        + (f" | {c['tag']}" if c else "")
+    )
+
+
+def _plymouth_broaden_prefix_name(name: str) -> str:
+    """
+    v3.30 (item 11) — drop a trailing middle initial from a Plymouth
+    grantor-search name.
+
+    Plymouth's party field is a PREFIX match: the index entry must START
+    WITH the query. So 'GRANT LAUREN S' cannot reach an instrument indexed
+    as 'GRANT LAUREN', while the bare 'GRANT LAUREN' reaches both — 49 rows
+    vs 14 on log 2026-08-13-001. The broad form is a strict superset, so it
+    REPLACES the narrow one instead of adding a second search. This matters
+    most for co-owner names, which come from the detail panel in whatever
+    form THAT deed used, while the co-owner's later deed-out may be indexed
+    without the initial. Same trap as the v3.5 compound-surname limitation,
+    different axis.
+
+    Only a trailing single letter (optionally with a period) is dropped,
+    and only while at least two tokens remain: 'GRANT LAUREN' and
+    'DE SOUSA MARIA' are returned untouched.
+    """
+    toks = name.split()
+    if len(toks) >= 3:
+        tail = toks[-1].rstrip(".")
+        if len(tail) == 1 and tail.isalpha():
+            return " ".join(toks[:-1])
+    return name
+
+
+def _plymouth_record_searches(result: dict, search_log: list) -> None:
+    """
+    v3.30 (item 11) — record what each grantor search actually ran and
+    returned, into grantor_check.searches plus one readable note.
+
+    Hits are de-duplicated across searches and tagged with the first search
+    that found them, so a co-owner who signed the same instruments as the
+    named seller contributes no visibly-new lines. Without this record,
+    "searched, every row a duplicate" and "never searched" produce byte-
+    identical output, and the only way to tell them apart is to re-run the
+    co-owner's search by hand — which is exactly what the Grant / 23
+    Harrowgate Dr run cost. Reporting zero rows as a clean answer when the
+    search never ran is the recurring v3.20/v3.23/v3.29 failure.
+    """
+    gc = result.setdefault("grantor_check", {})
+    gc["searches"] = search_log
+    if not search_log:
+        return
+    errored = [s for s in search_log if s.get("status", "").startswith("ERROR")]
+    lines = [f"Grantor searches: {len(search_log) - len(errored)} of "
+             f"{len(search_log)} completed."]
+    for s in search_log:
+        if s.get("status", "").startswith("ERROR"):
+            outcome = f"DID NOT RUN — {s['status']}; this name is an OPEN question"
+        elif s["rows_returned"] == 0:
+            outcome = "0 rows — searched, nothing indexed for this name"
+        elif s["rows_new"] == 0:
+            outcome = (f"{s['rows_returned']} rows, 0 new — searched; every row "
+                       f"was already found by an earlier search name "
+                       f"(duplicate, NOT skipped)")
+        else:
+            outcome = f"{s['rows_returned']} rows, {s['rows_new']} new"
+        lines.append(f"  - '{s['name']}' [{s['label']}]: {outcome}")
+    result.setdefault("notes", []).append("\n".join(lines))
+
+
+def _plymouth_finalize_grantor_check(result: dict, rows: list, st_num: str,
+                                     st_word: str, subject_town: str) -> None:
+    """
+    v3.21 — classify, order and summarise the Plymouth grantor-check hits,
+    mutating `result` in place. Ported from the ALIS grantor-check filters
+    (v3.11/v3.16) after the Merrick / 52 Kingsbury Rd run (2026-08-12), where
+    the common name `MERRICK JAMES` returned 93 instruments — about forty of
+    them 1870s Hull deeds belonging to a namesake — and all 93 had to be
+    read by hand. Only three touched the subject parcel.
+
+    NOTHING IS DROPPED. grantor_check.deeds still lists every hit; it is now
+    ordered most-relevant first and each line carries a parcel tag. The new
+    grantor_check.needs_review holds the short set that actually needs
+    judgment, and grantor_check.summary the tier counts. On the Merrick set
+    this is 5 rows instead of 93.
+
+    Classification needs a street parsed from --base-name; without one
+    (entity sellers, unparseable base names) every hit is left unclassified
+    and reported for manual assessment exactly as before v3.21.
+    """
+    acq_date = _parse_deed_date(result.get("recorded_date") or "")
+    classified = bool(st_num and st_word)
+    if classified:
+        for r in rows:
+            r["classification"] = _plymouth_classify_grantor_hit(
+                r, st_num, st_word, subject_town, acq_date)
+        rows.sort(key=_plymouth_grantor_sort_key)
+    else:
+        result["notes"].append(
+            "Grantor-hit classification skipped: no street number/name parsed "
+            "from the base name — every hit below must be assessed manually "
+            "by parcel."
+        )
+
+    gc = result["grantor_check"]
+    gc["has_subsequent_deed"] = len(rows) > 0
+    gc["deeds"] = [_plymouth_grantor_hit_str(r) for r in rows]
+    review = [r for r in rows
+              if not classified or r["classification"]["needs_review"]]
+    gc["needs_review"] = [_plymouth_grantor_hit_str(r) for r in review]
+
+    if classified:
+        counts = {t: 0 for t in _PLYMOUTH_HIT_TIERS}
+        for r in rows:
+            counts[r["classification"]["parcel"]] += 1
+        gc["summary"] = {
+            "total": len(rows),
+            "needs_review": len(review),
+            "pre_acquisition": sum(
+                1 for r in rows if r["classification"]["pre_acquisition"]),
+            **counts,
+        }
+        # A conveyance at the subject parcel recorded on/after the
+        # acquisition date is the deed-out this whole check exists to find.
+        for r in rows:
+            c = r["classification"]
+            if c["parcel"] != "subject" or c["pre_acquisition"]:
+                continue
+            if c["conveyance"]:
+                result["notes"].append(
+                    f"CRITICAL: grantor hit Bk{r['book']} Doc#{r['doc_number']} "
+                    f"({r['deed_type']} {r['recorded_date']}) is a conveyance-type "
+                    f"instrument at the SUBJECT property ({r['street']}, {r['town']}) "
+                    "recorded on/after the acquisition — the seller may have deeded "
+                    "the subject parcel out. Verify before closing."
+                )
+            else:
+                result["notes"].append(
+                    f"Grantor hit Bk{r['book']} Doc#{r['doc_number']} "
+                    f"({r['deed_type']} {r['recorded_date']}) affects the SUBJECT "
+                    "property but is not a conveyance — assess as an encumbrance "
+                    "(homestead/lien/mortgage), not as a deed-out."
+                )
+
+    if not rows:
+        result["notes"].append(
+            "Grantor check: no subsequent deeds found across all grantees — clean title."
+        )
+    elif classified:
+        s = gc["summary"]
+        result["notes"].append(
+            f"Grantor check: {s['total']} instrument(s) found; {s['needs_review']} "
+            f"need review (subject parcel: {s['subject']}, possible subject: "
+            f"{s['possible_subject']}, unknown parcel in the subject town: "
+            f"{s['unknown_same_town']}, plus any post-acquisition conveyance "
+            f"elsewhere). The other {s['total'] - s['needs_review']} are other "
+            "parcels/towns or pre-acquisition and are still listed in full in "
+            "grantor_check.deeds, ordered most-relevant first. READ "
+            "grantor_check.needs_review FIRST. A 'parcel unknown' tag means the "
+            "index carried no address — that row was NOT ruled out."
+        )
+    else:
+        result["notes"].append(
+            f"Grantor check: {len(rows)} subsequent deed(s) found — "
+            "Claude must assess title flags."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Plymouth County — main workflow
+# ---------------------------------------------------------------------------
+
+async def run_plymouth(
+    seller_last: str,
+    seller_first: str,
+    base_name: str,
+    output_folder: Path,
+    headless: bool,
+    town: str = "",
+    street_number: str = "",
+    street_name: str = "",
+    force_address_search: bool = False,
+) -> dict:
+    """
+    Plymouth County Registry of Deeds — full workflow:
+    1. Grantee search → results grid → extract metadata
+    2. Detail panel → full grantor/grantee list + consideration
+    3. View Images → ImageViewerEx.aspx → download all pages
+    4. Grantor check
+    """
+    result = {
+        "status": "error",
+        "registry": "Plymouth County",
+        "registry_url": PLYMOUTH_SEARCH,
+        "registry_system": "Avenu/20-20 (ASP.NET)",
+        "book": None,
+        "page": None,
+        "document_number": None,
+        "recorded_date": None,
+        "deed_type": None,
+        "consideration": None,
+        "grantors": [],
+        "grantees": [],
+        "deed_property_address": None,
+        # v3.21 — needs_review/summary are populated by the grantor-check
+        # classifier; needs_review is the short set requiring judgment.
+        # v3.30 — `searches` records what each grantor search actually ran
+        # and returned, so a co-owner pass whose rows all duplicate the
+        # named seller's is distinguishable from one that never ran.
+        "grantor_check": {"has_subsequent_deed": False, "deeds": [],
+                          "needs_review": [], "summary": None, "searches": []},
+        # v3.24 — the detail panel's References cross-ref list (later
+        # homesteads/discharges/related deeds against the selected deed).
+        "detail_references": [],
+        # v3.26 — the same data normalised into the shared cross-reference
+        # shape used by every registry (leads, NOT discharge verification).
+        "cross_references": [],
+        "files": [],
+        "total_pages_in_viewer": None,
+        "found_via_address_search": False,
+        "found_via_compound_surname": False,
+        "selected_row_is_not_a_deed": False,
+        "results_truncated_at_cap": False,
+        "notes": [],
+        "errors": [],
+    }
+
+    # Plymouth name format: "LAST FIRST" (no comma, no spaces in compound first names)
+    first_normalized = seller_first.upper().replace(" ", "")
+    combined_name = f"{seller_last.upper()} {first_normalized}"
+    # First token of the seller's first name, used to filter surname-only retry
+    # results (e.g. "ALAN" matched against grantee "WHITFIELD-BARROW ALAN D").
+    first_token = (seller_first.upper().split() or [""])[0]
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=headless)
+        context = await browser.new_context(accept_downloads=True)
+        page = await context.new_page()
+
+        try:
+            # -----------------------------------------------------------
+            # STEP 1 — GRANTEE SEARCH (with address-search fallback)
+            # -----------------------------------------------------------
+            found_via_address = False
+            first_name_filter = ""  # set when the compound-surname retry fires
+
+            if force_address_search:
+                if not street_number or not street_name:
+                    result["status"] = "error"
+                    result["errors"].append(
+                        "--force-address-search requires --street-number and --street "
+                        "(or a --base-name starting with 'NUM STREET')."
+                    )
+                    await browser.close()
+                    return result
+                result["notes"].append(
+                    f"Force address search: skipping name search, "
+                    f"searching directly for {street_number} {street_name} (town={town!r})."
+                )
+                await _plymouth_address_search(page, street_number, street_name, town, result=result)
+                if not await _has_results(page):
+                    result["status"] = "deed_not_found"
+                    result["notes"].append("Force address search: no results.")
+                    await browser.close()
+                    return result
+                found_via_address = True
+                result["found_via_address_search"] = True
+            else:
+                await _plymouth_search(page, combined_name, "I")
+
+            if not force_address_search and not await _has_results(page):
+                body = await page.inner_text("body")
+                result["notes"].append(
+                    f"No results for '{combined_name}' as Grantee. "
+                    f"Page text snippet: {body[:200]}"
+                )
+
+                # v3.5 — HYPHENATED / COMPOUND-SURNAME RETRY (before address fallback)
+                # Plymouth's combined "LAST FIRST" field prefix-matches the index,
+                # so a partial surname on a hyphenated name fails ("WHITFIELD ALAN" does
+                # not prefix-match "WHITFIELD-BARROW ALAN D"). Retry with the surname
+                # ONLY — "WHITFIELD" prefix-matches "WHITFIELD-BARROW ..." — then filter
+                # the returned rows by first name so an unrelated same-prefix surname
+                # is not selected.
+                compound_found = await _plymouth_compound_surname_retry(
+                    page, seller_last, result
+                )
+                if compound_found:
+                    result["found_via_compound_surname"] = True
+                    first_name_filter = first_token
+                    result["notes"].append(
+                        f"Compound-surname retry active — filtering results by first "
+                        f"name token '{first_token}'."
+                    )
+
+                # Property may be trust-vested or LLC-vested: the grantee on the
+                # deed is an entity, not the individual seller. Fall back to a
+                # property address search which returns all instruments at that address.
+                if compound_found:
+                    pass  # results already loaded by the surname-only retry
+                elif street_number and street_name:
+                    result["notes"].append(
+                        f"Trying address search fallback: "
+                        f"street_number={street_number!r} street_name={street_name!r}."
+                    )
+                    await _plymouth_address_search(page, street_number, street_name, town, result=result)
+                    if not await _has_results(page):
+                        result["status"] = "deed_not_found"
+                        result["notes"].append(
+                            "Address search fallback also returned no results."
+                        )
+                        await browser.close()
+                        return result
+                    found_via_address = True
+                    result["found_via_address_search"] = True
+                    result["notes"].append(
+                        "Address search found results — property may be trust-vested or "
+                        "LLC-vested. Verify grantee entity and confirm signing authority."
+                    )
+                else:
+                    result["status"] = "deed_not_found"
+                    result["notes"].append(
+                        "Address search fallback unavailable (no street number/name). "
+                        "Pass --street-number and --street, or ensure --base-name starts "
+                        "with 'NUM STREET' so street info can be auto-parsed."
+                    )
+                    await browser.close()
+                    return result
+
+            # -----------------------------------------------------------
+            # STEP 2 — SORT BY DATE DESC, THEN EXTRACT METADATA
+            # Sorting descending puts the most recently recorded deed first.
+            # -----------------------------------------------------------
+            # v3.13 — replay the search that is currently on screen.  Needed by
+            # _plymouth_relocate_row(): the pager walk parks the grid on the LAST
+            # page, so a row selected from an earlier page must have its page
+            # brought back before its Book link can be clicked.
+            async def _replay_search():
+                if found_via_address:
+                    await _plymouth_address_search(page, street_number, street_name, town)
+                elif result["found_via_compound_surname"]:
+                    await _plymouth_search(page, seller_last.upper().strip(), "I")
+                else:
+                    await _plymouth_search(page, combined_name, "I")
+                await _has_results(page, timeout_ms=20000)
+
+            # v3.13 — page size FIRST, then sort.  The 100/Page postback re-renders
+            # the grid from the default index order, which DISCARDS the Rec Date
+            # sort — so sorting first and paging second silently returns rows in
+            # ascending/default order (observed live: a date-sorted GRANT PETER
+            # search came back starting at 1757 once the page-size switch landed).
+            # Selection does not depend on this (the name path re-sorts in Python
+            # and the address path picks by max book/doc), but the on-screen order
+            # must still match what the notes claim, and prefer_first= relies on it.
+            await _avenu_set_page_size_100(page)
+            sorted_desc = await _sort_results_by_date_desc(page)
+            result["notes"].append(
+                f"Date sort descending: {'applied' if sorted_desc else 'not applied (header not found — using book-number fallback)'}."
+            )
+            # v3.13 — read EVERY pager page, not just the first.  The grid defaults
+            # to 20 rows/page; the walk switches it to 100 and follows the Next
+            # button to the last page.  Previously only page 1 was read, so an older
+            # vesting deed on a busy seller was invisible (live 2026-07-13: the
+            # GRANT PETER grantee search reports 122 rows; the script saw 20).
+            all_rows = await _read_all_result_rows_paginated(
+                page, notes=result["notes"], flags=result
+            )
+            search_label = "Address search" if found_via_address else "Grantee search"
+            result["notes"].append(
+                f"{search_label} returned {len(all_rows)} row(s). "
+                + " | ".join(
+                    f"[p{r.get('_pager_page', 1)}/{r['ctl']}] Bk{r['book']} {r['deed_type']} "
+                    f"{r['recorded_date']} addr={r['street']!r} town={r['town']!r}"
+                    for r in all_rows[:40]
+                )
+                + (f" | ...(+{len(all_rows) - 40} more)" if len(all_rows) > 40 else "")
+            )
+
+            # v3.5 — first-name filter for the compound-surname retry.
+            # The surname-only search returns every grantee whose surname begins
+            # with the seller's last name (e.g. "WHITFIELD" matches "WHITFIELD-BARROW"
+            # but could also match an unrelated "WHITFIELD"). Keep only rows whose
+            # grantee Name column contains the seller's first name token.
+            if first_name_filter and not found_via_address and all_rows:
+                fn = first_name_filter.upper()
+                fn_rows = [r for r in all_rows if fn in (r.get("name") or "").upper()]
+                if fn_rows:
+                    result["notes"].append(
+                        f"Compound-surname retry: filtered {len(all_rows)} surname "
+                        f"row(s) to {len(fn_rows)} matching first name '{first_name_filter}'."
+                    )
+                    all_rows = fn_rows
+                else:
+                    result["notes"].append(
+                        f"Compound-surname retry: no rows matched first name "
+                        f"'{first_name_filter}' among {len(all_rows)} surname row(s) — "
+                        f"proceeding with all rows. VERIFY MANUALLY."
+                    )
+
+            # Address search returns all instrument types at the property
+            # (mortgages, notices, discharges, etc.). Filter to deed-type rows
+            # so _select_best_row() picks the vesting deed, not a mortgage.
+            if found_via_address and all_rows:
+                deed_rows = [
+                    r for r in all_rows
+                    if not _is_non_conveyance_instrument(r.get("deed_type", ""))
+                ]
+                if deed_rows:
+                    excluded_types = [r["deed_type"] for r in all_rows if r not in deed_rows]
+                    result["notes"].append(
+                        f"Address search: filtered to {len(deed_rows)} deed-type row(s). "
+                        f"Excluded: {excluded_types}"
+                    )
+                    all_rows = deed_rows
+                else:
+                    result["notes"].append(
+                        "Address search: no rows survived deed-type filter — using all rows."
+                    )
+
+            # Name-search results can include non-conveyance instruments where the
+            # seller is indexed as grantee — most commonly DIS (discharge of mortgage,
+            # where the borrower/homeowner is the grantee beneficiary).  Filter these
+            # out so _select_best_row() picks the actual vesting deed, not whatever
+            # was most recently recorded.  Falls back to the unfiltered set if no
+            # conveyance-type rows survive (prevents silent exit-2 on unusual indexes).
+            if not found_via_address and all_rows:
+                # v3.4 — use the shared classifier so tax-title redemptions ("CR"),
+                # tax takings, municipal lien certificates, easements, etc. are never
+                # treated as a vesting deed (the 2026-06-23 run reported a redemption).
+                deed_rows = [
+                    r for r in all_rows
+                    if not _is_non_conveyance_instrument(r.get("deed_type", ""))
+                ]
+                if deed_rows:
+                    excluded = [r["deed_type"] for r in all_rows if r not in deed_rows]
+                    result["notes"].append(
+                        f"Name search: filtered {len(excluded)} non-deed row(s) "
+                        f"before selection: {excluded}."
+                    )
+                    all_rows = deed_rows
+                else:
+                    result["notes"].append(
+                        "Name search: no rows survived deed-type filter — using all rows as-is."
+                    )
+
+            # Python date sort (v2.7) — overrides browser-side sort for name-search path.
+            # Browser sort validation using book numbers is unreliable when Plymouth
+            # County's digitized old records have non-monotonic book numbers (e.g.
+            # a 1978 deed at Bk32450 while a 2002 deed is at Bk22572).  Sorting in
+            # Python by parsed date is always correct regardless of book numbering.
+            if not found_via_address and all_rows:
+                all_rows.sort(
+                    key=lambda r: _parse_deed_date(r.get("recorded_date", "")),
+                    reverse=True,
+                )
+                sorted_desc = True  # Python sort guarantees descending order
+
+            if found_via_address:
+                # Address search: pick by (book, doc_number) descending so we get
+                # the most recently recorded deed. Using doc_number as a tiebreaker
+                # handles the case where multiple documents share the same book
+                # (e.g. a Trustee's Certificate and the vesting deed recorded on the
+                # same day — the deed has the higher doc number).
+                try:
+                    row = max(
+                        all_rows,
+                        key=lambda r: (int(r.get("book") or 0), int(r.get("doc_number") or 0))
+                    )
+                except (ValueError, TypeError):
+                    row = all_rows[0] if all_rows else None
+            else:
+                row = _select_best_row(
+                    all_rows, town, prefer_first=sorted_desc, street_filter=street_name,
+                )
+            if row is None:
+                result["status"] = "deed_not_found"
+                result["notes"].append("No result rows found after reading grid.")
+                await browser.close()
+                return result
+
+            # -----------------------------------------------------------
+            # WRONG-PARCEL DETECTION → ADDRESS-SEARCH RETRY
+            # -----------------------------------------------------------
+            # Two independent signals that the name search selected a deed for
+            # the wrong property.  Both funnel into the same address-search
+            # retry, which is more discriminating because it filters by street.
+            #
+            #   town mismatch   (v2.7) — seller owns property in another town.
+            #   street mismatch (v3.12) — seller owns MULTIPLE PROPERTIES IN THE
+            #       SAME TOWN, so the town filter matched every candidate and the
+            #       most-recently-recorded one won regardless of street.
+            #       (Peter Grant, Hingham, 2026-07-13: name search returned a DEED
+            #       for 23 Harrowgate Dr; subject property was 18 Kestrel Ave.  Both rows
+            #       carried town HNGHM, so the v2.7 town check never fired.)
+            town_mismatch = False
+            street_mismatch = False
+
+            if not found_via_address:
+                if town and (row.get("town") or "").upper() not in ("", "NONE"):
+                    town_mismatch = not _town_matches_filter(
+                        town.upper(), (row.get("town") or "").upper()
+                    )
+                # Only meaningful when the town is right — a town mismatch is the
+                # stronger signal and is reported on its own terms below.
+                if street_name and not town_mismatch and (row.get("street") or "").strip():
+                    street_mismatch = not _street_matches_filter(
+                        street_name, row.get("street", "")
+                    )
+
+            if town_mismatch:
+                if len(all_rows) == 1:
+                    # Single result — no ambiguity to resolve.  The town filter
+                    # failed only because this abbreviation isn't in the dict yet.
+                    # Accept the row as-is and prompt to update the dict.
+                    result["notes"].append(
+                        f"NOTE: town abbreviation '{(row.get('town') or '').upper()}' not yet in "
+                        f"_PLYMOUTH_TOWN_ABBREVS for '{town}'. "
+                        f"Add entry \"{town}\": \"{(row.get('town') or '').upper()}\" to the dict. "
+                        f"Single result — proceeding without retry."
+                    )
+                else:
+                    # Multiple results and none matched the expected town —
+                    # genuine multi-property ambiguity; retry with address search.
+                    result["notes"].append(
+                        f"WARNING: no name-search result matched town '{town}'. "
+                        f"Best available row is Bk{row['book']} town={row['town']!r} "
+                        f"(possible wrong property — seller may own multiple Plymouth Co. properties)."
+                    )
+            elif street_mismatch:
+                result["notes"].append(
+                    f"WARNING: name-search selected row street {row.get('street')!r} does not "
+                    f"match expected street '{street_name}' (town {row.get('town')!r} DID match) — "
+                    f"seller likely owns multiple properties in {town or 'this town'}."
+                )
+
+            # Retry on either signal.  A town mismatch on a single-row result is
+            # an unknown-abbreviation artifact, not real ambiguity, so it is
+            # excluded (v2.9) — but a street mismatch is meaningful even with one
+            # row, since the deed plainly names a different street.
+            retry_reason = ""
+            if town_mismatch and len(all_rows) > 1:
+                retry_reason = "town mismatch"
+            elif street_mismatch:
+                retry_reason = "street mismatch"
+
+            if retry_reason and not found_via_address and street_number and street_name:
+                result["notes"].append(
+                    f"{retry_reason.capitalize()}: retrying with address search "
+                    f"({street_number} {street_name}, town={town!r})."
+                )
+                await _plymouth_address_search(page, street_number, street_name, town, result=result)
+                if await _has_results(page, timeout_ms=15000):
+                    found_via_address = True
+                    result["found_via_address_search"] = True
+                    result["notes"].append(
+                        f"Address search ({retry_reason} retry) returned results."
+                    )
+                    # v3.13 — page size before sort, then walk every pager page
+                    # (a busy street can exceed one page just like a busy seller).
+                    await _avenu_set_page_size_100(page)
+                    await _sort_results_by_date_desc(page)
+                    addr_rows = await _read_all_result_rows_paginated(
+                        page, notes=result["notes"], flags=result
+                    )
+                    result["notes"].append(
+                        f"Address search ({retry_reason} retry) returned {len(addr_rows)} row(s). "
+                        + " | ".join(
+                            f"[p{r.get('_pager_page', 1)}/{r['ctl']}] Bk{r['book']} {r['deed_type']} "
+                            f"{r['recorded_date']} addr={r['street']!r} town={r['town']!r}"
+                            for r in addr_rows[:40]
+                        )
+                        + (f" | ...(+{len(addr_rows) - 40} more)" if len(addr_rows) > 40 else "")
+                    )
+                    addr_deed_rows = [
+                        r for r in addr_rows
+                        if not _is_non_conveyance_instrument(r.get("deed_type", ""))
+                    ]
+                    if addr_deed_rows:
+                        result["notes"].append(
+                            f"Address search ({retry_reason} retry): filtered to "
+                            f"{len(addr_deed_rows)} deed-type row(s)."
+                        )
+                        addr_rows = addr_deed_rows
+                    try:
+                        row = max(
+                            addr_rows,
+                            key=lambda r: (
+                                int(r.get("book") or 0),
+                                int(r.get("doc_number") or 0),
+                            ),
+                        )
+                    except (ValueError, TypeError):
+                        row = addr_rows[0] if addr_rows else row
+                    result["notes"].append(
+                        f"Address search ({retry_reason} retry): selected "
+                        f"Bk{row['book']} {row['deed_type']} {row['recorded_date']} "
+                        f"town={row['town']!r} addr={row.get('street')!r}."
+                    )
+                else:
+                    result["notes"].append(
+                        f"Address search ({retry_reason} retry): no results — "
+                        "proceeding with name-search selection. VERIFY MANUALLY."
+                    )
+            elif street_mismatch:
+                # Street mismatch detected but no address search possible (street
+                # info unparseable).  Never fail silently on a known wrong parcel.
+                result["notes"].append(
+                    "WARNING: street mismatch detected but address-search retry "
+                    "unavailable (no street number/name parsed). VERIFY MANUALLY — "
+                    "the selected deed may be for a different property."
+                )
+
+            # -----------------------------------------------------------
+            # v3.3 — MISINDEXED-NAME / NO-DEED FALLBACK
+            # -----------------------------------------------------------
+            # If the row selected from the grantee name search is NOT a
+            # conveyance deed (e.g. the only HENNIGAN hit was a Certificate of
+            # Redemption because the real deed was misindexed as "HANNIGAN"),
+            # retry with an address search.  Address search is index-name-
+            # independent, so it recovers the vesting deed — or, if the seller
+            # has since sold, the out-conveyance, which flags that the seller is
+            # no longer the record owner.  Reference: 60 Aldergate St, Middleborough
+            # (run 2026-06-23-001 reported the redemption; 2026-06-24-001 fixed it).
+            if (
+                not found_via_address
+                and row is not None
+                and _is_non_conveyance_instrument(row.get("deed_type", ""))
+            ):
+                if street_number and street_name:
+                    result["notes"].append(
+                        f"Name-search selection {row.get('deed_type')!r} is not a "
+                        f"conveyance deed (grantee may be misindexed under a "
+                        f"misspelled name) — retrying with address search."
+                    )
+                    fb_row = await _plymouth_address_fallback(
+                        page, street_number, street_name, town, result
+                    )
+                    if fb_row is not None:
+                        found_via_address = True
+                        result["found_via_address_search"] = True
+                        row = fb_row
+                    else:
+                        result["notes"].append(
+                            "Address-search fallback found no deed — proceeding with "
+                            "name-search selection. VERIFY MANUALLY: vesting deed may be "
+                            "misindexed; check the registry by book/page or address."
+                        )
+                else:
+                    result["notes"].append(
+                        f"WARNING: name-search selection {row.get('deed_type')!r} is not "
+                        f"a conveyance deed and no street info is available for an "
+                        f"address-search fallback. The vesting deed may be misindexed "
+                        f"under a misspelled grantee name — VERIFY MANUALLY by book/page."
+                    )
+
+            # -----------------------------------------------------------
+            # v3.12 — FINAL-SELECTION CONVEYANCE GUARD (path-independent)
+            # -----------------------------------------------------------
+            # The v3.3 fallback above only guards the NAME-search path
+            # (`not found_via_address`).  Any row reached via an address search —
+            # including the v3.12 street-mismatch retry — skipped that guard, so a
+            # non-conveyance instrument could be reported as the vesting deed with
+            # status "success" and no warning.  The address-search row filter falls
+            # back to "using all rows" when no DEED-type row is present at the
+            # address, which is exactly when this bites.
+            #
+            # Surfaced live 2026-07-13 (18 Kestrel Ave, Hingham): the street-mismatch
+            # retry correctly moved to the right parcel, but the address results held
+            # only MTG/DISCHARGE/ASSIGNMENT rows — no DEED — so an ASSIGNMENT was
+            # selected.  A vesting deed that is absent from BOTH the grantee name
+            # index and the address index usually means the parcel is Registered Land
+            # (Land Court) or the deed is misindexed; either way it must never be
+            # reported as the deed.
+            if row is not None and _is_non_conveyance_instrument(row.get("deed_type", "")):
+                result["selected_row_is_not_a_deed"] = True
+                result["notes"].append(
+                    f"CRITICAL: the selected instrument is a {row.get('deed_type')!r}, NOT a "
+                    f"conveyance deed. No DEED-type row for this property was found in the "
+                    f"grantee name index or the property address index. DO NOT report this as "
+                    f"the vesting deed or extract a legal description from it. Check Plymouth "
+                    f"Registered Land (Land Court), and check for a misindexed grantee name."
+                )
+            else:
+                result["selected_row_is_not_a_deed"] = False
+
+            result["book"]           = row["book"]
+            result["page"]           = row["page"]
+            result["document_number"] = row["doc_number"]
+            result["deed_type"]      = row["deed_type"]
+            result["recorded_date"]  = row["recorded_date"]
+            result["deed_property_address"] = (
+                f"{row['street']}, {row['town']}" if row["street"] else row["town"]
+            )
+            result["notes"].append(
+                f"Selected row: {row['deed_type']} Doc#{row['doc_number']} "
+                f"Bk{row['book']}/Pg{row['page']} {row['recorded_date']} | "
+                f"Grantor: {row['reverse_party']} | Grantee: {row['name']} | "
+                f"Address: {row['street']}, {row['town']}"
+            )
+
+            # -----------------------------------------------------------
+            # v3.13 — BRING THE SELECTED ROW BACK ON SCREEN BEFORE CLICKING IT
+            # -----------------------------------------------------------
+            # ctl numbers are unique only within a pager page, and the pager walk
+            # leaves the grid parked on the LAST page.  Clicking the selected row's
+            # recorded ctl now would address a DIFFERENT row and open the wrong
+            # deed's detail panel and images.  Re-derive the live ctl (replaying the
+            # search and paging forward if the row is not currently displayed).
+            live_ctl = await _plymouth_ensure_row_visible(page, row, _replay_search)
+            if live_ctl:
+                if live_ctl != row["ctl"]:
+                    result["notes"].append(
+                        f"Re-located selected row for clicking: pager page "
+                        f"{row.get('_pager_page', 1)}, ctl {row['ctl']} -> {live_ctl}."
+                    )
+                row["ctl"] = live_ctl
+            else:
+                result["notes"].append(
+                    f"WARNING: could not bring the selected row (Bk{row['book']} "
+                    f"Doc#{row['doc_number']}) back on screen after the pager walk — "
+                    f"detail panel and images may be unavailable."
+                )
+
+            # -----------------------------------------------------------
+            # STEP 3 — DETAIL PANEL (full parties + consideration)
+            # -----------------------------------------------------------
+            panel_opened = await _open_detail_panel(page, ctl=row["ctl"], expected_book=row["book"])
+            if panel_opened:
+                detail = await _read_detail_panel(page)
+                result["grantors"]     = detail["grantors"]
+                result["grantees"]     = detail["grantees"]
+                result["consideration"] = detail["consideration"]
+                result["notes"].append(
+                    f"Grantors: {detail['grantors']} | Grantees: {detail['grantees']} | "
+                    f"Consideration: {detail['consideration']}"
+                )
+                # v3.24 — surface the panel's cross-reference list (later
+                # homesteads / discharges / related deeds against this deed);
+                # same treatment as Middlesex South's detail-panel References.
+                result["detail_references"] = detail.get("references") or []
+                if result["detail_references"]:
+                    result["notes"].append(
+                        "Detail panel references (cross-refs against this "
+                        "deed — homesteads/discharges/related instruments): "
+                        + " | ".join(result["detail_references"])
+                    )
+                    # v3.26 — normalised into the shared cross_references
+                    # shape so every registry reads the same downstream.
+                    result["cross_references"] = _normalize_cross_references(
+                        result["detail_references"], "Plymouth detail panel")
+                    xnote = _cross_reference_note(result["cross_references"])
+                    if xnote:
+                        result["notes"].append(xnote)
+            else:
+                # Fall back to single grantor from results row
+                result["grantors"] = [row["reverse_party"]] if row["reverse_party"] else []
+                result["grantees"] = [row["name"]] if row["name"] else []
+                result["notes"].append("Detail panel did not open — using results-row party data only.")
+
+            # -----------------------------------------------------------
+            # STEP 4 — VIEW IMAGES → download deed pages
+            # -----------------------------------------------------------
+            # Click "View Images" tab to set up server session (no popup fires)
+            try:
+                view_images_link = await page.query_selector('a[href*="TabController1$ImageViewertabitem"]')
+                if view_images_link:
+                    await view_images_link.click()
+                    await page.wait_for_timeout(1500)  # let server register the session
+                else:
+                    result["notes"].append("View Images tab not found — navigating directly to viewer.")
+            except Exception as e:
+                result["notes"].append(f"View Images tab click error (non-fatal): {e}")
+
+            # Navigate to viewer (session holds document context)
+            await page.goto(PLYMOUTH_VIEWER, wait_until="domcontentloaded", timeout=30000)
+            try:
+                await page.wait_for_selector("#ImageViewer1_docImage", timeout=20000)
+                await page.wait_for_timeout(1500)  # let image fully render
+            except Exception:
+                result["errors"].append("Image viewer did not load #ImageViewer1_docImage.")
+                await browser.close()
+                return result
+
+            total_pages = await _parse_page_count(page)
+            result["total_pages_in_viewer"] = total_pages
+
+            # All pages — loop from 1 through total_pages
+            for page_num in range(1, total_pages + 1):
+                if page_num > 1:
+                    try:
+                        await page.click("#ImageViewer1_BtnNext")
+                        await page.wait_for_timeout(2000)
+                    except Exception as e:
+                        result["notes"].append(f"Page {page_num} navigation error (stopping): {e}")
+                        break
+                p_path = output_folder / f"{base_name} - deed_p{page_num}.jpg"
+                method = await _download_viewer_image(page, p_path)
+                if method != "failed":
+                    result["files"].append(str(p_path))
+                    result["notes"].append(f"Page {page_num} saved ({method}): {p_path.name}")
+                else:
+                    result["errors"].append(f"Page {page_num} download failed.")
+
+        except Exception as e:
+            result["errors"].append(f"Main workflow failed: {e}")
+            await browser.close()
+            return result
+        finally:
+            try:
+                await page.close()
+            except Exception:
+                pass
+
+        # -----------------------------------------------------------
+        # STEP 5 — GRANTOR CHECK (all grantees)
+        # Checks every grantee on the deed as a potential Grantor, not just
+        # the named seller.  Catches subsequent deeds by joint tenant co-owners.
+        # -----------------------------------------------------------
+        try:
+            g_page = await context.new_page()
+            original_book = result.get("book", "")
+            original_doc = result.get("document_number", "") or ""
+
+            # Build set of names to check: named seller + all grantees from detail panel.
+            # named seller: already in Plymouth format (LAST FIRST) from --last/--first args.
+            # detail panel grantees: already in Plymouth format (LAST FIRST MI) — use
+            #   _clean_registry_name (strip suffixes only, do NOT reorder).
+            names_to_check: dict[str, str] = {}  # search_name → display label
+
+            def _add_search_name(raw: str, label: str) -> None:
+                # v3.30 (item 11) — broaden past a trailing middle initial
+                # before de-duplicating, because Plymouth prefix-matches.
+                broad = _plymouth_broaden_prefix_name(raw)
+                if broad != raw:
+                    label = (f"{label} [searched as '{broad}' — Plymouth "
+                             f"prefix match; '{raw}' would miss an entry "
+                             f"indexed without the initial]")
+                names_to_check.setdefault(broad, label)
+
+            _add_search_name(combined_name, f"named seller ({combined_name})")
+            for grantee_display in result.get("grantees", []):
+                cleaned = _clean_registry_name(grantee_display)
+                if cleaned and cleaned != combined_name:
+                    _add_search_name(cleaned, grantee_display)
+
+            all_grantor_rows: list[dict] = []
+            seen_docs: set[tuple] = set()
+
+            # v3.29 — server-side date window (see _GRANTOR_WINDOW_LOOKBACK_DAYS).
+            # GRANT PETER / 23 Harrowgate Dr: 218 rows back to 1704 → 41, with the
+            # earliest returned row being the deed's own recording date, so the
+            # acquisition batch survives. An unknown acquisition date leaves the
+            # window off entirely rather than guessing one.
+            g_window = _grantor_window_start(
+                _parse_deed_date(result.get("recorded_date") or ""))
+            result.setdefault("grantor_check", {})["search_window"] = {
+                "from": (f"{g_window[1]}/{g_window[2]}/{g_window[0]}"
+                         if g_window > (0, 0, 0) else None),
+                "lookback_days": (_GRANTOR_WINDOW_LOOKBACK_DAYS
+                                  if g_window > (0, 0, 0) else None),
+                "basis": ("acquisition date less lookback" if g_window > (0, 0, 0)
+                          else "no window — acquisition date unknown, all years searched"),
+                "lien_sweep": "document-type restricted, ALL YEARS",
+            }
+
+            # (search_name, label, date_from, doc_types) — the main windowed
+            # pass per name, then the all-years lien sweep per name. The sweep
+            # recovers exactly what the window hides: liens against the person
+            # that can reach after-acquired property. Skipped when no window
+            # was applied, because the main pass then already covers all years.
+            passes = [(n, l, g_window, None) for n, l in names_to_check.items()]
+            if g_window > (0, 0, 0):
+                passes += [(n, f"{l} [lien sweep, all years]", None,
+                            _PLYMOUTH_LIEN_DOC_TYPES)
+                           for n, l in names_to_check.items()]
+
+            # v3.30 (item 11) — per-search accounting. Hits are de-duplicated
+            # by (book, doc#) and labelled with the FIRST search that found
+            # them, so on a co-owned parcel where both owners signed every
+            # instrument, every line reads "via: <named seller>" and the
+            # co-owner pass is INDISTINGUISHABLE FROM NEVER HAVING RUN — the
+            # Grant / 23 Harrowgate Dr run had to be re-verified by hand
+            # before the report could say the co-owner had not conveyed. This
+            # log makes "searched, all rows duplicate" visibly different from
+            # "searched, zero rows" and from "never searched". Same
+            # missing-information-read-as-a-negative-answer family as v3.20.
+            search_log: list[dict] = []
+
+            for search_name, label, win, doc_types in passes:
+                try:
+                    rows = await _grantor_check_search(
+                        g_page, search_name, original_book, original_doc,
+                        date_from=win, doc_type_values=doc_types)
+                except Exception as e:
+                    # Never let one pass silently vanish — a sweep that did not
+                    # run must not read as a sweep that found nothing.
+                    result["notes"].append(
+                        f"WARNING: grantor search [{label}] FAILED "
+                        f"(non-fatal): {e}. That question is OPEN, not clean."
+                    )
+                    search_log.append({
+                        "name": search_name, "label": label,
+                        "rows_returned": None, "rows_new": 0,
+                        "status": f"ERROR — {type(e).__name__}: {e}",
+                    })
+                    continue
+                rows_new = 0
+                for row in rows:
+                    key = (row["book"], row["doc_number"])
+                    if key not in seen_docs:
+                        seen_docs.add(key)
+                        # v3.29 — carry the sweep marker into the row so the
+                        # "[found via: …]" tag on every line in
+                        # grantor_check.deeds distinguishes an all-years lien
+                        # sweep hit from a windowed one. Without this the row
+                        # only knows the search NAME and the two passes are
+                        # indistinguishable in the output.
+                        if doc_types:
+                            row["searched_name"] = (
+                                f"{row.get('searched_name', search_name)} (lien sweep)")
+                        all_grantor_rows.append(row)
+                        rows_new += 1
+                        result["notes"].append(
+                            f"Grantor check hit [{label}]: "
+                            f"Bk{row['book']} {row['deed_type']} {row['recorded_date']} "
+                            f"| Grantee: {row['grantee']} | {row['street']}, {row['town']} "
+                            f"| Doc#{row['doc_number']}"
+                        )
+                    # else: duplicate deed already captured via another grantee's search
+                search_log.append({
+                    "name": search_name, "label": label,
+                    "rows_returned": len(rows), "rows_new": rows_new,
+                    "status": "ok",
+                })
+
+            _plymouth_record_searches(result, search_log)
+            _plymouth_finalize_grantor_check(
+                result, all_grantor_rows, street_number, street_name, town)
+
+            await g_page.close()
+        except Exception as e:
+            result["notes"].append(f"Grantor check failed (non-fatal): {e}")
+
+        await browser.close()
+
+    result["status"] = "success" if result["files"] else "error"
+    if not result["files"] and not result["errors"]:
+        result["errors"].append("No files downloaded.")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Suffolk — stub (Norfolk is implemented below)
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Middlesex South District — masslandrecords.com (Avenu/20-20, Incapsula WAF)
+# ---------------------------------------------------------------------------
+#
+# Probed live 2026-07-09. Differences vs Plymouth (titleview.org):
+#   * Incapsula bot protection: headless browsers get 403 on the search POST
+#     (initial GET succeeds, postbacks blocked). Headful real Chrome
+#     (channel="chrome") passes. The run function forces headful.
+#   * Name search uses SEPARATE LastName1 / FirstName1 fields (Plymouth
+#     concatenates "LAST FIRST" into the last-name field).
+#   * Grid columns: Type | Name/ Corporation | Book | Page | Type Desc. |
+#     File Date | Street # | Property Descr.  No Town, Doc #, or Reverse
+#     Party columns. 'Type Desc.' is spelled out (DEED / MORTGAGE / ...) so
+#     _is_non_conveyance_instrument's ALIS substring vocabulary applies.
+#   * No 'Sort$Rec Date' header — Python date sort handles selection.
+#   * Street # cell holds the full street ("10 ASHGROVE PL"), which stands
+#     in for the missing Town column when disambiguating multi-property
+#     sellers (expected street parsed from --base-name).
+#   * Detail panel header table: Doc. # | File Date | Rec Time | Type Desc. |
+#     # of Pgs. | Book/Page | Consideration | Doc. Status — parsed
+#     structurally (the generic consideration regex would match the Rec Time
+#     value '10:38:19.043' first). Also shows a References list (cross-refs
+#     such as discharges) captured into notes.
+#   * Image viewer: View Images tab click, then direct navigation to
+#     ImageViewerEx.aspx (same trick as Plymouth Option A). Image src is an
+#     ACSResource.axd URL whose CNTWIDTH/CNTHEIGHT params control SERVER-SIDE
+#     render size — rewriting CNTHEIGHT to 2000 yields a fully legible scan
+#     (~5x the default 682px render; verified on a 1969 deed).
+
+MSOUTH_SEARCH = "https://www.masslandrecords.com/MiddlesexSouth/D/Default.aspx"
+MSOUTH_VIEWER = "https://www.masslandrecords.com/MiddlesexSouth/D/ImageViewerEx.aspx"
+
+_MSOUTH_COLS = {
+    "book": "Book", "page": "Page", "doc_number": "Doc",  # no Doc # column → ''
+    "deed_type": "Type Desc", "recorded_date": "File Date",
+    "street": "Street", "town": "Town",                   # no Town column → ''
+    "reverse_party": "Reverse Party",                     # absent → ''
+    "name": "Name",
+}
+
+# Tokens that mark a registry name as an entity (search whole string in the
+# Business/Last Name field) rather than a person (split LAST / FIRST).
+def _alis_same_party_reconveyance(entry: dict) -> bool:
+    """
+    v3.20 — True when a candidate row's indexed grantor and grantee are the
+    same party (surname + first given-name token both match): a re-vesting
+    deed — a self-conveyance after marriage, adding a spouse, or a trust
+    transfer. Such a deed routinely SUPERSEDES the purchase deed as the
+    operative vesting instrument. Keegan/402 Sedgefield St: 'KEEGAN, RICHARD H
+    (&AL)' → 'KEEGAN, RICHARD H. (&AL)' — the 2002 re-vesting deed
+    (Bk 15978/412) superseded the 1998 purchase deed (Bk 11873/154).
+    """
+    or_last, or_first = _alis_indexed_name_pair(entry.get("grantor") or "")
+    ee_last, ee_first = _alis_indexed_name_pair(entry.get("grantee") or "")
+    if not (or_last and ee_last and or_last == ee_last):
+        return False
+    t_or = re.sub(r"[^A-Z0-9]", "", (or_first.split() or [""])[0])
+    t_ee = re.sub(r"[^A-Z0-9]", "", (ee_first.split() or [""])[0])
+    return bool(t_or) and t_or == t_ee
+
+
+# v3.20 — pages fetched per candidate by the deep-sampling fallback: page 1
+# plus up to 3 more, enough to reach an attached exhibit/legal page.
+_CANDIDATE_SAMPLE_MAX_PAGES = 4
+
+
+def _alis_extend_candidate_samples(
+    session, base_url: str, result: dict, cand_rows: list, idxs: list,
+    base_name: str, output_folder: Path,
+) -> None:
+    """
+    v3.20 — deeper sampling for candidates whose page-1 sample produced no
+    property address. Keegan/402 Sedgefield St (2026-08-10): the operative 2002
+    deed's page 1 read only "SEE ATTACHED FULL LEGAL" — its address lived
+    on an attached exhibit page the page-1 sample never downloaded, so its
+    sample address came back null and the v3.14 auto-retarget silently
+    dropped it, reporting the superseded 1998 deed at exit 0.
+
+    For each candidate index in `idxs`: downloads the instrument's first
+    _CANDIDATE_SAMPLE_MAX_PAGES pages (page 1 is re-fetched so the _pN file
+    names stay aligned with actual page numbers) and re-runs the light
+    extraction over all of them. Mutates the candidate entries in place
+    (sample_file, sample_files, sample_extraction). Fails soft per
+    candidate — a candidate that still has no address stays UNVERIFIED and
+    the caller must warn about it, never drop it quietly.
+    """
+    client, reason = _anthropic_client()
+    if client is None:
+        result["notes"].append(
+            f"Candidate deep-sampling skipped ({reason}) — candidates whose "
+            "page-1 sample had no address could not be address-checked."
+        )
+        return
+    for i in idxs:
+        cand = cand_rows[i]
+        entry = result["multiple_deed_candidates"][i]
+        rid = _alis_row_id(cand)
+        try:
+            info = _alis_get_pdf_hrefs_http(session, base_url, cand["img_href"])
+            hrefs = info["pdf_hrefs"][:_CANDIDATE_SAMPLE_MAX_PAGES]
+            if len(hrefs) <= 1:
+                result["notes"].append(
+                    f"Candidate {rid}: page-1 sample had no property address "
+                    "and the instrument has no further pages to sample — it "
+                    "remains UNVERIFIED."
+                )
+                continue
+            label = ("candidate_Doc" + (cand["document_number"] or cand["ctl_num"])
+                     if cand.get("land_court")
+                     else f"candidate_Bk{cand['book']}_Pg{cand['page']}")
+            saved, errs = _alis_download_pdfs_http(
+                session, base_url, hrefs, base_name, output_folder, label=label,
+            )
+            result["errors"] += errs
+            if not saved:
+                continue
+            entry["sample_file"] = saved[0]
+            entry["sample_files"] = saved
+            entry["sample_extraction"] = _extract_pdf_fields_light(
+                client, saved, _CANDIDATE_SCHEMA,
+                f"These are the first {len(saved)} page(s) of a candidate "
+                "deed, possibly including attached exhibit or legal-"
+                "description pages. Extract the property address (check the "
+                "attached pages if page 1 refers to an attached legal), "
+                "lot/unit, and grantees so the subject property can be "
+                "identified.",
+            )
+            addr = (entry["sample_extraction"] or {}).get("property_address")
+            result["notes"].append(
+                f"Candidate {rid}: page-1 sample had no property address — "
+                f"deep-sampled {len(saved)} page(s); address now: "
+                + (repr(addr) if addr else "STILL NOT FOUND (candidate "
+                   "remains UNVERIFIED)")
+                + "."
+            )
+        except Exception as e:
+            result["notes"].append(
+                f"Candidate {rid}: deep sampling failed (non-fatal) — it "
+                f"remains UNVERIFIED. ({type(e).__name__}: {e})"
+            )
+
+
+_ENTITY_NAME_TOKENS = {
+    "TRUST", "TR", "LLC", "CORP", "INC", "REALTY", "COMPANY", "CO",
+    "PARTNERSHIP", "LP", "LLP", "ASSOCIATES", "DEVELOPMENT", "BANK",
+    "NOMINEE", "CONDOMINIUM", "HOMES", "PROPERTIES", "INVESTMENTS",
+}
+
+
+def _msouth_split_name(display: str) -> tuple:
+    """
+    Split a registry-format name ('LAST FIRST MI' or an entity name) into
+    (last, first) for Middlesex South's two-field search form.
+    Entities go entirely into the Business/Last Name field.
+    """
+    cleaned = _clean_registry_name(display)
+    tokens = cleaned.split()
+    if not tokens:
+        return "", ""
+    if any(t in _ENTITY_NAME_TOKENS for t in tokens):
+        return cleaned, ""
+    return tokens[0], " ".join(tokens[1:])
+
+
+async def _msouth_launch(p, headless: bool, result: dict):
+    """
+    Launch a browser that passes masslandrecords.com's Incapsula WAF.
+    Headless (any flavor) gets 403 on postbacks; headful real Chrome passes.
+    """
+    try:
+        browser = await p.chromium.launch(headless=False, channel="chrome")
+        if headless:
+            result["notes"].append(
+                "Incapsula WAF on masslandrecords.com blocks headless browsers — "
+                "launched headful real Chrome (channel='chrome') instead. A Chrome "
+                "window will appear for the duration of the run."
+            )
+        return browser
+    except Exception as e:
+        result["notes"].append(
+            f"Real-Chrome launch failed ({e}); falling back to bundled Chromium "
+            "headful — Incapsula may still return 403s."
+        )
+        return await p.chromium.launch(headless=False)
+
+
+async def _msouth_search(page: Page, last: str, first: str, party_type: str) -> None:
+    """Navigate to the Middlesex South search form and submit a name search."""
+    await page.goto(MSOUTH_SEARCH, wait_until="domcontentloaded", timeout=45000)
+    await page.wait_for_selector("#SearchFormEx1_ACSTextBox_LastName1", timeout=25000)
+    await page.select_option("#SearchFormEx1_ACSRadioButtonList_PartyType1", party_type)
+    await page.fill("#SearchFormEx1_ACSTextBox_LastName1", last.upper().strip())
+    await page.fill("#SearchFormEx1_ACSTextBox_FirstName1", first.upper().strip())
+    await page.click("#SearchFormEx1_btnSearch")
+
+
+async def _msouth_read_detail(page: Page) -> dict:
+    """
+    Structurally parse the Middlesex South detail-panel header table.
+    Returns {doc_number, num_pages, consideration, references} ('' / [] when
+    absent). Party lists come from _read_detail_panel (same gg-link markup as
+    Plymouth); its consideration value must NOT be used here — the panel's
+    Rec Time value (e.g. '10:38:19.043') matches the generic regex first.
+    """
+    data = await page.evaluate(
+        """() => {
+            const panel = document.querySelector('[id*="DocDetails1"]');
+            if (!panel) return null;
+            let out = null;
+            // Tables are returned outermost-first; keep scanning so the
+            // INNERMOST match wins — outer wrapper tables report the whole
+            // header block as one cell, misaligning every value.
+            for (const tbl of panel.querySelectorAll('table')) {
+                const rows = tbl.querySelectorAll(':scope > tbody > tr, :scope > tr');
+                if (rows.length < 2) continue;
+                const hdr = Array.from(rows[0].querySelectorAll(':scope > th, :scope > td'))
+                    .map(c => c.innerText.trim());
+                if (hdr.length < 4) continue;
+                if (!hdr.some(h => h === 'Doc. #' || h.startsWith('Doc. #'))) continue;
+                const val = Array.from(rows[1].querySelectorAll(':scope > td'))
+                    .map(c => c.innerText.trim());
+                out = {};
+                hdr.forEach((h, i) => { out[h] = val[i] !== undefined ? val[i] : ''; });
+            }
+            const full = panel.innerText;
+            const refIdx = full.indexOf('References');
+            return {header: out,
+                    references: refIdx >= 0 ? full.slice(refIdx, refIdx + 400)
+                        .split('\\n').map(s => s.trim()).filter(s => s) : []};
+        }"""
+    )
+    if not data:
+        return {"doc_number": "", "num_pages": "", "consideration": "", "references": []}
+    hdr = data.get("header") or {}
+
+    def _get(*keys):
+        for k in keys:
+            for h, v in hdr.items():
+                if k in h:
+                    return v
+        return ""
+
+    return {
+        "doc_number":    _get("Doc. #"),
+        "num_pages":     _get("# of Pgs"),
+        "consideration": _get("Consideration"),
+        "references":    data.get("references") or [],
+    }
+
+
+async def _msouth_download_viewer_image(page: Page, output_path: Path) -> str:
+    """
+    Download the image currently shown in the Middlesex South viewer.
+    Rewrites the ACSResource.axd src to a 2000px server-side render
+    (masslandrecords' default render is container-sized, ~682px).
+    Returns 'hires_src_download' | 'src_download' | 'screenshot' | 'failed'.
+    """
+    src = await page.evaluate(
+        "() => { const i = document.querySelector('#ImageViewer1_docImage');"
+        " return i ? i.src : null; }"
+    )
+    if src and "ACSResource" in src:
+        hi = re.sub(r"CNTHEIGHT=\d+", "CNTHEIGHT=2000", src)
+        hi = re.sub(r"CNTWIDTH=\d+", "CNTWIDTH=1550", hi)
+        try:
+            resp = await page.request.get(hi)
+            if resp.ok:
+                body = await resp.body()
+                if len(body) > 5000:  # sanity: not an error page / placeholder
+                    output_path.write_bytes(body)
+                    return "hires_src_download"
+        except Exception:
+            pass
+    if src:
+        try:
+            resp = await page.request.get(src)
+            if resp.ok:
+                output_path.write_bytes(await resp.body())
+                return "src_download"
+        except Exception:
+            pass
+    img_el = await page.query_selector("#ImageViewer1_docImage")
+    if img_el:
+        try:
+            await img_el.screenshot(path=str(output_path))
+            return "screenshot"
+        except Exception:
+            pass
+    return "failed"
+
+
+_MSOUTH_IMG_READY_JS = (
+    "() => { const i = document.querySelector('#ImageViewer1_docImage');"
+    " return !!(i && i.src && !i.src.includes('loading') && i.naturalWidth > 100); }"
+)
+
+
+async def _msouth_grantor_check(
+    g_page: Page,
+    last: str,
+    first: str,
+    original_book: str,
+    original_page: str,
+    searched_label: str,
+) -> list:
+    """
+    Grantor search on Middlesex South; returns rows that are not the original
+    deed. No Reverse Party column exists on this grid, so 'grantee' is ''.
+    """
+    await _msouth_search(g_page, last, first, "D")
+    if not await _has_results(g_page, timeout_ms=40000):
+        return []
+    rows = []
+    for r in await _read_all_result_rows_paginated(g_page, cols=_MSOUTH_COLS):
+        if r["book"] == original_book and r["page"] == original_page:
+            continue  # the vesting deed itself, indexed under both party types
+        rows.append({
+            "book":          r["book"],
+            "page":          r["page"],
+            "doc_number":    r["doc_number"],
+            "deed_type":     r["deed_type"],
+            "recorded_date": r["recorded_date"],
+            "grantee":       "",  # grid has no Reverse Party column
+            "street":        r["street"],
+            "town":          "",
+            "searched_name": searched_label,
+        })
+    return rows
+
+
+async def run_middlesex_south(
+    seller_last: str,
+    seller_first: str,
+    base_name: str,
+    output_folder: Path,
+    headless: bool,
+    street_number: str = "",
+    street_name: str = "",
+) -> dict:
+    """
+    Middlesex South District Registry of Deeds (masslandrecords.com) —
+    Recorded Land fast path:
+      1. Grantee name search (separate last/first fields)
+      2. Non-conveyance filter + street-aware selection + Python date sort
+      3. Detail panel → Doc #, # of pages, consideration, parties, references
+      4. View Images tab → ImageViewerEx.aspx → hi-res download of all pages
+      5. Grantor check (seller + all deed grantees)
+    Registered Land (Land Court) is NOT searched — same limitation as the
+    other fast paths; fall back to the manual workflow on deed_not_found.
+    """
+    result = {
+        "status": "error",
+        "registry": "Middlesex South District",
+        "registry_url": MSOUTH_SEARCH,
+        "registry_system": "Avenu/20-20 (ASP.NET, masslandrecords.com)",
+        "book": None,
+        "page": None,
+        "document_number": None,
+        "recorded_date": None,
+        "deed_type": None,
+        "consideration": None,
+        "grantors": [],
+        "grantees": [],
+        "deed_property_address": None,
+        "grantor_check": {"has_subsequent_deed": False, "deeds": []},
+        # v3.26 — normalised detail-panel References (shared shape across
+        # registries); leads for the discharge / title-rundown workflows.
+        "cross_references": [],
+        "files": [],
+        "total_pages_in_viewer": None,
+        "found_via_address_search": False,
+        "found_via_compound_surname": False,
+        "notes": [],
+        "errors": [],
+    }
+
+    street_token = (street_name or "").upper().strip()
+
+    async with async_playwright() as p:
+        browser = await _msouth_launch(p, headless, result)
+        context = await browser.new_context(accept_downloads=True)
+        page = await context.new_page()
+
+        try:
+            # -----------------------------------------------------------
+            # STEP 1 — GRANTEE SEARCH
+            # -----------------------------------------------------------
+            await _msouth_search(page, seller_last, seller_first, "I")
+            if not await _has_results(page, timeout_ms=40000):
+                result["status"] = "deed_not_found"
+                result["notes"].append(
+                    f"No results for last='{seller_last}' first='{seller_first}' "
+                    "as Grantee on Middlesex South. NOTE: 403s from Incapsula "
+                    "render as empty pages — if this repeats, verify the browser "
+                    "passed the WAF (see launch note)."
+                )
+                await browser.close()
+                return result
+
+            all_rows = await _read_all_result_rows(page, cols=_MSOUTH_COLS)
+            result["notes"].append(
+                f"Grantee search returned {len(all_rows)} row(s). " + " | ".join(
+                    f"[{r['ctl']}] Bk{r['book']}/Pg{r['page']} {r['deed_type']} "
+                    f"{r['recorded_date']} street={r['street']!r}"
+                    for r in all_rows
+                )
+            )
+
+            deed_rows = [r for r in all_rows
+                         if not _is_non_conveyance_instrument(r["deed_type"])]
+            if len(deed_rows) < len(all_rows):
+                result["notes"].append(
+                    "Name search: filtered "
+                    f"{len(all_rows) - len(deed_rows)} non-deed row(s): "
+                    f"{[r['deed_type'] for r in all_rows if r not in deed_rows]}."
+                )
+            if not deed_rows:
+                result["status"] = "deed_not_found"
+                result["notes"].append(
+                    "All result rows are non-conveyance instruments — the vesting "
+                    "deed may be under a different name spelling or in Registered "
+                    "Land (not searched by this fast path)."
+                )
+                await browser.close()
+                return result
+
+            # Street-aware selection: Middlesex South's grid has no Town
+            # column; the Street # cell ('10 ASHGROVE PL') stands in when a
+            # seller owns multiple properties in the district.
+            candidates = deed_rows
+            if street_token:
+                matched = [r for r in deed_rows
+                           if street_token in (r["street"] or "").upper()]
+                if matched:
+                    if street_number:
+                        num_matched = [
+                            r for r in matched
+                            if (r["street"] or "").upper().startswith(street_number.upper())
+                        ]
+                        if num_matched:
+                            matched = num_matched
+                    candidates = matched
+                elif len(deed_rows) > 1:
+                    result["notes"].append(
+                        f"WARNING: no deed row's street matched {street_token!r} — "
+                        "selecting most recent deed regardless; VERIFY the deed "
+                        "image shows the expected property."
+                    )
+
+            candidates = sorted(
+                candidates,
+                key=lambda r: _parse_deed_date(r["recorded_date"]),
+                reverse=True,
+            )
+            row = candidates[0]
+            result["book"]          = row["book"]
+            result["page"]          = row["page"]
+            result["recorded_date"] = row["recorded_date"]
+            result["deed_type"]     = row["deed_type"]
+            result["deed_property_address"] = row["street"]
+            result["notes"].append(
+                f"Selected row: {row['deed_type']} Bk{row['book']}/Pg{row['page']} "
+                f"{row['recorded_date']} | Name: {row['name']} | Street: {row['street']}"
+            )
+
+            # -----------------------------------------------------------
+            # STEP 2 — DETAIL PANEL (Doc #, pages, consideration, parties)
+            # -----------------------------------------------------------
+            panel_opened = await _open_detail_panel(page, ctl=row["ctl"], expected_book=row["book"])
+            detail_pages = ""
+            if panel_opened:
+                parties = await _read_detail_panel(page)   # parties only
+                msouth  = await _msouth_read_detail(page)  # header table + references
+                result["grantors"]        = parties["grantors"]
+                result["grantees"]        = parties["grantees"]
+                result["document_number"] = msouth["doc_number"] or None
+                result["consideration"]   = msouth["consideration"] or None
+                detail_pages              = msouth["num_pages"]
+                result["notes"].append(
+                    f"Detail panel: Doc#{msouth['doc_number']} pages={msouth['num_pages']} "
+                    f"consideration={msouth['consideration']} | "
+                    f"Grantors: {parties['grantors']} | Grantees: {parties['grantees']}"
+                )
+                if msouth["references"]:
+                    result["notes"].append(
+                        "Detail panel references (cross-refs — discharges etc.): "
+                        + " | ".join(msouth["references"][:8])
+                    )
+                    # v3.26 — normalised into the shared cross_references
+                    # shape (full list, not the note's first 8).
+                    result["cross_references"] = _normalize_cross_references(
+                        msouth["references"], "Middlesex South detail panel")
+                    xnote = _cross_reference_note(result["cross_references"])
+                    if xnote:
+                        result["notes"].append(xnote)
+            else:
+                result["grantors"] = []
+                result["grantees"] = [row["name"]] if row["name"] else []
+                result["notes"].append(
+                    "Detail panel did not open — party/doc#/consideration data limited "
+                    "to the results row."
+                )
+
+            # -----------------------------------------------------------
+            # STEP 3 — VIEW IMAGES → ImageViewerEx.aspx → hi-res download
+            # -----------------------------------------------------------
+            try:
+                vi_tab = await page.query_selector('a[href*="TabController1$ImageViewertabitem"]')
+                if vi_tab:
+                    await vi_tab.click()
+                    await page.wait_for_timeout(1500)
+            except Exception as e:
+                result["notes"].append(f"View Images tab click error (non-fatal): {e}")
+
+            await page.goto(MSOUTH_VIEWER, wait_until="domcontentloaded", timeout=30000)
+            try:
+                await page.wait_for_function(_MSOUTH_IMG_READY_JS, timeout=45000)
+            except Exception:
+                result["errors"].append("Image viewer did not load a document image.")
+                await browser.close()
+                return result
+
+            total_pages = await _parse_page_count(page)
+            result["total_pages_in_viewer"] = total_pages
+            if detail_pages and str(total_pages) != str(detail_pages).strip():
+                result["notes"].append(
+                    f"NOTE: viewer page count ({total_pages}) differs from detail "
+                    f"panel # of Pgs. ({detail_pages}) — verify all pages captured."
+                )
+
+            for page_num in range(1, total_pages + 1):
+                if page_num > 1:
+                    prev_src = await page.evaluate(
+                        "() => document.querySelector('#ImageViewer1_docImage').src")
+                    try:
+                        await page.click("#ImageViewer1_BtnNext")
+                        await page.wait_for_function(
+                            "(prev) => { const i = document.querySelector('#ImageViewer1_docImage');"
+                            " return !!(i && i.src && i.src !== prev &&"
+                            " !i.src.includes('loading') && i.naturalWidth > 100); }",
+                            arg=prev_src, timeout=45000,
+                        )
+                    except Exception as e:
+                        result["notes"].append(f"Page {page_num} navigation error (stopping): {e}")
+                        break
+                p_path = output_folder / f"{base_name} - deed_p{page_num}.jpg"
+                method = await _msouth_download_viewer_image(page, p_path)
+                if method != "failed":
+                    result["files"].append(str(p_path))
+                    result["notes"].append(f"Page {page_num} saved ({method}): {p_path.name}")
+                else:
+                    result["errors"].append(f"Page {page_num} download failed.")
+
+            # -----------------------------------------------------------
+            # STEP 4 — GRANTOR CHECK (seller + all deed grantees)
+            # -----------------------------------------------------------
+            try:
+                g_page = await context.new_page()
+                names_to_check: dict[tuple, str] = {}
+                seller_key = (seller_last.upper().strip(), seller_first.upper().strip())
+                names_to_check[seller_key] = f"named seller ({seller_last} {seller_first})".strip()
+                for grantee_display in result.get("grantees", []):
+                    key = _msouth_split_name(grantee_display)
+                    if key[0] and key != seller_key:
+                        names_to_check[key] = grantee_display
+
+                all_grantor_rows: list[dict] = []
+                seen: set[tuple] = set()
+                for (g_last, g_first), label in names_to_check.items():
+                    rows = await _msouth_grantor_check(
+                        g_page, g_last, g_first,
+                        result["book"] or "", result["page"] or "", label,
+                    )
+                    for r in rows:
+                        key = (r["book"], r["page"])
+                        if key not in seen:
+                            seen.add(key)
+                            all_grantor_rows.append(r)
+                            result["notes"].append(
+                                f"Grantor check hit [{label}]: Bk{r['book']}/Pg{r['page']} "
+                                f"{r['deed_type']} {r['recorded_date']} | {r['street']}"
+                            )
+                result["grantor_check"]["has_subsequent_deed"] = len(all_grantor_rows) > 0
+                result["grantor_check"]["deeds"] = [
+                    f"Bk{r['book']}/Pg{r['page']} {r['deed_type']} {r['recorded_date']} "
+                    f"| {r['street']} | [found via: {r['searched_name']}]"
+                    for r in all_grantor_rows
+                ]
+                if all_grantor_rows:
+                    result["notes"].append(
+                        f"Grantor check: {len(all_grantor_rows)} instrument(s) found — "
+                        "Claude must assess title flags. (No Reverse Party column on "
+                        "this registry: open the detail panel or deed image for the "
+                        "counterparty of any DEED-type hit.)"
+                    )
+                else:
+                    result["notes"].append("Grantor check: no subsequent instruments found.")
+                await g_page.close()
+            except Exception as e:
+                result["notes"].append(f"Grantor check failed (non-fatal): {e}")
+
+        except Exception as e:
+            result["errors"].append(f"Main workflow failed: {e}")
+            await browser.close()
+            return result
+        finally:
+            try:
+                await page.close()
+            except Exception:
+                pass
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
+    result["status"] = "success" if result["files"] else "error"
+    return result
+
+
+async def run_stub(registry: str) -> dict:
+    return {
+        "status": "error",
+        "error_message": (
+            f"{registry.title()} County not yet implemented in Playwright script. "
+            "Use the standard fetch-download + Read tool workflow."
+        )
+    }
+
+
+# ---------------------------------------------------------------------------
+# Browntech ALIS (shared: Barnstable, Norfolk)
+# ---------------------------------------------------------------------------
+# The two registries run identical ALIS software with the same form fields,
+# result table structure, image-list page format, and PDF URL pattern. The
+# only differences are the base URL (domain) and town code conventions.
+# All helpers below take `base_url` as a parameter so they serve both.
+
+def _alis_url(
+    base_url: str,
+    last: str,
+    first: str,
+    party: str,
+    town: str,
+    land_court: bool = False,
+    doc_type: str = "*ALL",
+    date_from: str = "",
+    per_page: int | None = None,
+) -> str:
+    """
+    Build a direct ALIS search results URL.
+
+    Parameters:
+      base_url    : registry domain (BARNSTABLE_BASE or NORFOLK_BASE)
+      last, first : seller name components — URL-encoded with quote(x, safe='')
+      party       : "E" = Grantee, "R" = Grantor
+      town        : ALIS town code (e.g. BARN, FALM, BRAI, QUIN, WEYM, *ALL).
+                    No default — caller supplies the correct value for the
+                    registry (Barnstable: BARN covers all villages; Norfolk:
+                    each municipality has its own code).
+      land_court  : if True, build a Land Court search (WSIQTP=LC01LP,
+                    name fields W9SN8/W9GN8, results handler WW401L00);
+                    else a Recorded Land search (WSIQTP=LR01LP, name fields
+                    W9SNM/W9GNM, results handler WW401R00).
+      doc_type    : "*DD" for deed-group pre-filter, "*LN" for the lien
+                    document group, "*ALL" for everything
+      date_from   : v3.29 — server-side start date, MMDDYYYY, "" for none.
+                    The form labels these "Date Range (optional) -mmddyyyy"
+                    and they are INDEPENDENT of the W9INQ year-index radio,
+                    which stays AY (all years). Verified live 2026-08-13 on
+                    Barnstable: a surname-only grantor search returned page-1
+                    rows spanning 1884–2022 unfiltered and 2020-10-07 onward
+                    with W9FDTA=01012020, so the server really filters.
+      per_page    : results per page (WSSRPP — site offers 10/20/30).
+                    None omits the param (site default 10). The HTTP engine
+                    passes 30 to cut pagination round-trips.
+
+    URL pattern confirmed from live DOM runs on both registries.
+
+    NOTE: Recorded Land and Land Court use DIFFERENT name-index field names.
+    A Land Court search built with the Recorded Land names (W9SNM/W9GNM)
+    silently returns zero results — the LC form ignores the unknown params
+    rather than erroring. Always switch field names on land_court.
+    """
+    wsiqtp      = "LC01LP"  if land_court else "LR01LP"
+    last_field  = "W9SN8"   if land_court else "W9SNM"
+    first_field = "W9GN8"   if land_court else "W9GNM"
+    wshtnm      = "WW401L00" if land_court else "WW401R00"
+    last_enc  = quote(last,  safe="")
+    first_enc = quote(first, safe="")
+    doc_enc   = quote(doc_type, safe="*")   # preserve * so *DD and *ALL are not percent-encoded
+    url = (
+        f"{base_url}/ALIS/WW400R.HTM?"
+        f"{last_field}={last_enc}&{first_field}={first_enc}&W9IXTP={party}"
+        f"&W9ABR={doc_enc}&W9TOWN={town}&W9INQ=AY"
+        f"&W9FDTA={quote(date_from, safe='')}&W9TDTA=&AYVAL=%2B1742&CYVAL=2015"
+        f"&WSHTNM={wshtnm}&WSIQTP={wsiqtp}&WSKYCD=N&WSWVER=2"
+    )
+    if per_page:
+        url += f"&WSSRPP={per_page}"
+    return url
+
+
+async def _alis_parse_results(page: Page) -> list:
+    """
+    Parse the ALIS search results table using page.evaluate().
+    Returns a list of row dicts. Each result row is identified by a
+    "View Document Image" link whose href contains WSIQTP=LR01I (recorded land)
+    or WSIQTP=LC01I (land court).
+
+    Recorded Land and Land Court use the same column layout EXCEPT:
+      column 1 — Recorded Land: Reverse Party | Land Court: Certificate #
+      column 6 — Recorded Land: "Book-Page"   | Land Court: "Doc#-Sequence"
+    Each row dict carries a `land_court` bool and BOTH sets of fields, with
+    the inapplicable ones left as empty strings:
+      Recorded Land row → book, page populated;  certificate, document_number ''
+      Land Court row    → certificate, document_number populated; book, page ''
+    `reverse_party` is populated for Recorded Land only — the Land Court index
+    has no opposite-party column, so the grantor must be read from the deed PDF.
+
+    Returns [] if page.evaluate() returns None or raises.
+    """
+    js = r"""
+() => {
+    const rows = [];
+    const imgLinks = Array.from(
+        document.querySelectorAll('a[href*="WSIQTP=LR01I"], a[href*="WSIQTP=LC01I"]')
+    );
+    for (const link of imgLinks) {
+        const href = link.getAttribute('href');
+        const mCtln = href.match(/W9CTLN=(\d+)/);
+        const mYear = href.match(/W9RCCY=(\d+)/);
+        const mMon  = href.match(/W9RCMM=(\d+)/);
+        const mDay  = href.match(/W9RCDD=(\d+)/);
+
+        // Land Court vs Recorded Land: the image-link WSIQTP identifies which
+        // result table this row belongs to. The two tables share a column
+        // layout except columns 1 and 6 (see below).
+        const isLC = /WSIQTP=LC01I/.test(href);
+
+        const tr = link.closest('tr');
+        if (!tr) continue;
+        const tds = Array.from(tr.querySelectorAll('td'));
+        const texts = tds.map(td => td.innerText.replace(/\s+/g, ' ').trim());
+        const nameLink = tr.querySelector('a[href*="WSIQTP=LR01L"], a[href*="WSIQTP=LC01L"]');
+
+        // Column 1 — Recorded Land: Reverse Party | Land Court: Certificate #.
+        const col1 = texts[1] || '';
+        // Column 6 — Recorded Land: "BOOK-PAGE" | Land Court: "DOCNUM-SEQUENCE".
+        const col6 = texts[6] || '';
+        const col6Match = col6.match(/(\d+)[-\/](\d+)/);
+
+        let reverse_party = '', certificate = '';
+        let book = '', page = '', document_number = '';
+        if (isLC) {
+            certificate = col1;
+            // Doc# is the part before the dash; the trailing "-1" is a
+            // sequence suffix, not a page. Fall back to a digits-only col6.
+            document_number = col6Match ? col6Match[1]
+                              : (/^\d+$/.test(col6) ? col6 : '');
+        } else {
+            reverse_party = col1;
+            book = col6Match ? col6Match[1] : '';
+            page = col6Match ? col6Match[2] : '';
+        }
+
+        rows.push({
+            name:            nameLink ? nameLink.innerText.trim() : (texts[0] || ''),
+            reverse_party:   reverse_party,
+            certificate:     certificate,
+            town:            texts[2] || '',
+            date_received:   (mYear && mMon && mDay)
+                             ? (mMon[1] + '-' + mDay[1] + '-' + mYear[1])
+                             : (texts[3] || ''),
+            doc_type:        texts[4] || '',
+            doc_desc:        texts[5] || '',
+            book_page:       col6,
+            book:            book,
+            page:            page,
+            document_number: document_number,
+            land_court:      isLC,
+            img_href:        href,
+            ctl_num:         mCtln ? mCtln[1] : '',
+        });
+    }
+    return rows;
+}
+"""
+    try:
+        result = await page.evaluate(js)
+        if result is None:
+            return []
+        return result
+    except Exception:
+        return []
+
+
+def _alis_row_id(row: dict) -> str:
+    """
+    Human-readable identifier for an ALIS result row, used in notes.
+    Land Court → "Doc#NNNN Ctf#NNNN"; Recorded Land → "BkNNNN/PgNNNN".
+    """
+    if row.get("land_court"):
+        return f"Doc#{row.get('document_number') or '?'} Ctf#{row.get('certificate') or '?'}"
+    return f"Bk{row.get('book') or '?'}/Pg{row.get('page') or '?'}"
+
+
+def _alis_select_deed_row(rows: list) -> dict | None:
+    """
+    Select the best (most recently recorded) deed row from ALIS results.
+
+    Filters out non-deed types using the shared _is_non_conveyance_instrument()
+    classifier (v3.4) — covers mortgages, discharges, assignments, releases,
+    liens, attachments, plans AND tax-title redemptions, tax takings, municipal
+    lien certificates, and easements that the prior bare substring list missed.
+
+    From the filtered pool (falls back to full rows if all excluded), returns
+    the row with the highest numeric identifier — book number for Recorded
+    Land rows, document number for Land Court rows (Land Court rows have no
+    book). Falls back to pool[0] if no identifier parses. Returns None if
+    rows is empty.
+    """
+    if not rows:
+        return None
+
+    def is_excluded(row: dict) -> bool:
+        return _is_non_conveyance_instrument(row.get("doc_type") or "")
+
+    def sort_key(row: dict) -> int:
+        # Recorded Land rows carry `book`; Land Court rows carry
+        # `document_number` instead. Use whichever is present.
+        val = row.get("book") or row.get("document_number") or ""
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            return 0
+
+    filtered = [r for r in rows if not is_excluded(r)]
+    pool = filtered if filtered else rows
+
+    return max(pool, key=sort_key)
+
+
+async def _alis_get_pdf_hrefs(page: Page, base_url: str, img_href: str) -> dict:
+    """
+    Navigate to the Document Image List page and return PDF hrefs.
+
+    Returns a dict:
+      {
+        "pdf_hrefs":      list[str],  # hrefs to download (primary or fallback)
+        "is_fallback":    bool,        # True if primary pattern empty, using
+                                       # permissive fallback (any .PDF link)
+        "all_pdfs":       list[str],  # every .PDF href found on the page
+        "image_list_url": str,         # URL of the Document Image List page
+      }
+
+    Strategy:
+    1. Navigate to the Document Image List page.
+    2. Collect all a[href*="/WwwImg/"] hrefs ending in .PDF (any naming).
+    3. Primary path: filter for the individual-page numbered pattern
+       /\\d{3,4}\\.PDF$/i (e.g. DUIP0001.PDF, DB3R0001.PDF — multi-page deeds).
+       Correctly excludes the combined "All Pg" PDF (e.g. DVT6.PDF).
+    4. If primary is non-empty → pdf_hrefs=primary, is_fallback=False.
+    5. If primary is empty but all_pdfs is non-empty → pdf_hrefs=all_pdfs,
+       is_fallback=True. Handles non-standard short single-file naming
+       (e.g. /WwwImg/D1UJ.PDF observed on a 1988 Foxborough deed,
+       Bk7906/Pg271) where the entire deed is in one PDF with no
+       page-number suffix.
+    6. If no PDFs at all → pdf_hrefs=[], is_fallback=False, all_pdfs=[].
+
+    PDF filename prefixes vary by recording batch and registry (Barnstable:
+    DX26, DN6D; Norfolk: DUIP, DB3R), so prefix is never hardcoded. The
+    fallback handles batches that use entirely non-standard short names.
+
+    On navigation/eval error, returns the empty shape but still includes
+    the attempted image_list_url so the caller can surface it to Claude
+    for manual recovery.
+    """
+    if img_href.startswith("/"):
+        full_url = base_url + img_href
+    else:
+        full_url = img_href
+
+    empty = {
+        "pdf_hrefs": [],
+        "is_fallback": False,
+        "all_pdfs": [],
+        "image_list_url": full_url,
+    }
+
+    try:
+        await page.goto(full_url, wait_until="domcontentloaded", timeout=30000)
+    except Exception:
+        return empty
+
+    js = r"""
+() => {
+    const links = Array.from(document.querySelectorAll('a[href*="/WwwImg/"]'));
+    const pdfs = links
+        .map(a => a.getAttribute('href'))
+        .filter(h => h && /\.PDF$/i.test(h));
+    const numbered = pdfs.filter(h => /\d{3,4}\.PDF$/i.test(h));
+    return {numbered: numbered, all: pdfs};
+}
+"""
+    try:
+        result = await page.evaluate(js)
+        if not result:
+            return empty
+        numbered = result.get("numbered") or []
+        all_pdfs = result.get("all") or []
+        if numbered:
+            return {
+                "pdf_hrefs": numbered,
+                "is_fallback": False,
+                "all_pdfs": all_pdfs,
+                "image_list_url": full_url,
+            }
+        if all_pdfs:
+            return {
+                "pdf_hrefs": all_pdfs,
+                "is_fallback": True,
+                "all_pdfs": all_pdfs,
+                "image_list_url": full_url,
+            }
+        return empty
+    except Exception:
+        return empty
+
+
+async def _alis_download_pdfs(
+    page: Page,
+    base_url: str,
+    pdf_hrefs: list,
+    base_name: str,
+    output_folder: Path,
+) -> tuple:
+    """
+    Download each PDF via Playwright's authenticated request context
+    (page.request.get()).
+
+    For each href (index i starting at 1):
+      - Build url = base_url + href (if href starts with '/').
+      - Fetch via page.request.get(url).
+      - If response.ok and content-type contains 'pdf' (or url ends with .pdf):
+          write bytes to output_folder / f"{base_name} - deed_p{i}.pdf"
+          append str(path) to saved.
+      - Else append to errors.
+
+    Returns (saved, errors).
+    """
+    saved = []
+    errors = []
+
+    for i, href in enumerate(pdf_hrefs, start=1):
+        url = (base_url + href) if href.startswith("/") else href
+        try:
+            response = await page.request.get(url)
+            ct = response.headers.get("content-type", "").lower()
+            if response.ok and ("pdf" in ct or url.lower().endswith(".pdf")):
+                out_path = output_folder / f"{base_name} - deed_p{i}.pdf"
+                out_path.write_bytes(await response.body())
+                saved.append(str(out_path))
+            else:
+                errors.append(
+                    f"Page {i}: HTTP {response.status} or non-PDF content-type ({ct!r}) — {url}"
+                )
+        except Exception as e:
+            errors.append(f"Page {i}: download error — {e} — {url}")
+
+    return saved, errors
+
+
+async def _alis_grantor_check(
+    page: Page,
+    base_url: str,
+    last: str,
+    town: str,
+    original_id: str,
+    land_court: bool = False,
+) -> list:
+    """
+    Run a Grantor search for the seller's last name with blank first name
+    (catches all joint owners and name variants). Navigate to the search URL,
+    parse results, and return every row except the acquisition document itself.
+
+    The acquisition document is excluded by document_number on Land Court and
+    by book number on Recorded Land — `original_id` must be the matching
+    identifier for the section being searched.
+    """
+    url = _alis_url(base_url, last, "", "R", town=town, land_court=land_court, doc_type="*ALL")
+    id_field = "document_number" if land_court else "book"
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        rows = await _alis_parse_results(page)
+        return [
+            r for r in rows
+            if r.get(id_field) and r.get(id_field) != original_id
+        ]
+    except Exception:
+        return []
+
+
+# ---------------------------------------------------------------------------
+# ALIS pure-HTTP engine (v3.9) — Norfolk & Barnstable without a browser.
+#
+# The Browntech ALIS sites are plain server-rendered GETs end to end:
+#   search:     WW400R.HTM?...WSIQTP=LR01LP|LC01LP (query-string form)
+#   next page:  WW400R.HTM with the results form's hidden fields
+#               + WSIQTP=LR01N|LC01N  (what doVarButton2() does in JS)
+#   per page:   WSSRPP=10|20|30
+#   image list: the row's "View Document Image" href (WSIQTP=LR01I|LC01I)
+#   PDFs:       /WwwImg/*.PDF
+# All verified live on norfolkresearch.org and search.barnstabledeeds.org
+# (2026-07-11). These sync helpers mirror the _alis_* Playwright versions
+# row-dict-for-row-dict so downstream consumers are shared.
+# ---------------------------------------------------------------------------
+
+_ALIS_HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    ),
+}
+
+_ALIS_MAX_PAGES = 5  # pagination cap per search (30 rows/page → 150 rows)
+
+# ---------------------------------------------------------------------------
+# v3.29 — SERVER-SIDE DATE WINDOW FOR THE GRANTOR CHECK
+#
+# Until v3.28 every grantor search pulled the party's COMPLETE index history
+# and the pre-acquisition rows were discarded in Python afterwards. On a
+# common name that is most of the work: GRANT PETER / 23 Harrowgate Dr returned
+# 218 rows back to 1704 to answer a question that concerns 41 of them, and
+# on ALIS those wasted pages are what pushed Keegan and Salgado into the
+# _ALIS_MAX_PAGES cap and the "grantor check INCOMPLETE" outcome. Both
+# platforms filter by recorded date server-side (ALIS W9FDTA; Plymouth
+# ACSTextBox_DateFrom on the Advanced panel), so the rows are now never
+# fetched. This is a speed fix AND a cap fix.
+#
+# THE WINDOW DOES NOT START ON THE DEED DATE. Two classes of instrument
+# recorded before the vesting deed still matter:
+#
+#   (a) The acquisition batch itself. The purchase-money mortgage and the
+#       homestead normally record the same day, but ordering within a batch
+#       is not guaranteed and a batch can straddle a day boundary. Hence
+#       _GRANTOR_WINDOW_LOOKBACK_DAYS rather than an exact date.
+#   (b) Liens against the PERSON that can reach after-acquired property —
+#       tax liens, executions, attachments, bankruptcy. These predate
+#       acquisition and can still cloud title, and a date window hides them
+#       by construction. They are recovered by a separate LIEN SWEEP that is
+#       restricted by document TYPE and left unrestricted in time (ALIS doc
+#       group "*LN"; Plymouth _PLYMOUTH_LIEN_DOC_TYPES). Those types are
+#       rare, so the sweep is cheap — far cheaper than the full history it
+#       replaces.
+#
+# Net effect: same answer, a fraction of the rows. Anything the window
+# excludes is either irrelevant to this parcel or caught by the sweep.
+# ---------------------------------------------------------------------------
+_GRANTOR_WINDOW_LOOKBACK_DAYS = 7
+
+
+def _grantor_window_start(acq_date: tuple, lookback_days: int = None) -> tuple:
+    """
+    v3.29 — the start of the grantor-check date window: the acquisition date
+    less a small lookback, as a (Y, M, D) tuple. Returns (0, 0, 0) when the
+    acquisition date is unknown, which every caller must treat as "no window"
+    (search all years) rather than as a window starting at zero — an unknown
+    acquisition date is missing information, not a licence to narrow.
+    """
+    if not acq_date or acq_date <= (0, 0, 0):
+        return (0, 0, 0)
+    if lookback_days is None:
+        lookback_days = _GRANTOR_WINDOW_LOOKBACK_DAYS
+    try:
+        d = _dt_date(acq_date[0], acq_date[1], acq_date[2])
+    except (ValueError, TypeError, IndexError):
+        return (0, 0, 0)
+    d -= _dt_timedelta(days=lookback_days)
+    return (d.year, d.month, d.day)
+
+
+def _alis_date_param(window: tuple) -> str:
+    """v3.29 — (Y, M, D) → ALIS MMDDYYYY, or '' for no window."""
+    if not window or window <= (0, 0, 0):
+        return ""
+    return f"{window[1]:02d}{window[2]:02d}{window[0]:04d}"
+
+# v3.20 — cap for the town-scoped grantor-check retry. When the county-wide
+# pass caps at _ALIS_MAX_PAGES on a common name (Keegan: 150/132/149 rows,
+# all truncated), the scoped pass must be allowed to run to completion —
+# town-scoping shrank Keegan to 69 and 31 rows, well inside this cap.
+_ALIS_RETRY_MAX_PAGES = 20  # 30 rows/page → 600 rows
+
+
+class AlisRegistryUnavailableError(RuntimeError):
+    """
+    The registry served its maintenance/outage page instead of real content.
+    Distinct from RuntimeError so the engine dispatch can report
+    `registry_unavailable` (exit 1) instead of falling back to Playwright —
+    the browser would hit the same maintenance page and, worse, parse it as
+    zero rows → a false `deed_not_found` (exit 2). Observed live 2026-07-16:
+    Barnstable nightly backup window returned a 264-byte HTTP 200 page and
+    both engines reported "no deed" for a seller with a recorded deed.
+    """
+
+
+def _alis_registry_unavailable_html(html: str) -> bool:
+    """
+    True if `html` is an ALIS registry maintenance page rather than a search
+    page. Both Barnstable and Norfolk serve the Browntech outage page:
+    "The <county> Public Search program is currently unavailable due to
+    nightly backup or periodic maintenance" — a tiny HTTP 200 response with
+    no results table, indistinguishable from zero results to the row parsers.
+    """
+    if not html or len(html) > 4096:
+        return False
+    lowered = html.lower()
+    return ("currently unavailable" in lowered
+            and ("maintenance" in lowered or "backup" in lowered))
+
+
+def _alis_http_get(session, url: str, params=None, timeout: int = 30,
+                   retries: int = 3):
+    """
+    GET with retries. Returns the requests Response. Raises RuntimeError
+    after the final attempt so callers can trip the Playwright fallback,
+    or AlisRegistryUnavailableError if the registry is serving its
+    maintenance page (retried like a failure in case the window is closing,
+    but never returned to callers as if it were real content).
+
+    v3.23 — a connection-level failure on the FINAL attempt (refused/reset/
+    unreachable — requests.ConnectionError, e.g. WinError 10061) also raises
+    AlisRegistryUnavailableError. A hard-down registry (observed Norfolk
+    2026-08-11/12: TCP refused outright across three runs) means exactly
+    what the maintenance page means — retry later, conclude nothing — and a
+    Playwright fallback would only hit ERR_CONNECTION_REFUSED on the same
+    host. Only the final attempt counts so a transient blip mid-retry that
+    resolves into a real HTTP error still reports that error.
+    """
+    last_err = None
+    saw_maintenance = False
+    last_was_conn_err = False
+    for attempt in range(retries):
+        last_was_conn_err = False
+        try:
+            resp = session.get(url, params=params, headers=_ALIS_HTTP_HEADERS,
+                               timeout=timeout)
+            if resp.status_code == 200:
+                ctype = resp.headers.get("Content-Type", "")
+                if ("html" in ctype
+                        and _alis_registry_unavailable_html(resp.text)):
+                    saw_maintenance = True
+                    last_err = "registry maintenance page"
+                else:
+                    return resp
+            else:
+                last_err = f"HTTP {resp.status_code}"
+        except requests.exceptions.ConnectionError as e:
+            last_was_conn_err = True
+            last_err = str(e)
+        except Exception as e:
+            last_err = str(e)
+        if attempt < retries - 1:
+            time.sleep(1.5 * (attempt + 1))
+    if saw_maintenance:
+        raise AlisRegistryUnavailableError(
+            f"Registry is offline for maintenance (nightly backup / periodic "
+            f"maintenance page served on {retries} attempts). Retry later — "
+            f"this is NOT a deed-not-found result. URL: {url}")
+    if last_was_conn_err:
+        raise AlisRegistryUnavailableError(
+            f"Registry is unreachable (connection refused/failed after "
+            f"{retries} attempts — hard-down outage, same handling as the "
+            f"maintenance window). Retry later — this is NOT a "
+            f"deed-not-found result. Last error: {last_err}. URL: {url}")
+    raise RuntimeError(f"GET failed after {retries} attempts ({last_err}): {url}")
+
+
+def _alis_parse_results_html(html: str) -> list:
+    """
+    BeautifulSoup equivalent of _alis_parse_results() — identical row dicts
+    (name, reverse_party, certificate, town, date_received, doc_type,
+    doc_desc, book_page, book, page, document_number, land_court, img_href,
+    ctl_num), so _alis_select_deed_row/_alis_row_id/_is_non_conveyance_
+    instrument work unchanged on either engine's output.
+    """
+    rows = []
+    soup = BeautifulSoup(html, "html.parser")
+    for link in soup.find_all("a", href=re.compile(r"WSIQTP=L[RC]01I")):
+        href = link.get("href") or ""
+        is_lc = "WSIQTP=LC01I" in href
+        m_ctln = re.search(r"W9CTLN=(\d+)", href)
+        m_year = re.search(r"W9RCCY=(\d+)", href)
+        m_mon  = re.search(r"W9RCMM=(\d+)", href)
+        m_day  = re.search(r"W9RCDD=(\d+)", href)
+
+        tr = link.find_parent("tr")
+        if tr is None:
+            continue
+        tds = tr.find_all("td")
+        texts = [" ".join(td.get_text(" ", strip=True).split()) for td in tds]
+        name_link = tr.find("a", href=re.compile(r"WSIQTP=L[RC]01L"))
+
+        col1 = texts[1] if len(texts) > 1 else ""
+        col6 = texts[6] if len(texts) > 6 else ""
+        col6_match = re.search(r"(\d+)[-/](\d+)", col6)
+
+        reverse_party = certificate = ""
+        book = page = document_number = ""
+        if is_lc:
+            certificate = col1
+            if col6_match:
+                document_number = col6_match.group(1)
+            elif col6.isdigit():
+                document_number = col6
+        else:
+            reverse_party = col1
+            if col6_match:
+                book = col6_match.group(1)
+                page = col6_match.group(2)
+
+        rows.append({
+            "name":            " ".join(name_link.get_text(" ", strip=True).split())
+                               if name_link else (texts[0] if texts else ""),
+            "reverse_party":   reverse_party,
+            "certificate":     certificate,
+            "town":            texts[2] if len(texts) > 2 else "",
+            "date_received":   (f"{m_mon.group(1)}-{m_day.group(1)}-{m_year.group(1)}"
+                                if (m_year and m_mon and m_day)
+                                else (texts[3] if len(texts) > 3 else "")),
+            "doc_type":        texts[4] if len(texts) > 4 else "",
+            "doc_desc":        texts[5] if len(texts) > 5 else "",
+            "book_page":       col6,
+            "book":            book,
+            "page":            page,
+            "document_number": document_number,
+            "land_court":      is_lc,
+            "img_href":        href,
+            "ctl_num":         m_ctln.group(1) if m_ctln else "",
+        })
+    return rows
+
+
+def _alis_hidden_fields_html(html: str) -> list:
+    """
+    Hidden inputs of the results page's <form id="search"> as (name, value)
+    tuples, order and duplicates preserved (the form legitimately repeats
+    W9PG). These carry the pagination cursor (W9NMX = last indexed name on
+    the page, W9BK/W9PG/W9CTLN/W9RC*/W9INO/X3XBRRN = last row position).
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    form = soup.find("form", id="search")
+    if form is None:
+        return []
+    return [
+        (inp.get("name"), inp.get("value") or "")
+        for inp in form.find_all("input", type="hidden")
+        if inp.get("name")
+    ]
+
+
+def _alis_row_identity(row: dict) -> tuple:
+    """Full row identity (index name included) for pagination dedupe."""
+    return (row.get("land_court"), row.get("name"), row.get("ctl_num"),
+            row.get("book"), row.get("page"), row.get("document_number"),
+            row.get("date_received"))
+
+
+def _alis_instrument_id(row: dict) -> tuple:
+    """
+    Instrument identity — the same deed indexed under two grantee names
+    (e.g. husband + wife rows) collapses to one instrument.
+    """
+    if row.get("land_court"):
+        return ("LC", row.get("document_number") or row.get("ctl_num"))
+    return ("RL", _norm_num(row.get("book")), _norm_num(row.get("page")))
+
+
+def _norm_num(val) -> str:
+    """Normalize a book/page number for comparison ('037820' == '37820')."""
+    s = str(val or "").strip()
+    return str(int(s)) if s.isdigit() else s
+
+
+def _alis_search_http(
+    session,
+    base_url: str,
+    last: str,
+    first: str,
+    party: str,
+    town: str,
+    land_court: bool = False,
+    doc_type: str = "*ALL",
+    date_from: str = "",
+    max_pages: int = _ALIS_MAX_PAGES,
+    notes: list = None,
+    meta: dict = None,
+) -> list:
+    """
+    Run an ALIS name search over HTTP and return ALL result rows across
+    pagination (up to max_pages of 30). The results page renders a "Next"
+    link unconditionally, so termination is: a short page (< 10 rows —
+    ALIS's smallest page size), a page with no new rows, or the cap.
+    Appends a truncation warning to `notes` if the cap is hit while rows
+    are still coming. v3.20: when `meta` is passed, meta["truncated"] is
+    set so callers can ACT on a capped search (the note alone let the
+    Keegan grantor check report a truncated set as its final answer).
+    """
+    url = _alis_url(base_url, last, first, party, town=town,
+                    land_court=land_court, doc_type=doc_type,
+                    date_from=date_from, per_page=30)
+    resp = _alis_http_get(session, url)
+    html = resp.text
+    new_rows = _alis_parse_results_html(html)
+    all_rows = list(new_rows)
+    seen = {_alis_row_identity(r) for r in new_rows}
+    next_control = "LC01N" if land_court else "LR01N"
+
+    pages = 1
+    while len(new_rows) >= 10 and pages < max_pages:
+        fields = _alis_hidden_fields_html(html)
+        if not fields:
+            break
+        # WSSRPP is not among the form's hidden fields — without re-sending
+        # it, continuation pages revert to the 10-row default.
+        params = [(n, v) for n, v in fields if n not in ("WSIQTP", "WSSRPP")]
+        params.append(("WSIQTP", next_control))
+        params.append(("WSSRPP", "30"))
+        resp = _alis_http_get(session, f"{base_url}/ALIS/WW400R.HTM", params=params)
+        html = resp.text
+        page_rows = _alis_parse_results_html(html)
+        new_rows = [r for r in page_rows if _alis_row_identity(r) not in seen]
+        if not new_rows:
+            break
+        seen.update(_alis_row_identity(r) for r in new_rows)
+        all_rows.extend(new_rows)
+        pages += 1
+
+    truncated = pages >= max_pages and len(new_rows) >= 10
+    if meta is not None:
+        meta["truncated"] = truncated
+        meta["pages_walked"] = pages
+    if truncated and notes is not None:
+        notes.append(
+            f"WARNING: pagination cap hit ({max_pages} pages / {len(all_rows)} rows) "
+            f"on {'Land Court' if land_court else 'Recorded Land'} "
+            f"{'grantor' if party == 'R' else 'grantee'} search for "
+            f"'{last}, {first or '(surname only)'}' — results may be truncated."
+        )
+    return all_rows
+
+
+def _alis_get_pdf_hrefs_http(session, base_url: str, img_href: str) -> dict:
+    """
+    HTTP version of _alis_get_pdf_hrefs() — fetch the Document Image List
+    page and return the same dict shape (pdf_hrefs / is_fallback / all_pdfs /
+    image_list_url).
+    """
+    full_url = (base_url + img_href) if img_href.startswith("/") else img_href
+    empty = {"pdf_hrefs": [], "is_fallback": False, "all_pdfs": [],
+             "image_list_url": full_url}
+    try:
+        resp = _alis_http_get(session, full_url)
+    except Exception:
+        return empty
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    all_pdfs = [
+        a.get("href") for a in soup.find_all("a", href=re.compile(r"/WwwImg/", re.I))
+        if a.get("href") and re.search(r"\.PDF$", a.get("href"), re.I)
+    ]
+    numbered = [h for h in all_pdfs if re.search(r"\d{3,4}\.PDF$", h, re.I)]
+    if numbered:
+        return {"pdf_hrefs": numbered, "is_fallback": False,
+                "all_pdfs": all_pdfs, "image_list_url": full_url}
+    if all_pdfs:
+        return {"pdf_hrefs": all_pdfs, "is_fallback": True,
+                "all_pdfs": all_pdfs, "image_list_url": full_url}
+    return empty
+
+
+def _alis_download_pdfs_http(
+    session,
+    base_url: str,
+    pdf_hrefs: list,
+    base_name: str,
+    output_folder: Path,
+    label: str = "deed",
+) -> tuple:
+    """
+    HTTP version of _alis_download_pdfs(). `label` distinguishes the main
+    deed ("deed") from candidate page-1 samples ("candidate_Bk..._Pg...").
+    Returns (saved, errors).
+    """
+    saved, errors = [], []
+    for i, href in enumerate(pdf_hrefs, start=1):
+        url = (base_url + href) if href.startswith("/") else href
+        try:
+            resp = _alis_http_get(session, url)
+            ct = resp.headers.get("content-type", "").lower()
+            if "pdf" in ct or url.lower().endswith(".pdf"):
+                out_path = output_folder / f"{base_name} - {label}_p{i}.pdf"
+                out_path.write_bytes(resp.content)
+                saved.append(str(out_path))
+            else:
+                errors.append(f"Page {i}: non-PDF content-type ({ct!r}) — {url}")
+        except Exception as e:
+            errors.append(f"Page {i}: download error — {e} — {url}")
+    return saved, errors
+
+
+# ---------------------------------------------------------------------------
+# Document Abstract page (v3.22) — the registry's own structured index record
+# for one instrument, including the PROPERTY ADDRESS.
+#
+# Until v3.22 the workflow explicitly skipped this page ("all required
+# metadata is on the results and image list pages"), an enumeration that
+# missed the `Addr:` field — and the address is precisely what the v3.14/3.15
+# wrong-parcel guards spend a PDF download plus a vision-model call per
+# candidate to re-derive. Worse, that derivation has a null-address failure
+# mode this page does not: Keegan Bk15978/412's page 1 reads only "SEE ATTACHED
+# FULL LEGAL", so its sampled address came back null and the candidate was
+# silently dropped (the whole v3.20 defect) — while its abstract carries
+# "Town: WEYMOUTH  Addr: 402 SEDGEFIELD STREET" as plain text.
+#
+# Cheap (one GET), needs no ANTHROPIC_API_KEY, and also yields Doc$
+# consideration, page count, and the Ref By:/Refers to Book: cross-references.
+# NOT a replacement for PDF sampling: `Addr:` is frequently absent (Keegan
+# Bk11873/154 has none), and an absent address means UNVERIFIED, never "a
+# different parcel" — the caller must fall through to sampling.
+#
+# RECORDED LAND ONLY. The Land Court abstract is keyed differently and
+# returns HTTP 500 for these parameters (probed live 2026-08-12); Land Court
+# rows fall through to the existing sampling path untouched.
+# ---------------------------------------------------------------------------
+
+# Every label the abstract record uses. Parsing is positional: a field's value
+# runs from the end of its label to the start of the next label, which handles
+# repeated Town:/Addr: pairs (multi-parcel deeds) and missing fields alike.
+_ALIS_ABSTRACT_LABELS = (
+    "Bk-Pg:", "Recorded:", "Inst #:", "Chg:", "Vfy:", "Sec:",
+    "Pages in document:", "Grp:", "Type:", "Doc$:", "Desc:",
+    "Refers to Book:", "Town:", "Addr:", "Map Book-Page:",
+    "Gtor:", "Gtee:", "Ref By:", "In book:", "Notes:", "Chgs Jrnl",
+    "Prev Doc", "Next Doc", "Print Search Results",
+    # v3.28 — the recording-footer labels. The LC vocabulary below has had
+    # these since v3.25; Recorded Land did not, and the scan takes each
+    # value up to the NEXT label — so on a page whose last label is "Gtee:"
+    # the whole footer was swallowed into the final party name:
+    #   "SALGADO, MARIA TERESA (Gtee) Return addr: SIMPLIFILE E-RECORDING
+    #    Recording Fee: 100.00 State excise: .00 Surcharge: 55.00"
+    # Harmless while `grantees` was only displayed; not harmless once
+    # v3.28 derives grantor-check SEARCH NAMES from it — a search for that
+    # first name returns nothing, and a co-owner search that finds nothing
+    # is indistinguishable from a co-owner with no subsequent instruments.
+    "Return addr:", "Recording Fee:", "State excise:", "Surcharge:",
+)
+
+# v3.25 — the Land Court abstract page uses its own label vocabulary
+# (spelled-out where the Recorded Land page abbreviates): Address:/Descr:/
+# Grantor:/Grantee: vs Addr:/Desc:/Gtor:/Gtee:, Consideration: vs Doc$:,
+# and LC-only fields — Ctf#:, Doc date:, Parent doc:/Related doc: (the
+# cross-references), Return addr:. Note Address: precedes Town: (Recorded
+# Land pairs Town:→Addr: in the opposite order).
+_ALIS_LC_ABSTRACT_LABELS = (
+    "Doc#:", "Recorded:", "Address:", "Pages in document:", "Group:",
+    "Type:", "Descr:", "Town:", "Doc date:", "Consideration:", "Ctf#:",
+    "Parent doc:", "Related doc:", "Grantor:", "Grantee:", "Return addr:",
+    "Recording Fee:", "State excise:", "Surcharge:", "Notes:",
+    "Prev Doc", "Next Doc", "Print Search Results",
+)
+
+
+def _alis_abstract_url(base_url: str, row: dict) -> str:
+    """
+    v3.22 — build the Document Abstract URL for a result row. Keyed by
+    recording date + control number, both already parsed off the results
+    grid, so no extra navigation is needed. Returns "" when the row lacks
+    either.
+
+    v3.25 — Land Court supported. The earlier "keyed by document number"
+    hypothesis was wrong: the LC abstract uses the SAME date+ctl keying,
+    just `WSIQTP=LC09A` + `WSKYCD=D` (not LR09A/B) — read off the ABS
+    icon's href on a live LC results page (Norfolk Kilbride row,
+    2026-08-12; the `W9IMID`/`W9ABR` params the icon carries are optional).
+    Confirmed identical on Barnstable.
+    """
+    parts = (row.get("date_received") or "").split("-")
+    ctl = (row.get("ctl_num") or "").strip()
+    if len(parts) != 3 or not ctl:
+        return ""
+    mm, dd, yyyy = parts
+    inq, key = ("LC09A", "D") if row.get("land_court") else ("LR09A", "B")
+    return (f"{base_url}/ALIS/WW400R.HTM?WSIQTP={inq}&WSKYCD={key}"
+            f"&W9RCCY={yyyy}&W9RCMM={mm}&W9RCDD={dd}&W9CTLN={ctl}")
+
+
+def _alis_parse_abstract_html(html_text: str) -> dict:
+    """
+    v3.22 — parse a Recorded Land abstract page into structured fields.
+    v3.25 — also parses the Land Court abstract page (own label
+    vocabulary; routed by which start label the page carries).
+
+    Returns {book, page, recorded, inst, pages, doc_type, consideration,
+    desc, addresses, grantors, grantees, refs, certificate}. `addresses`
+    is a list of {"town", "addr"} in document order; `addr` is None when
+    the record carries a Town with no Addr (common on Recorded Land), and
+    the list is empty when the record carries neither. On Land Court:
+    book/page are None, `inst` is the document number (group suffix
+    stripped), `certificate` is the Ctf# when numeric, and `refs` carries
+    the Parent doc:/Related doc: cross-references.
+    """
+    txt = _html.unescape(re.sub(r"<[^>]+>", " ", html_text or ""))
+    txt = re.sub(r"\s+", " ", txt).strip()
+    start = txt.find("Bk-Pg:")
+    if start < 0:
+        return _alis_parse_lc_abstract_text(txt)
+    txt = txt[start:]
+
+    # Positional scan: (index, label) for every label occurrence.
+    hits = []
+    for lab in _ALIS_ABSTRACT_LABELS:
+        i = txt.find(lab)
+        while i >= 0:
+            hits.append((i, lab))
+            i = txt.find(lab, i + 1)
+    hits.sort()
+
+    fields = []   # (label, value) in document order
+    for n, (pos, lab) in enumerate(hits):
+        end = hits[n + 1][0] if n + 1 < len(hits) else len(txt)
+        fields.append((lab, txt[pos + len(lab):end].strip()))
+
+    def first(label):
+        return next((v for l, v in fields if l == label and v), None)
+
+    out = {
+        "book": None, "page": None,
+        "recorded": first("Recorded:"),
+        "inst": first("Inst #:"),
+        "pages": None,
+        "doc_type": first("Type:"),
+        "consideration": first("Doc$:"),
+        "desc": first("Desc:"),
+        "addresses": [],
+        "grantors": [v for l, v in fields if l == "Gtor:" and v],
+        "grantees": [v for l, v in fields if l == "Gtee:" and v],
+        "refs": [],
+        "certificate": None,   # v3.25 — Land Court only
+    }
+    bp = first("Bk-Pg:")
+    if bp:
+        mo = re.match(r"([0-9A-Za-z]+)-([0-9A-Za-z]+)", bp)
+        if mo:
+            out["book"], out["page"] = mo.group(1), mo.group(2)
+    pg = first("Pages in document:")
+    if pg and pg.split()[0].isdigit():
+        out["pages"] = int(pg.split()[0])
+    if out["consideration"]:
+        out["consideration"] = out["consideration"].split()[0].rstrip(",")
+
+    # Town:/Addr: pairs — Addr belongs to the Town it immediately follows.
+    for n, (lab, val) in enumerate(fields):
+        if lab != "Town:":
+            continue
+        addr = None
+        if n + 1 < len(fields) and fields[n + 1][0] == "Addr:":
+            addr = fields[n + 1][1] or None
+        out["addresses"].append({"town": val or None, "addr": addr})
+
+    # Cross-references: "Ref By: <date> <TYPE> In book: <bk>-<pg>"
+    for n, (lab, val) in enumerate(fields):
+        if lab not in ("Ref By:", "Refers to Book:"):
+            continue
+        book = None
+        if lab == "Refers to Book:":
+            book = val.split()[0] if val else None
+        elif n + 1 < len(fields) and fields[n + 1][0] == "In book:":
+            book = (fields[n + 1][1] or "").split()[0] or None
+        out["refs"].append({"kind": lab.rstrip(":"), "detail": val or None,
+                            "book_page": book})
+    return out
+
+
+def _alis_parse_lc_abstract_text(txt: str) -> dict:
+    """
+    v3.25 — parse the Land Court abstract page (already tag-stripped and
+    whitespace-collapsed by _alis_parse_abstract_html, which routes here
+    when the page has no "Bk-Pg:"). Same positional label scan, LC
+    vocabulary. Live samples: Norfolk Doc 1183426 (Kilbride — Address:
+    29 FOX MEADOW ROAD, Ctf#: 174905, Parent doc: 438,116), Barnstable
+    Doc 982447 (COC — Ctf#: "See parent list", Related doc: + Parent doc:,
+    no Consideration:). Returns the same dict shape as the Recorded Land
+    parser; {} when the page carries no "Doc#:" either (maintenance page,
+    genuinely unkeyed row, error page).
+    """
+    start = txt.find("Doc#:")
+    if start < 0:
+        return {}
+    txt = txt[start:]
+
+    hits = []
+    for lab in _ALIS_LC_ABSTRACT_LABELS:
+        i = txt.find(lab)
+        while i >= 0:
+            hits.append((i, lab))
+            i = txt.find(lab, i + 1)
+    hits.sort()
+
+    fields = []   # (label, value) in document order
+    for n, (pos, lab) in enumerate(hits):
+        end = hits[n + 1][0] if n + 1 < len(hits) else len(txt)
+        fields.append((lab, txt[pos + len(lab):end].strip()))
+
+    def first(label):
+        return next((v for l, v in fields if l == label and v), None)
+
+    def party(label):
+        # values carry a trailing role token: "COYNE, DENNIS H. (JR.&AL) (Gtor)"
+        out = []
+        for l, v in fields:
+            if l == label and v:
+                out.append(re.sub(r"\s*\((?:Gtor|Gtee)\)\s*$", "", v))
+        return out
+
+    out = {
+        "book": None, "page": None,
+        "recorded": first("Recorded:"),
+        "inst": None,
+        "pages": None,
+        "doc_type": first("Type:"),
+        "consideration": first("Consideration:"),
+        "desc": first("Descr:"),
+        "addresses": [],
+        "grantors": party("Grantor:"),
+        "grantees": party("Grantee:"),
+        "refs": [],
+        "certificate": None,
+    }
+    doc = first("Doc#:")
+    if doc:
+        # "1183426-1" — strip the group suffix.
+        out["inst"] = doc.split()[0].split("-")[0]
+    pg = first("Pages in document:")
+    if pg and pg.split()[0].isdigit():
+        out["pages"] = int(pg.split()[0])
+    if out["consideration"]:
+        out["consideration"] = out["consideration"].split()[0].rstrip(",")
+    ctf = first("Ctf#:")
+    if ctf:
+        tok = ctf.split()[0].replace(",", "")
+        # "See parent list" and similar non-numeric values stay out — a
+        # certificate number is only useful when it IS one.
+        out["certificate"] = tok if tok.isdigit() else None
+
+    # Address:/Town: pairing — Address PRECEDES its Town on this page
+    # (Recorded Land is the opposite), with other fields between; a
+    # multi-group document repeats the block per group.
+    pending_addr = None
+    for lab, val in fields:
+        if lab == "Address:":
+            if pending_addr is not None:
+                out["addresses"].append({"town": None, "addr": pending_addr})
+            pending_addr = val or None
+        elif lab == "Town:":
+            out["addresses"].append({"town": val or None, "addr": pending_addr})
+            pending_addr = None
+    if pending_addr is not None:
+        out["addresses"].append({"town": None, "addr": pending_addr})
+
+    # Cross-references: the prior instrument(s) in this parcel's chain.
+    for lab, val in fields:
+        if lab in ("Parent doc:", "Related doc:") and val:
+            out["refs"].append({"kind": lab.rstrip(":"), "detail": val,
+                                "book_page": None})
+    return out
+
+
+# ---------------------------------------------------------------------------
+# v3.26 — cross-reference normalisation (the registries' own "what else
+# touches this instrument" lists). Four sources collect this data and none
+# of them consumed it: ALIS Recorded `Ref By:`/`Refers to Book:` (v3.22),
+# ALIS Land Court `Parent doc:`/`Related doc:` (v3.25), the Plymouth detail
+# panel's References table (v3.24) and the Middlesex South detail panel's
+# References list (v3.8). Each renders differently; this normalises all
+# four into one `cross_references` list so the report can show them and
+# /title-rundown + the discharge workflow can consume them.
+#
+# SCOPE (unchanged): this workflow does NOT verify discharges. A DISCHARGE
+# appearing here is a LEAD — the registry index saying an instrument of
+# that type references this one. It is not proof the mortgage was
+# discharged, and it must never be reported as one.
+# ---------------------------------------------------------------------------
+
+# Longest-first within each bucket; first hit wins, so "DISCHARGE" is tested
+# before "DIS" and "DECLARATION OF HOMESTEAD" before "DECLARATION".
+_CROSSREF_KINDS = (
+    ("discharge",  ("DISCHARGE", "RELEASE", "SATISFACTION", "DIS REL",
+                    "DIS", "REL")),
+    ("homestead",  ("DECLARATION OF HOMESTEAD", "HOMESTEAD", "DCLN HMS", "HMS")),
+    ("deed",       ("DEED", "DD")),
+    ("mortgage",   ("MORTGAGE", "MTG")),
+    ("death_cert", ("DEATH CERTIFICATE", "DEATH CERT", "DEATH")),
+    ("probate",    ("PROBATE", "ESTATE", "AFFIDAVIT", "AFFT")),
+    ("assignment", ("ASSIGNMENT", "ASSIGN", "ASST")),
+    ("lien",       ("MUNICIPAL LIEN", "TAX LIEN", "LIEN", "ATTACHMENT",
+                    "ATTACH", "MLC")),
+    ("plan",       ("PLAN",)),
+    ("taking",     ("TAKING", "TKG", "EASEMENT", "ESMT")),
+    ("notice",     ("NOTICE", "NOTC")),
+)
+
+
+def _classify_cross_reference(text: str) -> str:
+    """v3.26 — bucket a cross-reference's instrument text. 'other' when
+    nothing matches: an unrecognised type is surfaced, never dropped."""
+    t = (text or "").upper()
+    for kind, needles in _CROSSREF_KINDS:
+        if any(n in t for n in needles):
+            return kind
+    return "other"
+
+
+def _normalize_cross_references(entries, source: str) -> list:
+    """
+    v3.26 — normalise one registry's cross-reference list into
+    [{kind, instrument, book, page, doc_number, certificate, date,
+      direction, source, raw}].
+
+    `entries` is either the ALIS abstract's `refs` (list of dicts) or a
+    list of raw text lines (the Plymouth / Middlesex South detail-panel
+    slices, which arrive as innerText rows with tab-separated cells).
+
+    `direction` is the part a title reader actually acts on:
+      later    — a subsequent instrument references this one (ALIS
+                 `Ref By:`; panel rows dated after the deed). These are
+                 the homesteads/discharges/deeds recorded against the
+                 parcel afterwards.
+      earlier  — this instrument references a prior one (ALIS `Refers to
+                 Book:`, Land Court `Parent doc:` — the prior deed or
+                 certificate in the chain).
+      related  — lateral (Land Court `Related doc:`) or undetermined.
+
+    Never raises: a line it cannot parse is still returned with `raw` set
+    and everything else null, because dropping an unparsed cross-reference
+    is exactly the "missing information treated as absence" failure this
+    codebase keeps relearning.
+    """
+    out = []
+    for e in entries or []:
+        if isinstance(e, dict):
+            kind_label = (e.get("kind") or "").strip()
+            detail = (e.get("detail") or "").strip()
+            bp = (e.get("book_page") or "").strip()
+            raw = f"{kind_label}: {detail}" if kind_label else detail
+            direction = ("later" if kind_label == "Ref By"
+                         else "earlier" if kind_label in ("Refers to Book",
+                                                          "Parent doc")
+                         else "related")
+        else:
+            raw = " ".join(str(e).split())
+            if not raw or raw.lower().startswith("references"):
+                continue   # the "References - 2" table caption
+            kind_label, detail, bp, direction = "", raw, "", "later"
+
+        book = page = doc_number = certificate = date = None
+        # Book/page: "35430-156" (ALIS) or "29868/325" (panel tables).
+        mo = re.search(r"(?<![0-9])(\d{3,6})[-/](\d{1,4})(?![0-9])", bp or detail)
+        if mo:
+            book, page = mo.group(1), mo.group(2)
+        # Land Court: "438,116 1 DEED Ctf: 117912"
+        if not book:
+            mo = re.match(r"([\d,]{4,})", detail)
+            if mo:
+                doc_number = mo.group(1).replace(",", "")
+        mo = re.search(r"Ctf:?\s*([\d,]+)", detail, re.IGNORECASE)
+        if mo:
+            certificate = mo.group(1).replace(",", "")
+        mo = re.search(r"(\d{1,2}-\d{1,2}-\d{4})", detail)
+        if mo:
+            date = mo.group(1)
+        else:
+            mo = re.search(r"(?<![0-9])((?:19|20)\d{2})(?![0-9])", detail)
+            if mo:
+                date = mo.group(1)
+
+        # Instrument text = the words, minus the numeric/date noise.
+        instrument = re.sub(r"Ctf:?\s*[\d,]+", " ", detail, flags=re.IGNORECASE)
+        instrument = re.sub(r"\d{1,2}-\d{1,2}-\d{4}", " ", instrument)
+        instrument = re.sub(r"(?<![A-Za-z])[\d,]+(?:[-/]\d+)?(?![A-Za-z])", " ", instrument)
+        instrument = " ".join(instrument.split()) or None
+
+        out.append({
+            "kind": _classify_cross_reference(instrument or detail),
+            "instrument": instrument,
+            "book": book,
+            "page": page,
+            "doc_number": doc_number,
+            "certificate": certificate,
+            "date": date,
+            "direction": direction,
+            "source": source,
+            "raw": raw,
+        })
+    return out
+
+
+def _cross_reference_note(refs: list) -> str:
+    """v3.26 — one-line summary of the normalised cross-references for the
+    notes array. Names the discharge-type hits explicitly because those are
+    the ones a reader will want to chase — while saying plainly that this
+    workflow has not verified them."""
+    if not refs:
+        return ""
+    by_kind = {}
+    for r in refs:
+        by_kind.setdefault(r["kind"], 0)
+        by_kind[r["kind"]] += 1
+    parts = ", ".join(f"{n} {k}" for k, n in sorted(by_kind.items()))
+    msg = (f"Cross-references (v3.26): {len(refs)} instrument(s) reference "
+           f"this deed or are referenced by it — {parts}. These are the "
+           "registry's own index cross-refs, useful as leads for the "
+           "discharge / title-rundown workflows.")
+    disc = [r for r in refs if r["kind"] == "discharge"]
+    if disc:
+        cites = ", ".join(
+            (f"Bk{r['book']}/{r['page']}" if r["book"]
+             else f"Doc#{r['doc_number']}" if r["doc_number"] else r["raw"])
+            for r in disc)
+        msg += (f" NOTE the {len(disc)} discharge-type reference(s) "
+                f"({cites}): this workflow does NOT verify discharges — "
+                "treat them as leads to confirm, never as proof a mortgage "
+                "was discharged.")
+    return msg
+
+
+def _address_sources_disagree(addr_pdf, addr_abstract, base_name: str) -> bool:
+    """
+    v3.26 — do the deed PDF and the registry abstract disagree about the
+    property address? Both have been reported since v3.22 and on every run
+    so far have agreed; a disagreement means either a misindexed abstract
+    or a wrong-parcel PDF, and must not pass silently because one of the
+    two happened to match the subject.
+
+    Compared on the street parsed from --base-name — that is the question
+    the run actually turns on ("do these name the same parcel, relative to
+    the subject?"), and it tolerates the formatting differences between a
+    staff-typed index line and a granting clause ("402 SEDGEFIELD STREET,
+    WEYMOUTH" vs "402 Sedgefield Street, Weymouth, MA 02188"). With no street
+    to compare against, falls back to loose containment of the leading
+    address component. False whenever either source is missing: absence is
+    not disagreement.
+    """
+    if not addr_pdf or not addr_abstract:
+        return False
+    st_num, st_word = _parse_street_from_base_name(base_name)
+    if st_num and st_word:
+        return (_alis_address_matches(st_num, st_word, addr_pdf)
+                != _alis_address_matches(st_num, st_word, addr_abstract))
+    a, b = addr_pdf.upper(), addr_abstract.upper()
+    return not (a.split(",")[0].strip() in b or b.split(",")[0].strip() in a)
+
+
+def _alis_fetch_abstract_http(session, base_url: str, row: dict,
+                              notes: list = None) -> dict:
+    """
+    v3.22 — fetch + parse one row's Document Abstract. Fails soft: returns
+    {} on any error (unsupported row, HTTP failure, unparseable page) so
+    every caller falls back to the existing PDF-sampling path.
+    """
+    url = _alis_abstract_url(base_url, row)
+    if not url:
+        return {}
+    try:
+        parsed = _alis_parse_abstract_html(_alis_http_get(session, url).text)
+    except Exception as e:
+        if notes is not None:
+            notes.append(f"Abstract fetch failed for {_alis_row_id(row)} "
+                         f"(non-fatal, falling back to page-1 sampling): {e}")
+        return {}
+    if parsed:
+        parsed["url"] = url
+    return parsed
+
+
+def _alis_abstract_address_strings(abstract: dict) -> list:
+    """
+    v3.22 — the abstract's addresses as match-ready strings ("402 SEDGEFIELD
+    STREET, WEYMOUTH"). Entries with no Addr are omitted: a Town alone
+    cannot answer the parcel question, and treating it as an answer is the
+    exact mistake v3.20 was written to prevent.
+    """
+    out = []
+    for a in (abstract or {}).get("addresses") or []:
+        if a.get("addr"):
+            out.append(", ".join(x for x in (a["addr"], a.get("town")) if x))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# v3.23 — ALIS grantor-hit classification (the common-name pile, ALIS edition)
+#
+# Port of the Plymouth v3.21 trio. The blocker was always that the ALIS index
+# carries no address column; v3.22 removed it — the Document Abstract answers
+# "which parcel?" for one GET per hit, no PDF and no model call. Motivating
+# run: Keegan / 402 Sedgefield St Weymouth (2026-08-12, log 2026-08-12-003) — the
+# v3.20 town-scoped retries made the grantor check COMPLETE but returned 322
+# instruments, every one of which had to be read by hand.
+#
+# NOTHING IS EVER DROPPED. Hits are classified and ORDERED; the same tier
+# names, tags, and JSON shape as Plymouth (grantor_check.needs_review +
+# .summary) so both registries read identically.
+# ---------------------------------------------------------------------------
+
+# Abstract GETs are cheap (one HTTP request, no download, no model call), so
+# classification does NOT inherit _GRANTOR_HIT_SAMPLE_CAP = 5 — it fetches
+# far more. The cap only bounds a pathological run; rows beyond it classify
+# from town/type/date alone, which errs toward needs_review (safe direction).
+_ALIS_CLASSIFY_ABSTRACT_CAP = 250
+_ALIS_CLASSIFY_WORKERS = 8
+
+
+def _alis_hit_town_matches(row_town: str, town_code: str, town_name: str) -> bool:
+    """
+    v3.23 — does an ALIS grantor-hit row's Town cell refer to the subject
+    town? The grid usually renders the full proper-case name ("Cohasset"),
+    but fixtures and some batches carry the 4-letter ALIS code ("WEYM"), so
+    both the resolved code and the town name parsed from --base-name are
+    tried. `*ALL` is a search scope, never a town — it matches nothing.
+    """
+    t = (row_town or "").strip().upper()
+    if not t:
+        return False
+    code = (town_code or "").strip().upper()
+    name = (town_name or "").strip().upper()
+    if code and code != "*ALL":
+        if t == code or _town_matches_filter(code, t):
+            return True
+    return bool(name) and _town_matches_filter(name, t)
+
+
+def _alis_hit_address_note(result: dict, r: dict, address, st_num: str,
+                           st_word: str, what: str) -> None:
+    """
+    Compare a grantor hit's known address to the subject street and append
+    the appropriate note. v3.23 — hoisted from the STEP 8 closure so the
+    classification pass emits the identical wording (single source for the
+    CRITICAL / POSSIBLE / UNVERIFIED / different-parcel judgments).
+    """
+    if not (st_num and st_word):
+        return
+    rid = _alis_row_id(r)
+    if not address:
+        # v3.20 — null is MISSING INFORMATION, not a non-match (same class
+        # as the Keegan candidate gap): the sampled page may just say "SEE
+        # ATTACHED FULL LEGAL".
+        ref = (f"--verify-grantor-hit {r['document_number']}"
+               if r.get("land_court")
+               else f"--verify-grantor-hit {r['book']}/{r['page']}")
+        result["notes"].append(
+            f"WARNING: grantor hit {rid} ({r['doc_type']} "
+            f"{r['date_received']}): no property address could be "
+            "extracted from the sampled page(s) — UNVERIFIED; do "
+            "NOT dismiss it as a different parcel. Re-run with "
+            f"{ref} to fetch and read the full instrument. [{what}]"
+        )
+        return
+    if _alis_address_matches(st_num, st_word, address):
+        result["notes"].append(
+            f"CRITICAL: grantor hit {rid} ({r['doc_type']} "
+            f"{r['date_received']}) conveys the SUBJECT property "
+            f"({address}) — the seller has deeded the subject parcel "
+            f"out. [{what}]"
+        )
+    elif _alis_street_word_matches(st_word, address):
+        # v3.16 — street name matches but the number couldn't be
+        # confirmed. NEVER dismiss this as a different parcel.
+        ref = (f"--verify-grantor-hit {r['document_number']}"
+               if r.get("land_court")
+               else f"--verify-grantor-hit {r['book']}/{r['page']}")
+        result["notes"].append(
+            f"POSSIBLE SUBJECT PROPERTY: grantor hit {rid} "
+            f"({r['doc_type']} {r['date_received']}) conveys "
+            f"{address!r} — the street name matches '{st_word}' but "
+            f"the street number could not be confirmed. Treat as a "
+            f"likely deed-out until verified (re-run with {ref}). "
+            f"[{what}]"
+        )
+    else:
+        result["notes"].append(
+            f"Grantor hit {rid} conveys {address!r}, which does not "
+            f"match the subject street '{st_num} {st_word}' — likely "
+            f"a different parcel of the seller's; verify before "
+            f"flagging. [{what}]"
+        )
+
+
+def _alis_classify_grantor_hit(row: dict, st_num: str, st_word: str,
+                               town_code: str, town_name: str,
+                               acq_date: tuple) -> dict:
+    """
+    v3.23 — classify ONE ALIS grantor-check hit against the subject parcel.
+    Same tiers, tags, and needs_review rule as _plymouth_classify_grantor_hit
+    (v3.21); the address comes from the registry abstract (attached to the
+    row by _alis_classify_fetch_abstracts) instead of a grid cell.
+
+    A row with NO abstract address is NEVER treated as a different parcel on
+    that basis alone — it is only deprioritised when its TOWN also differs
+    (the Keegan lesson: missing information is not a non-match). The index
+    Desc cell can only ESCALATE a hit to possible_subject (it is staff-typed
+    low-signal text like "STANTON ROAD" or "SEE RECORD"); it can never
+    dismiss one, and never outranks a real abstract address.
+    """
+    addrs = row.get("abstract_addresses") or []
+    town_match = _alis_hit_town_matches(row.get("town"), town_code, town_name)
+
+    if any(_alis_address_matches(st_num, st_word, a) for a in addrs):
+        parcel = "subject"
+    elif any(_alis_street_word_matches(st_word, a) for a in addrs):
+        parcel = "possible_subject"
+    elif addrs:
+        parcel = "other_same_town" if town_match else "other_parcel"
+    elif _alis_street_word_matches(st_word, row.get("doc_desc") or ""):
+        parcel = "possible_subject"
+    else:
+        parcel = "unknown_same_town" if town_match else "other_town"
+
+    row_date = _parse_deed_date(row.get("date_received") or "")
+    # A row whose date will not parse is treated as post-acquisition — the
+    # safe direction for a deed-out check.
+    pre_acq = bool(acq_date > (0, 0, 0) and (0, 0, 0) < row_date < acq_date)
+    dt = (row.get("doc_type") or "").strip()
+    # A blank/unparsed type is treated as a conveyance — the safe direction.
+    conveyance = not dt or not _is_non_conveyance_instrument(dt)
+
+    needs_review = (
+        parcel in ("subject", "possible_subject", "unknown_same_town")
+        or (conveyance and not pre_acq)
+    )
+    tag = _PLYMOUTH_HIT_TAGS[parcel] + (" | pre-acquisition" if pre_acq else "")
+    return {
+        "parcel": parcel,
+        "pre_acquisition": pre_acq,
+        "conveyance": conveyance,
+        "needs_review": needs_review,
+        "tag": tag,
+    }
+
+
+def _alis_grantor_sort_key(row: dict) -> tuple:
+    """
+    v3.23 — order grantor hits most-relevant first (same rule as
+    _plymouth_grantor_sort_key): subject parcel before unknown before other;
+    post-acquisition before pre-acquisition; conveyances before
+    non-conveyances; then newest first. On the Keegan set the rows that
+    matter sit wherever the merged county-wide + town-scoped searches left
+    them, 322 rows deep.
+    """
+    c = row.get("classification") or {}
+    try:
+        tier = _PLYMOUTH_HIT_TIERS.index(c.get("parcel", "other_town"))
+    except ValueError:
+        tier = len(_PLYMOUTH_HIT_TIERS)
+    y, m, d = _parse_deed_date(row.get("date_received") or "")
+    return (tier, c.get("pre_acquisition", False), not c.get("conveyance", False),
+            -y, -m, -d)
+
+
+def _alis_grantor_hit_str(r: dict) -> str:
+    """
+    v3.23 — one ALIS grantor-check hit as its report/JSON line. Same base
+    format as v3.9; the abstract address and the classification tag are
+    appended when known, so the parcel question reads straight off the line.
+    """
+    if r.get("land_court"):
+        s = (f"Doc#{r['document_number']} Ctf#{r['certificate']} {r['doc_type']} "
+             f"{r['date_received']} | Desc: {r['doc_desc']} | Ctl#: {r['ctl_num']}"
+             f" | via: {r.get('via_search', '?')}")
+    else:
+        s = (f"Bk{r['book']}/{r['page']} {r['doc_type']} {r['date_received']} "
+             f"| Grantee: {r['reverse_party']} | Desc: {r['doc_desc']} | Ctl#: {r['ctl_num']}"
+             f" | via: {r.get('via_search', '?')}")
+    addrs = r.get("abstract_addresses") or []
+    if addrs:
+        s += f" | Addr: {addrs[0]}"
+        if len(addrs) > 1:
+            s += f" (+{len(addrs) - 1} more)"
+    c = r.get("classification")
+    if c:
+        s += f" | {c['tag']}"
+    return s
+
+
+def _alis_classify_fetch_abstracts(base_url: str, rows: list, acq_date: tuple,
+                                   town_code: str, town_name: str,
+                                   notes: list) -> None:
+    """
+    v3.23 — fetch registry abstracts, in parallel, for the grantor-check
+    rows whose classification an address can actually change:
+
+      (a) post-acquisition (or unparseable-date) conveyance hits — the
+          deed-out candidates; the address decides subject vs elsewhere;
+      (b) rows whose Town matches the subject town — the address moves them
+          out of unknown_same_town (the tier that forces needs_review).
+
+    Other-town non-conveyance and pre-acquisition rows classify to excluded
+    tiers with no address, so no GET is spent on them. Land Court rows are
+    included since v3.25 (LC09A/WSKYCD=D keying — same date+ctl fields).
+    Each fetched row gains `_abstract` (cached for STEP 8),
+    `abstract_addresses`, and `abstract_url`. Failures are aggregated into
+    ONE note — a per-row note per failure would flood a 300-hit run when
+    the registry hiccups.
+    """
+    need = []
+    for r in rows:
+        if "_abstract" in r:
+            continue
+        dt = (r.get("doc_type") or "").strip()
+        conv = not dt or not _is_non_conveyance_instrument(dt)
+        rd = _parse_deed_date(r.get("date_received") or "")
+        post = not (acq_date > (0, 0, 0) and (0, 0, 0) < rd < acq_date)
+        if (conv and post) or _alis_hit_town_matches(r.get("town"), town_code,
+                                                     town_name):
+            prio = 0 if (conv and post) else 1
+            need.append((prio, (-rd[0], -rd[1], -rd[2]), r))
+    need.sort(key=lambda t: (t[0], t[1]))
+    over_cap = len(need) - _ALIS_CLASSIFY_ABSTRACT_CAP
+    todo = [t[2] for t in need[:_ALIS_CLASSIFY_ABSTRACT_CAP]]
+    if not todo:
+        return
+
+    def _worker(chunk):
+        s = requests.Session()
+        for r in chunk:
+            a = _alis_fetch_abstract_http(s, base_url, r)
+            r["_abstract"] = a
+            r["abstract_addresses"] = _alis_abstract_address_strings(a)
+            r["abstract_url"] = a.get("url") if a else None
+
+    workers = min(_ALIS_CLASSIFY_WORKERS, len(todo))
+    chunks = [todo[i::workers] for i in range(workers)]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        # list() so worker exceptions propagate to the caller's try/except.
+        list(pool.map(_worker, chunks))
+
+    with_addr = sum(1 for r in todo if r.get("abstract_addresses"))
+    failed = sum(1 for r in todo if not r.get("_abstract"))
+    notes.append(
+        f"Grantor-hit classification (v3.23): fetched {len(todo)} registry "
+        f"abstract(s) ({with_addr} carried an address"
+        + (f", {failed} failed/empty" if failed else "")
+        + ")"
+        + (f"; {over_cap} lower-priority row(s) beyond the "
+           f"{_ALIS_CLASSIFY_ABSTRACT_CAP}-abstract cap classified from "
+           "town/type/date alone" if over_cap > 0 else "")
+        + ". Other-town non-conveyance and pre-acquisition rows need no "
+        "address to classify."
+    )
+
+
+def _alis_finalize_grantor_check(result: dict, rows: list, base_name: str,
+                                 town_code: str, base_url: str) -> None:
+    """
+    v3.23 — classify, order and summarise the ALIS grantor-check hits,
+    mutating `result` in place (Plymouth v3.21 parity — same JSON shape:
+    grantor_check.deeds ordered most-relevant first with parcel tags,
+    .needs_review, .summary).
+
+    NOTHING IS DROPPED. ALIS full-name hits include the seller's own
+    mortgages, homesteads and liens (they are not type-filtered), so hits
+    are classified and ordered, never filtered out.
+
+    Classification needs a street parsed from --base-name; without one
+    (entity sellers, unparseable base names) every hit is left unclassified
+    and reported for manual assessment exactly as before v3.23.
+
+    Per-hit notes are emitted here ONLY for subject / possible-subject hits,
+    via the same _alis_hit_address_note wording the sampler uses; rows this
+    pass has assessed are marked `_class_noted` so STEP 8 does not repeat
+    the note for its sampled subset.
+    """
+    st_num, st_word = _parse_street_from_base_name(base_name)
+    town_name = _parse_town_from_base_name(base_name)
+    acq_date = _parse_deed_date(result.get("recorded_date") or "")
+    gc = result["grantor_check"]
+    classified = bool(st_num and st_word)
+    if classified:
+        try:
+            _alis_classify_fetch_abstracts(base_url, rows, acq_date,
+                                           town_code, town_name,
+                                           result["notes"])
+        except Exception as e:
+            result["notes"].append(
+                f"Grantor-hit abstract fetch failed (non-fatal — hits with "
+                f"no fetched address classify as parcel-unknown, which stays "
+                f"in needs_review): {e}"
+            )
+        for r in rows:
+            r["classification"] = _alis_classify_grantor_hit(
+                r, st_num, st_word, town_code, town_name, acq_date)
+        rows.sort(key=_alis_grantor_sort_key)
+    else:
+        result["notes"].append(
+            "Grantor-hit classification skipped: no street number/name parsed "
+            "from the base name — every hit below must be assessed manually "
+            "by parcel."
+        )
+
+    gc["deeds"] = [_alis_grantor_hit_str(r) for r in rows]
+    review = [r for r in rows
+              if not classified or r["classification"]["needs_review"]]
+    gc["needs_review"] = [_alis_grantor_hit_str(r) for r in review]
+
+    if classified:
+        counts = {t: 0 for t in _PLYMOUTH_HIT_TIERS}
+        for r in rows:
+            counts[r["classification"]["parcel"]] += 1
+        gc["summary"] = {
+            "total": len(rows),
+            "needs_review": len(review),
+            "pre_acquisition": sum(
+                1 for r in rows if r["classification"]["pre_acquisition"]),
+            **counts,
+        }
+        # Subject / possible-subject notes — same wording as the sampler.
+        # A conveyance at the subject parcel recorded on/after the
+        # acquisition date is the deed-out this whole check exists to find.
+        for r in rows:
+            c = r["classification"]
+            if c["pre_acquisition"]:
+                continue
+            addrs = r.get("abstract_addresses") or []
+            if c["parcel"] == "subject" and c["conveyance"]:
+                matched = next(
+                    (a for a in addrs
+                     if _alis_address_matches(st_num, st_word, a)), None)
+                _alis_hit_address_note(result, r, matched, st_num, st_word,
+                                       "registry abstract")
+                r["_class_noted"] = True
+            elif c["parcel"] == "subject":
+                result["notes"].append(
+                    f"Grantor hit {_alis_row_id(r)} ({r['doc_type']} "
+                    f"{r['date_received']}) affects the SUBJECT property but "
+                    "is not a conveyance — assess as an encumbrance "
+                    "(homestead/lien/mortgage), not as a deed-out."
+                )
+                r["_class_noted"] = True
+            elif c["parcel"] == "possible_subject" and c["conveyance"]:
+                addr = next(
+                    (a for a in addrs
+                     if _alis_street_word_matches(st_word, a)), None)
+                # Escalated from the index Desc cell when no abstract
+                # address exists — the note cites what triggered it.
+                what = "registry abstract" if addr else "index Desc"
+                _alis_hit_address_note(
+                    result, r, addr or (r.get("doc_desc") or "").strip(),
+                    st_num, st_word, what)
+                r["_class_noted"] = True
+        s = gc["summary"]
+        result["notes"].append(
+            f"Grantor check: {s['total']} instrument(s) found; "
+            f"{s['needs_review']} need review (subject parcel: {s['subject']}, "
+            f"possible subject: {s['possible_subject']}, unknown parcel in "
+            f"the subject town: {s['unknown_same_town']}, plus any "
+            f"post-acquisition conveyance elsewhere). The other "
+            f"{s['total'] - s['needs_review']} are other parcels/towns or "
+            "pre-acquisition and are still listed in full in "
+            "grantor_check.deeds, ordered most-relevant first. READ "
+            "grantor_check.needs_review FIRST. A 'parcel unknown' tag means "
+            "no address was available from the registry abstract — that row "
+            "was NOT ruled out. Rows 'via: ... (surname only)' may still be "
+            "same-surname strangers — verify the grantor's first name before "
+            "flagging one as the seller's."
+        )
+    else:
+        gc["summary"] = None
+        result["notes"].append(
+            f"Grantor check: {len(rows)} instrument(s) found — "
+            "Claude must assess title flags. Rows 'via: <last>, <first>' are "
+            "the seller. Rows 'via: ... (co-owner from deed)' are a "
+            "co-owner named on the deed — their subsequent instruments "
+            "affect this parcel's title. Rows 'via: ... (surname only)' "
+            "are conveyance-type ONLY (v3.11) and may still be "
+            "same-surname strangers — verify the grantor's first name "
+            "and the property before flagging one; do NOT report a "
+            "surname-only row as the seller's encumbrance."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Inline PDF extraction (v3.10) — Claude API reads the scanned deed so the
+# conversation doesn't have to. ALIS PDFs are image-based scans (no text
+# layer), so this requires a multimodal model; local parsers return nothing.
+# ---------------------------------------------------------------------------
+
+# v3.16 — two extraction tiers. The MAIN deed (and --verify-grantor-hit
+# full extractions) carry the verbatim legal description and stay on the
+# strongest reader; page-1 samples only need an address + party names and
+# run on the fast model (with a one-shot main-model fallback on failure).
+#
+# These are defaults, not pins. Override per run with --model-main /
+# --model-light, or set MA_REGISTRY_MODEL_MAIN / MA_REGISTRY_MODEL_LIGHT in
+# the environment, so a newer model can be adopted without editing the script.
+_EXTRACT_MODEL_MAIN_DEFAULT  = "claude-opus-4-8"
+_EXTRACT_MODEL_LIGHT_DEFAULT = "claude-haiku-4-5-20251001"
+
+_EXTRACT_MODEL_MAIN = os.environ.get(
+    "MA_REGISTRY_MODEL_MAIN", _EXTRACT_MODEL_MAIN_DEFAULT)
+_EXTRACT_MODEL_LIGHT = os.environ.get(
+    "MA_REGISTRY_MODEL_LIGHT", _EXTRACT_MODEL_LIGHT_DEFAULT)
+
+_DEED_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "legal_description": {
+            "type": ["string", "null"],
+            "description": (
+                "The full legal description of the premises, transcribed "
+                "verbatim from the body of the deed: metes and bounds, lot "
+                "and plan references, condominium unit recitals including "
+                "the master deed reference, appurtenant rights, and any "
+                "'subject to' clauses that are part of the description. "
+                "Preserve the original wording and punctuation. Null only "
+                "if no legal description appears."
+            ),
+        },
+        "property_address": {
+            "type": ["string", "null"],
+            "description": (
+                "The property street address as stated on the deed — from "
+                "the granting clause, the left-margin/property notation, or "
+                "the cover sheet. Include town. Null if no address appears "
+                "anywhere on the instrument."
+            ),
+        },
+        "document_number": {
+            "type": ["string", "null"],
+            "description": (
+                "The registry document/instrument number, e.g. the '#NNNNN' "
+                "on a Norfolk recording-stamp header, 'Ctrl#' on a "
+                "Barnstable cover, or 'Doc#' on a Land Court instrument."
+            ),
+        },
+        "certificate_of_title": {
+            "type": ["string", "null"],
+            "description": (
+                "Land Court (Registered Land) only: the Certificate of "
+                "Title number ('Certificate of Title No. NNNNN' or 'Ctf#'). "
+                "Null for Recorded Land instruments."
+            ),
+        },
+        "consideration": {
+            "type": ["string", "null"],
+            "description": (
+                "The consideration as stated in the granting clause ('for "
+                "consideration paid and in full consideration of $X'). "
+                "Cross-check against a cover-sheet 'Cons:' figure if "
+                "present; report the granting-clause amount and note any "
+                "discrepancy in title_flags."
+            ),
+        },
+        "signing_date": {
+            "type": ["string", "null"],
+            "description": (
+                "The date the deed was executed/signed (e.g. 'Executed "
+                "under seal this Xth day of MONTH, YYYY' on the signature "
+                "page), in MM-DD-YYYY form."
+            ),
+        },
+        "recording_stamp": {
+            "type": ["string", "null"],
+            "description": (
+                "The book and page from the recording stamp in the margin "
+                "or header (e.g. 'Bk 34918 Pg 103'), used to sanity-check "
+                "that the right instrument was downloaded. Null if none "
+                "visible."
+            ),
+        },
+        "grantors_full": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Every grantor's full name exactly as written, including "
+                "middle names/initials and capacity language ('John A. "
+                "Smith, individually and as Trustee of the Smith Family "
+                "Trust')."
+            ),
+        },
+        "grantees_full": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Every grantee's full name exactly as written, including "
+                "middle names/initials and capacity language."
+            ),
+        },
+        "tenancy": {
+            "type": ["string", "null"],
+            "description": (
+                "The tenancy in which the grantees take title, verbatim: "
+                "'as joint tenants with rights of survivorship', 'as "
+                "tenants by the entirety', 'as tenants in common', etc. "
+                "Null if the deed is silent (single grantee or unstated)."
+            ),
+        },
+        "prior_deed_reference": {
+            "type": ["string", "null"],
+            "description": (
+                "The derivation clause: 'Being the same premises conveyed "
+                "to the grantor by deed ... recorded at Book NNNN, Page "
+                "NNN' (or a Land Court document/certificate reference)."
+            ),
+        },
+        "title_flags": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Anything a closing attorney should notice: trust vesting "
+                "or trustee-authority recitals, divorce-action recitals, "
+                "tenancy-in-common-only conveyances, homestead releases or "
+                "declarations, estate/probate references, life estates, "
+                "mortgage payoff references, consideration discrepancies, "
+                "handwritten alterations. Empty array if clean."
+            ),
+        },
+    },
+    "required": [
+        "legal_description", "property_address", "document_number",
+        "certificate_of_title", "consideration", "signing_date",
+        "recording_stamp", "grantors_full", "grantees_full", "tenancy",
+        "prior_deed_reference", "title_flags",
+    ],
+    "additionalProperties": False,
+}
+
+# Lighter schema for multiple_deed_candidates page-1 samples — just enough
+# to verify which candidate is the subject property.
+_CANDIDATE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "property_address": {
+            "type": ["string", "null"],
+            "description": (
+                "The property street address (with town) as stated on this "
+                "deed page — granting clause, margin notation, or cover "
+                "sheet. Null if page 1 shows no address."
+            ),
+        },
+        "lot_or_unit": {
+            "type": ["string", "null"],
+            "description": "Lot number, unit number, or plan reference if stated.",
+        },
+        "grantees": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Grantee names as written on this page.",
+        },
+    },
+    "required": ["property_address", "lot_or_unit", "grantees"],
+    "additionalProperties": False,
+}
+
+# Light schema for grantor-check hit page-1 samples (v3.15) — enough to
+# tell whether a suspected deed-out conveys the subject parcel, and by whom.
+_GRANTOR_HIT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "property_address": {
+            "type": ["string", "null"],
+            "description": (
+                "The property street address (with town) as stated on this "
+                "instrument page — granting clause, margin notation, or "
+                "cover sheet. Null if page 1 shows no address."
+            ),
+        },
+        "lot_or_unit": {
+            "type": ["string", "null"],
+            "description": "Lot number, unit number, or plan reference if stated.",
+        },
+        "grantors": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Grantor names as written on this page.",
+        },
+        "grantees": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Grantee names as written on this page.",
+        },
+    },
+    "required": ["property_address", "lot_or_unit", "grantors", "grantees"],
+    "additionalProperties": False,
+}
+
+# v3.15 — page-1 samples are fetched for at most this many conveyance-type
+# grantor-check hits per run (each costs a download + an API extraction).
+_GRANTOR_HIT_SAMPLE_CAP = 5
+
+_EXTRACT_SYSTEM = (
+    "You extract structured title data from scanned Massachusetts Registry "
+    "of Deeds instruments (Browntech ALIS registries such as Norfolk and "
+    "Barnstable). The attached PDF pages together form ONE recorded "
+    "instrument, in page order; the first page is usually a registry cover "
+    "sheet or bears the recording stamp. Transcribe fields exactly as "
+    "written on the instrument — do not paraphrase, normalize names, or "
+    "infer facts that are not on the page. Use null for anything not "
+    "present. These are scans: read stamps, margins, and handwriting "
+    "carefully."
+)
+
+
+def _anthropic_client():
+    """
+    Construct the Anthropic client, or return (None, reason) if extraction
+    cannot run (SDK missing / no credentials).
+
+    v3.27 — credentials are checked HERE rather than left to surface on the
+    first request. The docstring used to say a credentials problem "may
+    only surface on the first request"; measured against the installed SDK,
+    that is what always happens: `Anthropic()` constructs fine with
+    ANTHROPIC_API_KEY unset (api_key=None) or empty (api_key=''), and only
+    raises "Could not resolve authentication method" when a request is
+    sent. So this probe reported a usable client on a keyless machine, and
+    the run did a full search before failing — which is precisely the
+    experience the claude-code mode exists to avoid. Checking the resolved
+    api_key/auth_token makes the probe honest, so `--extraction auto`
+    degrades up front and `--extraction api` errors up front.
+    """
+    if anthropic is None:
+        return None, "anthropic SDK not installed (python -m pip install anthropic)"
+    try:
+        client = anthropic.Anthropic(timeout=180.0, max_retries=2)
+    except Exception as e:
+        return None, f"Anthropic client init failed: {e}"
+    if not (getattr(client, "api_key", None) or getattr(client, "auth_token", None)):
+        return None, ("no Anthropic credentials — set ANTHROPIC_API_KEY in "
+                      "the environment")
+    return client, None
+
+
+def _extraction_fatal_reason(exc) -> str:
+    """
+    v3.28 — is this extraction failure one that will recur for every
+    remaining call in this run (account/credentials/model), as opposed to a
+    per-document or transient one? Returns a short reason, or "" if the
+    failure is worth retrying on the next document.
+
+    Salgado / 87 Marchmont St Hyannis (2026-08-12): a valid API key on an account
+    with no credit returned HTTP 400 `invalid_request_error: "Your credit
+    balance is too low"`. v3.27's pre-flight probe passed — credentials
+    resolved fine — so the run made the same doomed call for the main deed
+    and for every candidate sample, each failing identically. A present key
+    is not a usable key; the honest response to the first such answer is to
+    stop asking and hand the PDFs to Claude, which is what claude-code mode
+    does by design.
+
+    Deliberately NOT fatal: rate limits, timeouts, connection errors,
+    refusals and max_tokens — those are per-request or transient, and
+    giving up on the whole run for one of them would lose extractions that
+    would have succeeded.
+    """
+    status = getattr(exc, "status_code", None)
+    if status in (401, 402, 403, 404):
+        return f"HTTP {status}: {exc}"
+    msg = str(exc)
+    if status == 400 and re.search(
+            r"credit balance|billing|quota|payment|purchase credits",
+            msg, re.I):
+        return f"HTTP 400: {exc}"
+    if anthropic is not None:
+        fatal_types = tuple(
+            t for t in (
+                getattr(anthropic, "AuthenticationError", None),
+                getattr(anthropic, "PermissionDeniedError", None),
+            ) if t is not None
+        )
+        if fatal_types and isinstance(exc, fatal_types):
+            return str(exc)
+    return ""
+
+
+# v3.27 — what the run still does with no Claude API. Worth stating
+# plainly, because it changed a lot: before v3.22 the wrong-parcel guard
+# was gated on PDF extraction, so a keyless run lost its main safety
+# check. Abstracts (v3.22/v3.25) and index-based classification (v3.23)
+# moved that work off the model entirely.
+_NO_API_STILL_WORKS = (
+    "Unaffected without the API: the grantee search and deed selection, "
+    "the registry-abstract address check (the wrong-parcel guard and "
+    "auto-retarget, v3.22/v3.25), the grantor check with its needs_review "
+    "classification (v3.23), cross-references (v3.26), and the deed PDF "
+    "downloads themselves."
+)
+_NO_API_DEGRADES = (
+    "What you must do by hand: (1) Read the downloaded deed PDFs to get "
+    "the legal description and the deed's own field values — that is the "
+    "one job the API was doing; (2) for any candidate or grantor hit whose "
+    "registry abstract carried no address, Read its `sample_file` page-1 "
+    "PDF to answer the which-parcel question."
+)
+
+
+def _resolve_extraction_mode(requested: str):
+    """
+    v3.27 — resolve `--extraction {auto,api,claude-code}` into
+    (extract_pdf, mode, note, error).
+
+      auto (default)  Use the Claude API when a client is available,
+                      otherwise fall back to claude-code mode with a
+                      friendly note. This keeps a key-holder's single-shot
+                      run unchanged while making a keyless install work
+                      out of the box instead of emitting an
+                      `extraction_error`.
+      api             Force the API. Missing SDK/credentials is a hard,
+                      actionable error rather than a silent degrade — the
+                      caller asked for it explicitly.
+      claude-code     Force no-API. This is a MODE, NOT A FAILURE: no
+                      `extraction_error` is set, and the notes tell Claude
+                      to Read the PDFs.
+
+    Returns (extract_pdf: bool, mode: str, note: str|None, error: str|None).
+    """
+    if requested == "claude-code":
+        return False, "claude-code", (
+            "Extraction mode: claude-code (no Claude API call). This is a "
+            "mode, not a failure. " + _NO_API_DEGRADES + " " +
+            _NO_API_STILL_WORKS
+        ), None
+
+    client, reason = _anthropic_client()
+    if requested == "api":
+        if client is None:
+            return False, "api", None, (
+                f"--extraction api was requested but the Claude API is not "
+                f"available: {reason}. Set ANTHROPIC_API_KEY (and "
+                f"`python -m pip install anthropic`), or re-run with "
+                f"--extraction claude-code to have Claude read the deed "
+                f"PDFs instead. No search was performed."
+            )
+        return True, "api", None, None
+
+    # auto
+    if client is None:
+        return False, "claude-code", (
+            f"Extraction mode: claude-code — the Claude API is unavailable "
+            f"({reason}), so the run continues without it. This is expected "
+            f"and supported, not an error. " + _NO_API_DEGRADES + " " +
+            _NO_API_STILL_WORKS + " (Pass --extraction api to make a missing "
+            "key a hard error instead.)"
+        ), None
+    return True, "api", None, None
+
+
+def _extract_pdf_fields(client, pdf_paths: list, schema: dict,
+                        instruction: str,
+                        model: str = _EXTRACT_MODEL_MAIN) -> dict:
+    """
+    Send the given PDFs (pages of one instrument) to Claude with a
+    structured-output schema and return the parsed field dict.
+    Raises on API/parse failure — callers wrap.
+    """
+    content = []
+    for p in pdf_paths:
+        data = base64.standard_b64encode(Path(p).read_bytes()).decode("utf-8")
+        content.append({
+            "type": "document",
+            "source": {"type": "base64", "media_type": "application/pdf",
+                       "data": data},
+        })
+    content.append({"type": "text", "text": instruction})
+
+    response = client.messages.create(
+        model=model,
+        max_tokens=8000,
+        system=_EXTRACT_SYSTEM,
+        output_config={"format": {"type": "json_schema", "schema": schema}},
+        messages=[{"role": "user", "content": content}],
+    )
+    if response.stop_reason == "refusal":
+        raise RuntimeError("extraction request was refused")
+    if response.stop_reason == "max_tokens":
+        raise RuntimeError("extraction output truncated (max_tokens)")
+    text = next(b.text for b in response.content if b.type == "text")
+    return json.loads(text)
+
+
+def _extract_pdf_fields_light(client, pdf_paths: list, schema: dict,
+                              instruction: str) -> dict:
+    """
+    v3.16 — page-1 sample extraction on the fast model, retried once on
+    the main model on any failure so a light-model hiccup can't blind the
+    address checks. Raises only if BOTH attempts fail.
+    """
+    try:
+        return _extract_pdf_fields(client, pdf_paths, schema, instruction,
+                                   model=_EXTRACT_MODEL_LIGHT)
+    except Exception:
+        return _extract_pdf_fields(client, pdf_paths, schema, instruction,
+                                   model=_EXTRACT_MODEL_MAIN)
+
+
+def _mark_extraction_unavailable(result: dict, exc) -> None:
+    """
+    v3.28 — on the first extraction failure that will recur for the rest of
+    the run (see _extraction_fatal_reason), latch it on the result so the
+    later extraction sites — the auto-retarget's re-extraction, the
+    grantor-hit page-1 samples, and --verify-grantor-hit — skip their calls
+    and tell Claude to Read the PDFs instead. Behaviourally the run
+    finishes in claude-code mode; `extraction_mode` still reports what was
+    resolved pre-flight, and `extraction_error` stays set because this one
+    IS a failure, not the chosen mode.
+
+    Idempotent: only the first fatal failure is recorded.
+    """
+    if result.get("extraction_unavailable"):
+        return
+    reason = _extraction_fatal_reason(exc)
+    if not reason:
+        return
+    result["extraction_unavailable"] = reason
+    result["notes"].append(
+        "EXTRACTION UNAVAILABLE for the rest of this run — the Claude API "
+        f"returned an error that will recur for every remaining call: "
+        f"{reason}. Skipping the remaining extraction calls (candidate and "
+        "grantor-hit samples, verification) rather than repeating a failing "
+        "one. " + _NO_API_DEGRADES + " " + _NO_API_STILL_WORKS
+    )
+    if result.get("files"):
+        result["notes"].append(
+            "READ THE DEED PDFs to extract the legal description and deed "
+            "fields (extraction degraded to claude-code mode): "
+            + ", ".join(Path(f).name for f in result["files"])
+        )
+
+
+def _run_pdf_extraction(result: dict, land_court: bool) -> None:
+    """
+    v3.10 — extract structured fields from the downloaded deed PDFs and the
+    multi-candidate page-1 samples, concurrently. Mutates `result` in place:
+    populates result["pdf_extraction"], promotes high-value fields to the
+    top level, fills index nulls, and annotates candidate entries with
+    "sample_extraction". Fails soft: on any error sets
+    result["extraction_error"] and a fallback note; never raises.
+    """
+    client, reason = _anthropic_client()
+    if client is None:
+        result["extraction_error"] = reason
+        result["notes"].append(
+            f"PDF extraction skipped ({reason}) — Claude should Read the "
+            "PDFs to extract the legal description and deed details."
+        )
+        return
+
+    deed_instruction = (
+        "Extract the requested fields from this "
+        + ("Land Court (Registered Land)" if land_court else "Recorded Land")
+        + " instrument."
+    )
+
+    jobs = {}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        jobs["deed"] = pool.submit(
+            _extract_pdf_fields, client, result["files"], _DEED_SCHEMA,
+            deed_instruction,
+        )
+        for i, cand in enumerate(result.get("multiple_deed_candidates") or []):
+            # v3.14 — skip candidates already extracted (the auto-retarget
+            # re-run extracts only the newly selected main deed).
+            if (cand.get("sample_file") and not cand.get("selected")
+                    and not cand.get("sample_extraction")):
+                jobs[f"cand{i}"] = pool.submit(
+                    _extract_pdf_fields_light, client, [cand["sample_file"]],
+                    _CANDIDATE_SCHEMA,
+                    "This is page 1 of a candidate deed. Extract the "
+                    "property address, lot/unit, and grantees so the "
+                    "subject property can be identified.",
+                )
+
+        # Main deed
+        try:
+            fields = jobs["deed"].result()
+            result["pdf_extraction"] = {"model": _EXTRACT_MODEL_MAIN, "fields": fields}
+            result["legal_description"]  = fields.get("legal_description")
+            result["signing_date"]       = fields.get("signing_date")
+            result["grantors_full"]      = fields.get("grantors_full") or []
+            result["grantees_full"]      = fields.get("grantees_full") or []
+            result["tenancy"]            = fields.get("tenancy")
+            result["prior_deed_reference"] = fields.get("prior_deed_reference")
+            result["title_flags"]        = fields.get("title_flags") or []
+            result["deed_property_address_pdf"] = fields.get("property_address")
+            result["recording_stamp"]    = fields.get("recording_stamp")
+            if not result.get("consideration"):
+                result["consideration"] = fields.get("consideration")
+            if not result.get("document_number"):
+                result["document_number"] = fields.get("document_number")
+            if not result.get("certificate_of_title"):
+                result["certificate_of_title"] = fields.get("certificate_of_title")
+            result["notes"].append(
+                f"PDF extraction ({_EXTRACT_MODEL_MAIN}): OK — legal description "
+                f"{'present' if fields.get('legal_description') else 'NOT FOUND'}, "
+                f"address: {fields.get('property_address') or 'n/a'}, "
+                f"stamp: {fields.get('recording_stamp') or 'n/a'}"
+                + (f", title flags: {len(fields.get('title_flags') or [])}"
+                   if fields.get("title_flags") else "")
+            )
+        except Exception as e:
+            result["extraction_error"] = f"{type(e).__name__}: {e}"
+            result["notes"].append(
+                "PDF extraction FAILED for the main deed — Claude should "
+                f"Read the PDFs instead. ({result['extraction_error']})"
+            )
+            _mark_extraction_unavailable(result, e)
+
+        # Candidate samples
+        for i, cand in enumerate(result.get("multiple_deed_candidates") or []):
+            job = jobs.get(f"cand{i}")
+            if job is None:
+                continue
+            try:
+                cand["sample_extraction"] = job.result()
+            except Exception as e:
+                cand["sample_extraction"] = {"error": f"{type(e).__name__}: {e}"}
+                _mark_extraction_unavailable(result, e)
+
+
+def _alis_indexed_name_pair(indexed: str) -> tuple:
+    """
+    Parse an ALIS index name string into (last, first) for a name search.
+    "RENWICK, MICHELE D (&AL)" → ("RENWICK", "MICHELE D") — the (&AL)/(&H)/(&W)
+    co-party suffix is stripped, the middle initial is KEPT (the index
+    groups by the exact string, so 'MICHELE D' rows sort apart from
+    'MICHELE' rows — searching first="MICHELE" prefix-matches both).
+    """
+    # v3.28 — strip EVERY parenthetical group, not just "(&...)". ALIS puts
+    # only capacity/co-party markers in parentheses — "(&AL)", "(TR &AL)",
+    # "(JR.&AL)", "(BY M)", "(AS TR)", "(EST.&AL)" — and the abstract page
+    # additionally tags each party "(Gtor)"/"(Gtee)" where the results grid
+    # does not. The old "(&" -only pattern left "COYNE, MARTIN H. (JR.&AL)"
+    # with first="MARTIN H. (JR.&AL)", which is not a searchable first name.
+    s = re.sub(r"\([^)]*\)", "", indexed or "").strip().rstrip(",").strip()
+    if "," in s:
+        last, _, first = s.partition(",")
+        return (last.strip().upper(), " ".join(first.split()).upper())
+    return (s.upper(), "")
+
+
+def _alis_address_matches(street_num: str, street_word: str, address: str) -> bool:
+    """
+    v3.14 — does an extracted property address match the expected street?
+    Match = the street NUMBER and the FIRST street-name word both appear as
+    standalone tokens (case-insensitive). Matching only the first street
+    token tolerates suffix variance ("Ave"/"Avenue", "Dr"/"Drive"):
+    ("72", "CLOVERFIELD") matches "72 Cloverfield Avenue, Weymouth, MA".
+    Tokenizing on non-alphanumerics also splits ranged numbers ("72-74").
+    """
+    if not (street_num and street_word and address):
+        return False
+    tokens = re.findall(r"[A-Z0-9]+", address.upper())
+    return street_num.upper() in tokens and street_word.upper() in tokens
+
+
+def _alis_street_word_matches(street_word: str, address: str) -> bool:
+    """
+    v3.16 — street-NAME-only match, the "suspicious partial" tier: an
+    extracted address like 'Cloverfield Avenue, Weymouth' (no number read from
+    the scan) matches street word CLOVERFIELD. Used to keep a possible
+    subject-parcel hit from being dismissed as a different parcel when the
+    number couldn't be confirmed (Renwick Bk39044/162, light-model sample).
+    """
+    if not (street_word and address):
+        return False
+    return street_word.upper() in re.findall(r"[A-Z0-9]+", address.upper())
+
+
+_ENTITY_NAME_TOKENS = {
+    "TRUST", "TRUSTEE", "TRUSTEES", "LLC", "INC", "CORP", "CORPORATION",
+    "COMPANY", "CO", "BANK", "ESTATE", "REALTY", "NOMINEE", "PARTNERSHIP",
+    "PARTNERS", "LP", "LLP", "ASSOCIATES", "ASSOCIATION",
+}
+
+_GENERATIONAL_SUFFIXES = {"JR", "SR", "II", "III", "IV", "V"}
+
+
+def _grantee_full_name_pair(name: str) -> tuple:
+    """
+    v3.14 — parse a grantees_full entry (a name transcribed verbatim from
+    the deed, natural order, possibly with capacity language) into an ALIS
+    (LAST, FIRST) search pair for the co-owner grantor check.
+
+      "Marta Lynn Kowalczyk"                   → ("KOWALCZYK", "MARTA")
+      "John A. Smith, individually and as
+       Trustee of the Smith Family Trust"      → ("SMITH", "JOHN")
+      "Alan D. Whitfield-Barrow"               → ("WHITFIELD-BARROW", "ALAN")
+      "Robert Fenwick Jr."                     → ("FENWICK", "ROBERT")
+      "The Smith Family Trust"                 → ("", "")   [entity]
+
+    Everything after the first comma is capacity language and is dropped;
+    " as Trustee ..." phrases without a comma are cut too. Last remaining
+    token = surname (hyphenated surnames survive intact), first token =
+    first name — ALIS's begins-with matching extends "MARTA" to
+    "MARTA LYNN"/"MARTA L" index variants. Returns ("", "") when the entry
+    is an entity/trust or doesn't parse to at least two name tokens.
+    """
+    segments = [seg.strip() for seg in (name or "").split(",")]
+    s = segments[0]
+    # An entity designator directly after the first comma ("BRANDT
+    # INVESTMENTS, LLC, a Massachusetts Limited Liability Company") marks
+    # an entity even though the pre-comma portion carries no entity token;
+    # an individual's capacity clause starts with "individually"/"as
+    # Trustee ..." instead (Brandt live run, 2026-07-16).
+    if len(segments) > 1 and segments[1]:
+        if segments[1].split()[0].upper().rstrip(".") in _ENTITY_NAME_TOKENS:
+            return ("", "")
+    s = re.split(r"\s+(?:as|aka|a/k/a|f/k/a)\s+", s, maxsplit=1, flags=re.I)[0]
+    s = s.replace(".", " ").strip()
+    tokens = s.split()
+    if any(t.upper() in _ENTITY_NAME_TOKENS for t in tokens):
+        return ("", "")
+    while tokens and tokens[-1].upper() in _GENERATIONAL_SUFFIXES:
+        tokens.pop()
+    if len(tokens) < 2:
+        return ("", "")
+    return (tokens[-1].upper(), tokens[0].upper())
+
+
+def _alis_abstract_party_pairs(abstract: dict, notes: list = None) -> list:
+    """
+    v3.28 — derive grantor-check name pairs from the selected deed's
+    Document Abstract, which lists EVERY party on both sides
+    ("Gtor:"/"Gtee:", one label per party) in ALIS index format. Returns
+    [(LAST, FIRST, via_label), ...].
+
+    Two gaps this closes, both found on Salgado / 87 Marchmont St Hyannis
+    (2026-08-12):
+
+      1. The v3.14 co-owner check reads `grantees_full`, i.e. the PDF
+         extraction — so when extraction fails (there: an API billing
+         error) the co-owner search silently never runs. The abstract is
+         index data: no API, no PDF, and it is already fetched for the
+         selected row.
+
+      2. A co-owner REMOVED by the vesting deed appears only on the
+         GRANTOR side, so `grantees_full` could never have named them even
+         with extraction working. Salgado: grantee "SALGADO, MARIA TERESA";
+         grantors "DESALGADO, MARIA ISABEL" + "SALGADO, MARIA TERESA". The
+         departing party is indexed under a different surname, so neither
+         the full-name nor the broad surname-only SALGADO search could reach
+         a deed-out by her — and her mortgages on this parcel were
+         invisible too.
+
+    Grantees are always returned: they are the continuing owners, and any
+    one of them can convey or encumber their interest alone.
+
+    Grantors are returned ONLY when the deed is a partial self-conveyance
+    — some party appears on BOTH sides. That is the co-owner-removal /
+    re-vesting pattern, and it is what makes the other grantors continuing
+    parties in interest rather than the arm's-length seller. On an ordinary
+    purchase (Bk 5311/226: TRELAWNEY -> KEEGAN, no overlap) the grantors are
+    strangers whose other conveyances are pure noise, and none is returned.
+    """
+    if not abstract:
+        return []
+
+    def _pairs(strings):
+        out = []
+        for s in strings or []:
+            # Defence in depth against the v3.28 footer bug: the parser now
+            # terminates the last party value at the recording-footer
+            # labels, but any trailer that gets through would become part
+            # of a search name, and a search on a malformed name returns
+            # zero rows — which reads exactly like a co-owner with nothing
+            # recorded against them. Three cuts, cheapest first. Case
+            # INSENSITIVE throughout: the Braintree run (2026-08-12) showed
+            # the same footer arriving upper-cased, where a rule keyed on
+            # the labels' title case would have sailed straight past it.
+            s = s or ""
+            s = re.split(r"(?i)\s+(?:return\s+addr|recording\s+fee"
+                         r"|state\s+excise|surcharge|notes)\s*:",
+                         s, maxsplit=1)[0]
+            if ":" in s:
+                # An unknown TITLE-CASE label ("Some Trailer: …"): ALIS
+                # index names are upper case, so the first token carrying a
+                # lower-case letter starts the trailer. Gated on the colon,
+                # so a genuinely mixed-case name is never truncated.
+                keep = []
+                for tok in s.split():
+                    if any(c.islower() for c in tok):
+                        break
+                    keep.append(tok)
+                s = " ".join(keep) or s
+            if ":" in s:
+                # An unknown UPPER-CASE label: cut at the colon and drop
+                # the label's own last word.
+                s = s[:s.index(":")].rsplit(" ", 1)[0]
+            last, first = _alis_indexed_name_pair(s)
+            # A party name with a digit in it, or one this long, is a
+            # parse artefact rather than a person — spending a paginated
+            # grantor search on it buys nothing and (Braintree) injected
+            # 146 junk hits into the pile the classifier has to sort.
+            if any(c.isdigit() for c in last + first) or len(last) + len(first) > 60:
+                if notes is not None:
+                    notes.append(
+                        "NOTE: ignored an unparseable party name from the "
+                        f"registry abstract: {s[:80]!r} — not searched as a "
+                        "co-owner. If that looks like a real name, the "
+                        "abstract parser needs a new terminating label."
+                    )
+                continue
+            # The abstract punctuates initials where the results grid does
+            # not — "KEEGAN, RICHARD H." vs "KEEGAN, RICHARD H". Searching
+            # the punctuated form finds nothing, so drop the trailing dots
+            # (and only those: an interior "." never appears in an ALIS
+            # index name).
+            last = re.sub(r"\.(?=\s|$)", "", last).strip()
+            first = re.sub(r"\.(?=\s|$)", "", first).strip()
+            if last and (last, first) not in out:
+                out.append((last, first))
+        return out
+
+    gtee = _pairs(abstract.get("grantees"))
+    gtor = _pairs(abstract.get("grantors"))
+
+    def _ident(pair):
+        # Same identity test as _alis_same_party_reconveyance: surname plus
+        # the first given-name token, so "KEEGAN, RICHARD H" == "KEEGAN,
+        # RICHARD H." == "KEEGAN, RICHARD".
+        first_tok = (pair[1].split() or [""])[0]
+        return (pair[0], re.sub(r"[^A-Z0-9]", "", first_tok))
+
+    out = [(last, first, f"{last}, {first} (co-owner from abstract)")
+           for last, first in gtee]
+    gtee_ids = {_ident(p) for p in gtee}
+    if any(_ident(p) in gtee_ids for p in gtor):
+        for last, first in gtor:
+            if _ident((last, first)) in gtee_ids:
+                continue      # a continuing owner, already covered above
+            out.append((last, first,
+                        f"{last}, {first} (prior co-owner from abstract)"))
+    return out
+
+
+def _alis_grantor_check_http(
+    session,
+    base_url: str,
+    name_pairs: list,
+    town: str,
+    acq_row: dict,
+    land_court: bool,
+    notes: list,
+    prefetched: dict = None,
+    retry_town: str = None,
+    check_meta: dict = None,
+) -> list:
+    """
+    v3.9 grantor check. Runs a PAGINATED grantor search for each
+    (last, first) pair in name_pairs, dedupes hits across searches, and
+    excludes the acquisition instrument itself (book+page match on Recorded
+    Land — the old book-only exclusion could hide a genuine later deed
+    recorded in the same book — or document number on Land Court).
+
+    v3.20 — town-scoped retry on the pagination cap (Keegan/402 Sedgefield St,
+    2026-08-10): on a common name the county-wide (`town="*ALL"`, Norfolk's
+    default by design — it catches a seller who moved within the county)
+    search caps at _ALIS_MAX_PAGES and a truncated check cannot support a
+    clean-title statement. When a search caps and `retry_town` (the subject
+    town code) is a real town, the same pair is re-searched scoped to that
+    town with the larger _ALIS_RETRY_MAX_PAGES cap and the results MERGED —
+    the county-wide pass is kept, not replaced. A deed-out of the subject
+    parcel is indexed under the subject town, so a complete scoped pass
+    closes the subject-parcel question even when the county-wide set stays
+    truncated. `check_meta` (the result's grantor_check dict) records
+    capped_searches / incomplete_searches so callers and the report can
+    tell a genuinely clean check from a truncated one.
+
+    v3.28 — DEED-GROUP fallback when town scoping runs out (Salgado / 87
+    Linden St Hyannis, 2026-08-12). Barnstable's grantor search is already
+    town-scoped, so a capped broad surname-only search had no narrower town
+    to retry with and the check reported INCOMPLETE with nothing left to
+    try. Document type is the other axis: a `*DD` (deed-group) pass asks
+    precisely the question a capped deed-out check still needs answered,
+    and took `SALGADO` from capped/150 rows to a complete 36. Results are
+    merged, never substituted. A complete deed-group pass RESOLVES the cap
+    for a broad surname-only search (which keeps conveyances only anyway,
+    so nothing it would have kept is missing) but only PARTLY resolves it
+    for a full-name search, whose non-conveyance rows may still be
+    truncated — that pair stays in incomplete_searches and says why.
+
+    v3.23 — the fetches are parallel, the semantics unchanged: live
+    county-wide searches run concurrently (Phase A), then every capped
+    search's town-scoped retry runs concurrently (Phase B), each worker on
+    its own Session with its own notes list; merging, filtering, and every
+    note/check_meta append happen serially in pair order (Phase C), so the
+    output is deterministic. The Keegan validation spent ~4m39s running
+    three 20-page scoped retries back to back — the retries are independent
+    GETs and there was never a reason to wait between them.
+
+    Callers build name_pairs as:
+      Recorded Land — user-supplied full name, exact indexed grantee
+        name(s) from the selected deed row, AND the broad surname-only
+        search (joint-owner safety net; its namesake noise is tolerable
+        on town-filtered Recorded Land).
+      Land Court — full-name pairs ONLY (Kowalczyk spec): the broad search
+        is what buried the seller's real instruments under pages of
+        alphabetically-earlier namesakes.
+
+    Each returned row gains `via_search` naming the search that found it.
+
+    Broad (surname-only) hits are filtered twice, because the broad search
+    is a joint-owner safety net and NOTHING else:
+
+      (a) Non-conveyance types are dropped (v3.11). The only question a
+          surname-only search can answer is "did someone sharing the
+          seller's surname convey this property out?" — a co-owner or name
+          variant the full-name searches would miss (Fenwick: the estate
+          deed out was indexed under the co-owner's name). A MORTGAGE,
+          LIEN, HOMESTEAD, etc. returned by that search is by construction
+          a same-surname stranger's business: it cannot be a deed out and
+          it cannot change who the grantee is. Reporting them put a false
+          CRITICAL flag on a closing file — Louis Sarno's Citizens
+          Bank MORTGAGE (Bk 43196/88) was surfaced as a possible
+          encumbrance on seller Rosa Sarno (11 Halverson Dr, Braintree,
+          2026-07-12). The seller's OWN encumbrances still come through the
+          full-name searches, which are not type-filtered.
+
+      (b) Hits recorded BEFORE the acquisition date are dropped — the check
+          looks for subsequent dealings, and on a common surname the
+          pre-acquisition rows are overwhelmingly unrelated namesakes
+          (Renwick broad search: 148 hits, mostly 1910–2016 strangers).
+
+    Full-name hits are kept regardless of type or date, and rows whose date
+    fails to parse are kept as a safe default.
+    """
+    acq_id = _alis_instrument_id(acq_row) if acq_row else None
+    acq_date = _parse_deed_date(acq_row.get("date_received") or "") if acq_row else (0, 0, 0)
+
+    def _pair_key(pair):
+        return (pair[0], pair[1])
+
+    def _pair_label(pair):
+        # v3.14 — a pair may carry an explicit via-label as a third element
+        # (used to tag co-owner names sourced from the deed extraction).
+        last, first = pair[0], pair[1]
+        if len(pair) > 2 and pair[2]:
+            return pair[2]
+        return f"{last}, {first}" if first else f"{last} (surname only)"
+
+    # -----------------------------------------------------------
+    # v3.23 — the searches are fetched in PARALLEL, then merged and
+    # filtered serially in pair order (so notes, dedupe order, and the
+    # via-label a duplicated instrument gets stay deterministic). The
+    # Keegan validation ran 4m39s against the 25–65s benchmark because
+    # three county-wide searches capped and each re-ran town-scoped at up
+    # to _ALIS_RETRY_MAX_PAGES=20 pages, one after another. The retries
+    # (and any non-prefetched county-wide searches) are independent HTTP
+    # GETs — v3.16 prefetch pattern: own Session and own notes list per
+    # worker. NOTE: the retry is never skipped based on the truncated
+    # county-wide set's contents — a capped set's absence of subject-town
+    # rows proves nothing.
+    # -----------------------------------------------------------
+    # Phase A — county-wide searches. v3.16 — rows for the row-independent
+    # searches may have been prefetched on a worker thread while extraction
+    # ran; filtering still happens below, against the final acquisition row.
+    # v3.29 — the server-side date window for every search below. Computed
+    # from the FINAL acquisition row, so a v3.14 auto-retarget that moved to
+    # an earlier deed widens the window rather than leaving it where the
+    # pre-retarget row put it.
+    window = _grantor_window_start(acq_date)
+    window_param = _alis_date_param(window)
+    if check_meta is not None:
+        check_meta["search_window"] = {
+            "from": f"{window[1]:02d}/{window[2]:02d}/{window[0]:04d}" if window_param else None,
+            "lookback_days": _GRANTOR_WINDOW_LOOKBACK_DAYS if window_param else None,
+            "basis": "acquisition date less lookback" if window_param
+                     else "no window — acquisition date unknown, all years searched",
+            "lien_sweep": "document-type restricted, ALL YEARS (see *LN pass)",
+        }
+
+    searched = {}
+    for pair in name_pairs:
+        pf_entry = (prefetched or {}).get(_pair_key(pair))
+        if pf_entry is None:
+            continue
+        # v3.29 — the prefetch ran before extraction and therefore before any
+        # auto-retarget, so its window was derived from the THEN-selected
+        # row. If the final acquisition date is earlier, the prefetched set
+        # is missing rows between the two dates — discard it and search live
+        # rather than merge a set that was narrowed against the wrong deed.
+        pf_window = pf_entry.get("window") or (0, 0, 0)
+        if pf_window > window:
+            notes.append(
+                f"Grantor check: discarded the prefetched search for "
+                f"{_pair_label(pair)} — it was date-windowed from "
+                f"{pf_window[1]:02d}/{pf_window[2]:02d}/{pf_window[0]} against the "
+                f"pre-retarget deed, but the final deed needs "
+                f"{window[1]:02d}/{window[2]:02d}/{window[0]}. Re-searching live."
+            )
+            continue
+        searched[_pair_key(pair)] = {
+            "rows": pf_entry["rows"], "truncated": pf_entry["truncated"],
+            "prefetched": True, "notes": [], "error": None,
+        }
+
+    def _county_search(pair):
+        s = requests.Session()
+        local_notes, meta = [], {}
+        try:
+            rows = _alis_search_http(
+                s, base_url, pair[0], pair[1], "R", town=town,
+                land_court=land_court, doc_type="*ALL",
+                date_from=window_param, notes=local_notes,
+                meta=meta,
+            )
+            return _pair_key(pair), {
+                "rows": rows, "truncated": meta.get("truncated", False),
+                "prefetched": False, "notes": local_notes, "error": None,
+            }
+        except Exception as e:
+            return _pair_key(pair), {
+                "rows": [], "truncated": False, "prefetched": False,
+                "notes": local_notes, "error": e,
+            }
+
+    live_pairs = [p for p in name_pairs if _pair_key(p) not in searched]
+    if live_pairs:
+        with ThreadPoolExecutor(max_workers=min(4, len(live_pairs))) as pool:
+            for key, entry in pool.map(_county_search, live_pairs):
+                searched[key] = entry
+
+    # Phase B — town-scoped retries for every capped search (v3.20),
+    # including capped prefetched ones, in parallel.
+    retry_ok = bool(retry_town and retry_town != town and retry_town != "*ALL")
+    retry_pairs = [
+        p for p in name_pairs
+        if retry_ok and searched.get(_pair_key(p), {}).get("truncated")
+        and searched[_pair_key(p)]["error"] is None
+    ]
+
+    def _scoped_search(pair):
+        s = requests.Session()
+        local_notes, meta = [], {}
+        try:
+            rows = _alis_search_http(
+                s, base_url, pair[0], pair[1], "R", town=retry_town,
+                land_court=land_court, doc_type="*ALL",
+                date_from=window_param,
+                max_pages=_ALIS_RETRY_MAX_PAGES, notes=local_notes, meta=meta,
+            )
+            return _pair_key(pair), {"rows": rows, "meta": meta,
+                                     "notes": local_notes, "error": None}
+        except Exception as e:
+            return _pair_key(pair), {"rows": [], "meta": {},
+                                     "notes": local_notes, "error": e}
+
+    scoped_results = {}
+    if retry_pairs:
+        with ThreadPoolExecutor(max_workers=min(4, len(retry_pairs))) as pool:
+            for key, entry in pool.map(_scoped_search, retry_pairs):
+                scoped_results[key] = entry
+
+    # -----------------------------------------------------------
+    # Phase B2 (v3.28) — DEED-GROUP fallback when narrowing by town is
+    # exhausted. Salgado / 87 Marchmont St Hyannis, 2026-08-12: the broad
+    # surname-only SALGADO search capped at 150 rows and Barnstable's grantor
+    # search is already town-scoped (BARN), so retry_ok was False and the
+    # check reported INCOMPLETE with no path forward — the one outcome the
+    # v3.20 machinery exists to prevent. Narrowing by DOCUMENT TYPE is the
+    # remaining axis: `*DD` (deed group) is exactly the question a capped
+    # deed-out check still needs answered, and it took that search from
+    # capped/150 to a complete 36 rows over 2 pages.
+    #
+    # Fires for a pair that capped county-wide AND has no usable town
+    # retry, or whose town retry also capped/failed. Scoped to the
+    # narrowest town available. Results are MERGED, never substituted, so
+    # this can only add rows.
+    # -----------------------------------------------------------
+    def _dd_needed(pair):
+        entry = searched.get(_pair_key(pair)) or {}
+        if not entry.get("truncated") or entry.get("error") is not None:
+            return False
+        if _pair_key(pair) not in scoped_results:
+            return True          # no town-scoped retry was available
+        sr = scoped_results[_pair_key(pair)]
+        return sr["error"] is not None or sr["meta"].get("truncated", False)
+
+    dd_town = retry_town if retry_ok else town
+
+    def _deed_group_search(pair):
+        s = requests.Session()
+        local_notes, meta = [], {}
+        try:
+            rows = _alis_search_http(
+                s, base_url, pair[0], pair[1], "R", town=dd_town,
+                land_court=land_court, doc_type="*DD",
+                date_from=window_param,
+                max_pages=_ALIS_RETRY_MAX_PAGES, notes=local_notes, meta=meta,
+            )
+            return _pair_key(pair), {"rows": rows, "meta": meta,
+                                     "notes": local_notes, "error": None}
+        except Exception as e:
+            return _pair_key(pair), {"rows": [], "meta": {},
+                                     "notes": local_notes, "error": e}
+
+    dd_pairs = [p for p in name_pairs if _dd_needed(p)]
+    dd_results = {}
+    if dd_pairs:
+        with ThreadPoolExecutor(max_workers=min(4, len(dd_pairs))) as pool:
+            for key, entry in pool.map(_deed_group_search, dd_pairs):
+                dd_results[key] = entry
+
+    # -----------------------------------------------------------
+    # Phase B3 (v3.29) — LIEN SWEEP, restricted by document type and
+    # UNRESTRICTED IN TIME.
+    #
+    # The date window above is correct for the deed-out question but wrong
+    # for one class of instrument: liens against the PERSON that can reach
+    # after-acquired property (tax liens, executions, attachments,
+    # bankruptcy). Those record before acquisition and can still cloud
+    # title, so narrowing by date alone would hide them by construction —
+    # the same "a filter that cannot see X reports no X" shape as the v3.20
+    # null addresses. Restricting by TYPE instead of DATE asks exactly that
+    # question over the full history, and the "*LN" group is rare enough
+    # that the sweep costs a fraction of the history it replaces.
+    #
+    # FULL-NAME PAIRS ONLY. The broad surname-only search keeps conveyance
+    # types only (v3.11), so lien rows from it would be discarded anyway,
+    # and its namesake noise over all years is exactly what the window was
+    # added to avoid.
+    # -----------------------------------------------------------
+    def _lien_search(pair):
+        s = requests.Session()
+        local_notes, meta = [], {}
+        try:
+            rows = _alis_search_http(
+                s, base_url, pair[0], pair[1], "R", town=town,
+                land_court=land_court, doc_type="*LN",
+                date_from="",           # deliberate: all years
+                max_pages=_ALIS_RETRY_MAX_PAGES, notes=local_notes, meta=meta,
+            )
+            return _pair_key(pair), {"rows": rows, "meta": meta,
+                                     "notes": local_notes, "error": None}
+        except Exception as e:
+            return _pair_key(pair), {"rows": [], "meta": {},
+                                     "notes": local_notes, "error": e}
+
+    # Only worth sweeping when a window was actually applied — with no
+    # window the main pass already covers all years and all types.
+    lien_pairs = [p for p in name_pairs if window_param and p[1]]
+    lien_results = {}
+    if lien_pairs:
+        with ThreadPoolExecutor(max_workers=min(4, len(lien_pairs))) as pool:
+            for key, entry in pool.map(_lien_search, lien_pairs):
+                lien_results[key] = entry
+
+    # Phase C — serial merge + filter, in pair order.
+    found, seen = [], set()
+    for pair in name_pairs:
+        last, first = pair[0], pair[1]   # first == "" marks the broad search
+        label = _pair_label(pair)
+        entry = searched.get(_pair_key(pair))
+        if entry is None:
+            continue
+        notes.extend(entry["notes"])
+        if entry["error"] is not None:
+            # v3.29 — a search that ERRORED is an open question, not a clean
+            # one. Before this, a failed search appended a note and dropped
+            # through, so a run in which every search failed reported "no
+            # subsequent instruments found — clean title" at exit 0. (Caught
+            # by the v3.29 test suite itself: a stub signature mismatch made
+            # all four Keegan searches raise and the check still said clean.)
+            # Same family as the v3.23 swallowed NameError and the v3.20 null
+            # addresses — missing information read as a negative answer.
+            if check_meta is not None:
+                check_meta.setdefault("incomplete_searches", []).append(
+                    f"{label} (search failed)")
+                # v3.30 (item 11) — the searches log records the attempt too,
+                # so "did not run" is never absent from the record.
+                check_meta.setdefault("searches", []).append({
+                    "name": label, "rows_returned": None, "rows_new": 0,
+                    "status": f"ERROR — {entry['error']}",
+                })
+            notes.append(
+                f"WARNING: grantor search '{label}' FAILED (non-fatal): "
+                f"{entry['error']} — this name was NOT searched, so the "
+                "grantor check is INCOMPLETE for it. Do not read the absence "
+                "of hits here as clean title."
+            )
+            continue
+        rows, truncated = entry["rows"], entry["truncated"]
+        was_prefetched = entry["prefetched"]
+
+        # v3.20 — town-scoped retry when the county-wide search caps.
+        # v3.28 — then the deed-group (*DD) retry when town scoping is
+        # exhausted or itself caps.
+        if truncated:
+            if check_meta is not None:
+                check_meta.setdefault("capped_searches", []).append(label)
+            resolved = False          # is the cap closed out for this pair?
+            why_open = ("no narrower town scope was available to retry with"
+                        if not retry_ok else None)
+            if retry_ok:
+                sr = scoped_results.get(_pair_key(pair)) or {
+                    "rows": [], "meta": {}, "notes": [],
+                    "error": RuntimeError("scoped retry result missing"),
+                }
+                notes.extend(sr["notes"])
+                scoped_meta, scoped_ok, scoped = sr["meta"], sr["error"] is None, sr["rows"]
+                if not scoped_ok:
+                    notes.append(
+                        f"Town-scoped grantor retry '{label}' failed "
+                        f"(non-fatal): {sr['error']}"
+                    )
+                known = {_alis_row_identity(r) for r in rows}
+                rows = rows + [r for r in scoped
+                               if _alis_row_identity(r) not in known]
+                if scoped_ok and not scoped_meta.get("truncated"):
+                    resolved = True
+                    notes.append(
+                        f"Grantor search '{label}' hit the county-wide "
+                        f"pagination cap — re-ran scoped to town {retry_town}: "
+                        f"{len(scoped)} row(s), COMPLETE. A deed-out of the "
+                        "subject parcel is indexed under the subject town, so "
+                        "the subject-parcel check is complete; only the "
+                        "seller's out-of-town dealings may be truncated."
+                    )
+                else:
+                    why_open = ("the town-scoped retry "
+                                + ("also hit the cap" if scoped_ok else "failed"))
+
+            # v3.28 — deed-group fallback.
+            if not resolved:
+                dd = dd_results.get(_pair_key(pair))
+                if dd is not None:
+                    notes.extend(dd["notes"])
+                    if check_meta is not None:
+                        check_meta.setdefault("deed_group_retries", []).append(label)
+                    known = {_alis_row_identity(r) for r in rows}
+                    rows = rows + [r for r in dd["rows"]
+                                   if _alis_row_identity(r) not in known]
+                    dd_ok = dd["error"] is None
+                    if not dd_ok:
+                        notes.append(
+                            f"Deed-group grantor retry '{label}' failed "
+                            f"(non-fatal): {dd['error']}"
+                        )
+                    elif not dd["meta"].get("truncated"):
+                        if not first:
+                            # The broad surname-only search is filtered to
+                            # conveyance types anyway (filter (a) below), so a
+                            # complete deed-group pass IS a complete broad
+                            # pass — nothing it would have kept is missing.
+                            resolved = True
+                            notes.append(
+                                f"Grantor search '{label}' hit the pagination "
+                                f"cap and {why_open} — re-ran restricted to "
+                                f"the deed group (*DD) in town {dd_town}: "
+                                f"{len(dd['rows'])} row(s), COMPLETE. The "
+                                "broad surname-only search keeps conveyance "
+                                "types only, so this answers exactly what it "
+                                "exists to ask: whether any same-surname "
+                                "party deeded the parcel out."
+                            )
+                        else:
+                            notes.append(
+                                f"Grantor search '{label}' hit the pagination "
+                                f"cap and {why_open} — re-ran restricted to "
+                                f"the deed group (*DD) in town {dd_town}: "
+                                f"{len(dd['rows'])} row(s), COMPLETE. The "
+                                "DEED-OUT question is closed for this name. "
+                                "Still truncated: this party's NON-conveyance "
+                                "instruments (mortgages, homesteads, liens), "
+                                "which a full-name search normally keeps."
+                            )
+                            why_open = ("only the deed group could be "
+                                        "completed, so non-conveyance "
+                                        "instruments may be missing")
+                    else:
+                        why_open = ("the town-scoped and deed-group retries "
+                                    "both hit the cap")
+
+            if not resolved:
+                if check_meta is not None:
+                    check_meta.setdefault("incomplete_searches", []).append(label)
+                notes.append(
+                    f"WARNING: grantor search '{label}' hit the pagination "
+                    f"cap and {why_open} — the grantor check is INCOMPLETE "
+                    "for this name; finish it manually before relying on a "
+                    "clean-title statement."
+                )
+        # v3.29 — merge this pair's all-years lien sweep. Merged, never
+        # substituted: it can only add rows the date window excluded.
+        lien_ids = set()
+        ls = lien_results.get(_pair_key(pair))
+        if ls is not None:
+            notes.extend(ls["notes"])
+            if ls["error"] is not None:
+                notes.append(
+                    f"WARNING: the all-years lien sweep for '{label}' failed "
+                    f"(non-fatal): {ls['error']}. Pre-acquisition liens against "
+                    "this party were NOT searched — treat that question as open, "
+                    "not as clean."
+                )
+            else:
+                known = {_alis_row_identity(r) for r in rows}
+                new_lien = [r for r in ls["rows"]
+                            if _alis_row_identity(r) not in known]
+                lien_ids = {_alis_row_identity(r) for r in new_lien}
+                rows = rows + new_lien
+                if ls["meta"].get("truncated"):
+                    # Tracked SEPARATELY from incomplete_searches on purpose.
+                    # The sweep asks a narrower question than the deed-out
+                    # check exists to answer, and a truncated sweep says
+                    # nothing about whether the seller conveyed the parcel
+                    # away — so it must not flip an otherwise complete check
+                    # to INCOMPLETE and turn a clean report CRITICAL. It is
+                    # still surfaced: pre-acquisition liens are simply an
+                    # open question, which is where this workflow's scope
+                    # already leaves them.
+                    if check_meta is not None:
+                        check_meta.setdefault("lien_sweep_truncated", []).append(label)
+                    notes.append(
+                        f"NOTE: the all-years lien sweep for '{label}' hit the "
+                        "pagination cap — pre-acquisition liens against this "
+                        "party may be truncated. The deed-out check is "
+                        "unaffected. Lien/discharge status is out of scope "
+                        "here either way; route it to /title-rundown."
+                    )
+
+        hits = pre_acq = non_conv = lien_hits = 0
+        for r in rows:
+            if r.get("land_court") != land_court:
+                continue
+            inst = _alis_instrument_id(r)
+            if acq_id and inst == acq_id:
+                continue
+            if not first:
+                # A blank/unparsed type is KEPT: _is_non_conveyance_instrument
+                # treats blank as non-deed, but dropping an unknown row is the
+                # dangerous direction for a deed-out check — surface it and let
+                # Claude assess.
+                dt = (r.get("doc_type") or "").strip()
+                if dt and _is_non_conveyance_instrument(dt):
+                    non_conv += 1
+                    continue
+                if acq_date > (0, 0, 0):
+                    row_date = _parse_deed_date(r.get("date_received") or "")
+                    if (0, 0, 0) < row_date < acq_date:
+                        pre_acq += 1
+                        continue
+            # Instrument-level dedupe: the same deed indexed under two name
+            # variants ("RENWICK, GEORGE" + "RENWICK, GEORGE R") is one hit.
+            if inst in seen:
+                continue
+            seen.add(inst)
+            # NB: lien_ids is keyed by _alis_row_identity (the merge key used
+            # above), NOT by _alis_instrument_id (the dedupe key) — mixing
+            # the two silently dropped every sweep label.
+            is_lien_sweep = _alis_row_identity(r) in lien_ids
+            r["via_search"] = label + (" (lien sweep, all years)"
+                                       if is_lien_sweep else "")
+            found.append(r)
+            hits += 1
+            if is_lien_sweep:
+                lien_hits += 1
+        notes.append(
+            f"Grantor search '{label}': {len(rows)} row(s), {hits} new hit(s)"
+            + (f", {non_conv} non-conveyance row(s) skipped" if non_conv else "")
+            + (f", {pre_acq} pre-acquisition row(s) skipped" if pre_acq else "")
+            + (f", of which {lien_hits} from the all-years lien sweep"
+               if lien_hits else "")
+            + (" (prefetched during extraction)" if was_prefetched else "")
+            + (f" [window: {window[1]:02d}/{window[2]:02d}/{window[0]} onward]"
+               if window_param else " [window: all years]")
+            + "."
+        )
+        # v3.30 (item 11) — the same per-search accounting Plymouth grew, in
+        # structured form. The note above already said this, but notes are
+        # the first thing lost when output is truncated, and a co-owner pass
+        # whose rows all duplicate the named seller's is otherwise
+        # indistinguishable from one that never ran.
+        if check_meta is not None:
+            check_meta.setdefault("searches", []).append({
+                "name": label,
+                "rows_returned": len(rows),
+                "rows_new": hits,
+                "rows_skipped_non_conveyance": non_conv,
+                "rows_skipped_pre_acquisition": pre_acq,
+                "lien_sweep_hits": lien_hits,
+                "status": "ok",
+            })
+    return found
+
+
+def _alis_apply_row_fields(result: dict, row: dict) -> None:
+    """
+    Populate the index-derived result fields from a selected result row.
+    v3.14 — extracted from run_alis_http STEP 2 so the auto-retarget can
+    re-apply them when it swaps the selected instrument.
+    """
+    result["book"]          = row["book"] or None
+    result["page"]          = row["page"] or None
+    result["ctl_num"]       = row["ctl_num"]
+    result["certificate_of_title"] = row["certificate"] or None
+    result["document_number"] = row["document_number"] or None
+    result["deed_type"]     = row["doc_type"]
+    result["recorded_date"] = row["date_received"]
+    # Land Court index has no opposite-party column — grantors stays
+    # empty and Claude reads them from the deed PDF.
+    result["grantors"]      = [row["reverse_party"]] if row["reverse_party"] else []
+    result["grantees"]      = [row["name"]] if row["name"] else []
+    result["deed_property_address"] = row["doc_desc"] or ""
+
+
+def _alis_fetch_deed_files(
+    session,
+    base_url: str,
+    row: dict,
+    base_name: str,
+    output_folder: Path,
+    notes: list,
+    errors: list,
+    label: str = "deed",
+) -> dict:
+    """
+    STEP 3+4 of run_alis_http — fetch the row's Document Image List and
+    download every page PDF. v3.14 — extracted into a helper so the
+    auto-retarget can run it a second time for the corrected instrument.
+    Returns {"ok", "files", "img_info"}; appends its own notes/errors.
+    """
+    img_info = _alis_get_pdf_hrefs_http(session, base_url, row["img_href"])
+    pdf_hrefs = img_info["pdf_hrefs"]
+    if not pdf_hrefs:
+        errors.append(
+            f"Document Image List: no .PDF links found at {img_info['image_list_url']}"
+        )
+        return {"ok": False, "files": [], "img_info": img_info}
+
+    if img_info["is_fallback"]:
+        notes.append(
+            "Document Image List: numbered-page pattern matched 0 links; "
+            f"using permissive fallback — selected {len(pdf_hrefs)} .PDF "
+            "link(s): " + ", ".join(pdf_hrefs)
+        )
+    else:
+        notes.append(
+            f"Document Image List: {len(pdf_hrefs)} page(s) — " + ", ".join(pdf_hrefs)
+        )
+
+    saved, dl_errors = _alis_download_pdfs_http(
+        session, base_url, pdf_hrefs, base_name, output_folder, label=label
+    )
+    errors.extend(dl_errors)
+    if not saved:
+        errors.append(f"PDF download failed for all pages (label={label!r}).")
+        return {"ok": False, "files": [], "img_info": img_info}
+    notes.append(
+        f"Downloaded {len(saved)} PDF(s): {[Path(f).name for f in saved]}"
+    )
+    return {"ok": True, "files": saved, "img_info": img_info}
+
+
+class _Timings:
+    """
+    v3.31 — per-stage wall-clock measurement for one run.
+
+    Measuring only. No scheduling, no transmission, nothing persisted
+    outside the run's own output folder: stage names are fixed strings and
+    the numbers are durations, but the FILE they land in also holds client
+    addresses, so this data never leaves the machine.
+
+    Why it exists: the one time run-shape mattered — establishing that the
+    grantor check was 85% of a 6.4-minute run and that the fix was
+    concurrent pagination rather than smaller caps — the numbers had to be
+    reconstructed by hand from note ordering. Measuring is nearly free, so
+    it is always on; `--timings` only controls whether the report shows a
+    footer.
+
+    Usage is one line per boundary:
+
+        tm = _Timings()
+        tm.mark("STEP 1 - grantee search")   # opens stage 1
+        ...
+        tm.mark("STEP 2 - select deed row")  # closes 1, opens 2
+        ...
+        tm.finish(result)                    # closes the last, writes JSON
+
+    `finish` is idempotent so an early `return` path can call it without
+    the caller tracking whether it already ran. Every method swallows its
+    own errors: a timing bug must never be able to fail a registry run.
+    """
+
+    def __init__(self) -> None:
+        self._t0 = time.perf_counter()
+        self._open = None            # (label, start)
+        self._stages: list[dict] = []
+        self._done = False
+
+    def mark(self, label: str) -> None:
+        try:
+            now = time.perf_counter()
+            if self._open is not None:
+                prev, start = self._open
+                self._stages.append({"stage": prev,
+                                     "seconds": round(now - start, 2)})
+            self._open = (label, now)
+        except Exception:
+            pass
+
+    def finish(self, result: dict) -> None:
+        try:
+            if self._done:
+                return
+            self._done = True
+            self.mark(None)          # closes the last open stage
+            self._open = None
+            total = round(time.perf_counter() - self._t0, 2)
+            stages = [s for s in self._stages if s["stage"]]
+            result["timings"] = {
+                "total_seconds": total,
+                "stages": stages,
+                # The slowest stage is the only one worth acting on, and
+                # naming it saves reading the list on every run.
+                "slowest": (max(stages, key=lambda s: s["seconds"])
+                            if stages else None),
+            }
+        except Exception:
+            pass
+
+    def summary_line(self, result: dict) -> str:
+        """One-line human summary, or "" when there is nothing to say."""
+        try:
+            t = result.get("timings") or {}
+            if not t.get("stages"):
+                return ""
+            parts = ", ".join(f"{s['stage']} {s['seconds']}s"
+                              for s in t["stages"])
+            return f"Run took {t['total_seconds']}s — {parts}."
+        except Exception:
+            return ""
+
+
+def _write_result_json(result: dict, base_name: str, output_folder: Path) -> None:
+    """
+    v3.30 — persist the complete result JSON beside the PDFs as
+    '<base-name> - result.json'. Sets result["result_file"].
+
+    WHY THIS EXISTS: stdout was the script's only output channel, so a run
+    whose stdout was not redirected — or whose tail overflowed the caller's
+    output limit — lost book, page and grantor_check.needs_review, and the
+    only recovery was re-running the entire search. Measured at 36% of one
+    bad run's wall clock (Ellsworth, log 2026-08-12-011) and it happened
+    again on Grant (2026-08-13-001). With the file on disk, recovery is a
+    Read.
+
+    OVERWRITE POLICY is deliberately NOT the never-overwrite rule used for
+    the report draft and the paste-out .txt. Those are hand-editable
+    deliverables; this is the machine record of the latest run, and a
+    re-run must refresh it (the re-run IS the recovery path this fixes).
+    One exception protects real information: if the file on disk records a
+    SUCCESSFUL run and this run did not succeed, the new result goes to a
+    timestamped sibling instead of clobbering it.
+
+    Never fatal — any failure here becomes a note and nothing more. The
+    path is assigned BEFORE serialising so the file names itself.
+    """
+    result["result_file"] = None
+    try:
+        path = Path(output_folder) / f"{base_name} - result.json"
+        if path.exists() and result.get("status") != "success":
+            try:
+                prior = json.loads(path.read_text(encoding="utf-8"))
+                prior_ok = isinstance(prior, dict) and prior.get("status") == "success"
+            except Exception:
+                prior_ok = False    # unreadable/partial — safe to replace
+            if prior_ok:
+                stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                path = path.with_name(f"{base_name} - result.{stamp}.json")
+                result.setdefault("notes", []).append(
+                    f"Result JSON written to '{path.name}' — the existing "
+                    f"'{base_name} - result.json' records a SUCCESSFUL run and "
+                    f"was not overwritten by this '{result.get('status')}' one."
+                )
+        result["result_file"] = str(path)
+        path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    except Exception as e:
+        result["result_file"] = None
+        try:
+            result.setdefault("notes", []).append(
+                f"Result JSON NOT written ({type(e).__name__}: {e}) — stdout "
+                "is the only copy of this run's output; redirect it to a file."
+            )
+        except Exception:
+            pass
+
+
+def _write_markdown_report(result: dict, base_name: str, seller_display: str,
+                           output_folder: Path,
+                           show_timings: bool = True) -> None:
+    """
+    v3.16 — render the Step 6 markdown report DRAFT from the result JSON,
+    using the skill's documented structure (LEGAL DESCRIPTION / Deed
+    Metadata / Title Flags / Screenshots Saved). Runs only on a successful
+    run with a populated legal_description; NEVER overwrites an existing
+    report file (manual edits must survive a re-run). Sets
+    result["report_file"] on success. Callers wrap non-fatally.
+    """
+    if result.get("status") != "success" or not result.get("legal_description"):
+        return
+    report_path = output_folder / f"Legal Description - {base_name}.md"
+    if report_path.exists():
+        result["notes"].append(
+            f"Report draft NOT written — '{report_path.name}' already exists "
+            "(existing reports are never overwritten)."
+        )
+        return
+
+    lc = bool(result.get("land_court"))
+    prop = result.get("deed_property_address_pdf") or base_name.split(" - ")[0]
+    L = [
+        "# Legal Description Report",
+        f"Property: {prop}",
+        f"Seller: {seller_display}",
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        "",
+        "> DRAFT — auto-generated by legal_desc_fetch.py (v3.16). Review the",
+        "> Title Flags / Notes section (judgment calls are tagged) before",
+        "> delivering. Remove this banner when finalized.",
+        "",
+        "---",
+        "",
+        "## LEGAL DESCRIPTION",
+        "",
+        result["legal_description"],
+        "",
+        "---",
+        "",
+        "## Deed Metadata",
+        "",
+        f"- Registry: {result.get('registry')}",
+        f"- Section: {'Registered Land (Land Court)' if lc else 'Recorded Land'}",
+    ]
+    if not lc:
+        L.append(f"- Book: {result.get('book')}")
+        L.append(f"- Page: {result.get('page')}")
+    if result.get("document_number"):
+        L.append(f"- Document #: {result['document_number']}")
+    if lc:
+        L.append(f"- Certificate of Title: {result.get('certificate_of_title')}")
+    L.append(f"- Recorded Date: {result.get('recorded_date')}")
+    if result.get("signing_date"):
+        L.append(f"- Signing Date: {result['signing_date']}")
+    if result.get("consideration"):
+        L.append(f"- Consideration: {result['consideration']}")
+    L.append(f"- Deed Type: {result.get('deed_type')}")
+    grantors = result.get("grantors_full") or result.get("grantors") or []
+    if grantors:
+        L.append("- Grantors (sellers as shown on deed):")
+        L.extend(f"  - {g}" for g in grantors)
+    grantees = result.get("grantees_full") or result.get("grantees") or []
+    if grantees:
+        L.append("- Grantees (current owners as shown on deed):")
+        L.extend(f"  - {g}" for g in grantees)
+        if result.get("tenancy"):
+            L.append(f"  - (held {result['tenancy']})")
+    if result.get("prior_deed_reference"):
+        L.append(f"- Prior Deed Reference: {result['prior_deed_reference']}")
+    L.append(f"- Deed Property Address: {result.get('deed_property_address_pdf')}")
+    if result.get("recording_stamp"):
+        L.append(f"- Recording Stamp (verification): {result['recording_stamp']}")
+    L += ["", "---", "", "## Title Flags / Notes", ""]
+
+    flags = []
+    if len(grantees) > 1:
+        flags.append(
+            "**FLAG — MULTIPLE OWNERS ON DEED (review):** Title vests in "
+            + "; ".join(grantees)
+            + (f" ({result['tenancy']})" if result.get("tenancy") else "")
+            + ". All current owners must sign the deed and closing documents."
+        )
+    for t in result.get("title_flags") or []:
+        flags.append(f"**NOTE — from deed (extraction):** {t}")
+    gc = result.get("grantor_check") or {}
+    deeds = gc.get("deeds") or []
+    summary = gc.get("summary")
+    if deeds and summary:
+        # v3.23 — classification ran: lead with the short review set, then
+        # the full tagged list (nothing is dropped).
+        flags.append(
+            f"**GRANTOR CHECK — {summary['total']} instrument(s) found; "
+            f"{summary['needs_review']} need review (subject parcel: "
+            f"{summary['subject']}, possible subject: "
+            f"{summary['possible_subject']}, parcel unknown in subject town: "
+            f"{summary['unknown_same_town']}):**"
+        )
+        flags.extend(f"- {d}" for d in gc.get("needs_review") or [])
+        flags.append(
+            f"**Full grantor-check list ({summary['total']} instrument(s), "
+            "ordered most-relevant first — a 'parcel unknown' tag means no "
+            "address was available and the row was NOT ruled out):**"
+        )
+        flags.extend(f"- {d}" for d in deeds)
+    elif deeds:
+        flags.append(
+            f"**GRANTOR CHECK — {len(deeds)} instrument(s) found (review "
+            "each; see workflow notes below for sampled address checks):**"
+        )
+        flags.extend(f"- {d}" for d in deeds)
+    elif gc.get("incomplete_searches"):
+        # v3.20 — a truncated zero-hit check must not render as "Clean".
+        flags.append(
+            "**CRITICAL — Grantor check INCOMPLETE.** No subsequent "
+            "instruments in the rows searched, but one or more searches "
+            "were TRUNCATED at the pagination cap — complete them before "
+            "any clean-title statement."
+        )
+    else:
+        flags.append(
+            "**NOTE — Grantor check: Clean.** No subsequent instruments "
+            "found for the seller (or deed co-owners) as grantor."
+        )
+    # v3.30 (item 11) — name the searches behind the verdict above. "Clean"
+    # is not auditable without them: on a co-owned parcel every hit is
+    # labelled with the FIRST search that found it, so the co-owner pass
+    # leaves no trace in the hit list even when it ran. The Grant / 23
+    # Harrowgate Dr report could not say the co-owner had not conveyed
+    # until that pass was re-run by hand.
+    _searches = gc.get("searches") or []
+    if _searches:
+        _ok = [s for s in _searches if not str(s.get("status", "")).startswith("ERROR")]
+        flags.append(
+            f"**Names searched as grantor ({len(_ok)} of {len(_searches)} "
+            "completed) — the basis for the verdict above:**"
+        )
+        for s in _searches:
+            if str(s.get("status", "")).startswith("ERROR"):
+                outcome = f"**DID NOT RUN** — {s['status']}; this name is an OPEN question"
+            elif not s.get("rows_returned"):
+                outcome = "0 rows — searched, nothing indexed under this name"
+            elif not s.get("rows_new"):
+                outcome = (f"{s['rows_returned']} rows, 0 new — searched; every "
+                           "row was already found under an earlier name "
+                           "(duplicate, *not* skipped)")
+            else:
+                outcome = f"{s['rows_returned']} rows, {s['rows_new']} new"
+            flags.append(f"- `{s['name']}` — {outcome}")
+    for n in result.get("notes") or []:
+        if (n.startswith(("CRITICAL", "AUTO-RETARGETED", "ADDRESS MISMATCH",
+                          "ADDRESS MATCH", "Address verified", "Grantor hit",
+                          "POSSIBLE SUBJECT", "WARNING", "Candidate"))
+                or "not sampled" in n or "sampling capped" in n):
+            tag = "CRITICAL" if n.startswith("CRITICAL") else "NOTE"
+            flags.append(f"**{tag} — workflow:** {n}")
+    for idx, f in enumerate(flags):
+        L.append(f)
+        nxt = flags[idx + 1] if idx + 1 < len(flags) else None
+        if not (f.startswith("-") and nxt and nxt.startswith("-")):
+            L.append("")
+
+    # v3.26 — Recorded Cross-References. The registry's own index of what
+    # else touches this instrument; collected for years by four different
+    # code paths and never shown. Rendered as its own section rather than a
+    # title flag because it is a LEAD LIST, not a finding.
+    xrefs = result.get("cross_references") or []
+    if xrefs:
+        L += ["---", "", "## Recorded Cross-References", "",
+              "The registry's own index cross-references for this deed — "
+              "instruments that reference it or that it references. "
+              "**These are leads, not findings: this workflow does not "
+              "verify discharges or examine these instruments.** Hand them "
+              "to `/title-rundown` or the discharge search.", ""]
+        _dir_label = {"later": "recorded after (references this deed)",
+                      "earlier": "prior (this deed references it)",
+                      "related": "related"}
+        L += ["| Instrument | Cite | Date | Relationship | Type |",
+              "|---|---|---|---|---|"]
+        for r in xrefs:
+            cite = (f"Bk {r['book']}/{r['page']}" if r["book"]
+                    else f"Doc #{r['doc_number']}" if r["doc_number"] else "—")
+            if r["certificate"]:
+                cite += f" (Ctf {r['certificate']})"
+            L.append(
+                f"| {r['instrument'] or r['raw']} | {cite} | {r['date'] or '—'} "
+                f"| {_dir_label.get(r['direction'], r['direction'])} "
+                f"| {r['kind']} |"
+            )
+        L.append("")
+        _disc = [r for r in xrefs if r["kind"] == "discharge"]
+        if _disc:
+            L += [f"**{len(_disc)} discharge-type cross-reference(s) above.** "
+                  "A discharge in the index is not proof a mortgage was "
+                  "discharged — the instrument itself has not been read here. "
+                  "Verify before any payoff or clean-title statement.", ""]
+
+    # v3.31 — timing footer. Local measurement only; never transmitted.
+    # Its one job is to make an abnormal run shape obvious at a glance —
+    # the grantor check quietly taking 85%% of a 6.4-minute run was
+    # reconstructed by hand from note ordering before this existed.
+    _t = result.get("timings") or {}
+    if show_timings and _t.get("stages"):
+        L += ["---", "", "## Run Timings", "",
+              f"Total: **{_t['total_seconds']}s**"
+              + (f" — slowest stage: {_t['slowest']['stage']} "
+                 f"({_t['slowest']['seconds']}s)" if _t.get("slowest") else ""),
+              "",
+              "| Stage | Seconds |", "|---|---|"]
+        L += [f"| {s['stage']} | {s['seconds']} |" for s in _t["stages"]]
+        L.append("")
+    L += ["---", "", "## Screenshots Saved", ""]
+    for i, f in enumerate(result.get("files") or [], 1):
+        L.append(f"- [{Path(f).name}] — Page {i}")
+    extras = []
+    for c in result.get("multiple_deed_candidates") or []:
+        # v3.20 — deep-sampled candidates carry several pages in sample_files.
+        extras += c.get("sample_files") or [c.get("sample_file")]
+    extras += [s.get("sample_file") for s in (result.get("grantor_check") or {}).get("samples") or []]
+    ver = result.get("grantor_hit_verification") or {}
+    extras += ver.get("files") or []
+    extras = [e for e in extras if e]
+    if extras:
+        L.append("")
+        L.append("Additional instrument samples (candidates / grantor hits):")
+        L.extend(f"- [{Path(e).name}]" for e in extras)
+
+    report_path.write_text("\n".join(L) + "\n", encoding="utf-8")
+    result["report_file"] = str(report_path)
+    result["notes"].append(
+        f"Markdown report DRAFT written: '{report_path.name}' — review the "
+        "Title Flags section (and remove the DRAFT banner) before delivering."
+    )
+
+
+# ---------------------------------------------------------------------------
+# v3.19 — Step 7 delivery: paste-out forms, .txt/.docx writers, clipboard
+# ---------------------------------------------------------------------------
+
+# Character normalization for the paste-ready form: curly quotes and prime
+# marks → ASCII quotes (primes appear as feet/inches marks in bearings),
+# en/em/horizontal-bar dashes and the minus sign → hyphen, exotic spaces →
+# plain space. Nothing outside this table is touched — the degree sign in a
+# bearing, ligatures, and accented names all pass through verbatim.
+_PASTE_CHAR_MAP = str.maketrans({
+    "‘": "'", "’": "'", "‚": "'", "′": "'",
+    "“": '"', "”": '"', "„": '"', "″": '"',
+    "–": "-", "—": "-", "―": "-", "−": "-",
+    " ": " ", " ": " ", " ": " ", " ": " ",
+})
+
+
+def _reflow_legal_description(text: str) -> str:
+    """
+    Conservative, whitespace-only reflow of the verbatim legal description
+    into paste-ready text. Per the skill spec this may ONLY: join
+    hard-wrapped lines, rejoin words split by a line-break hyphen, collapse
+    space runs, and normalize quote/dash characters. It must NEVER correct
+    spelling, expand abbreviations, fix apparent OCR errors, or
+    re-punctuate — a silently "improved" metes-and-bounds call is invisible
+    in review and wrong in a recorded instrument.
+
+    Blank-line paragraph breaks are preserved (multi-parcel descriptions —
+    Parcel I / Parcel II — must not collapse into one paragraph).
+    """
+    text = text.translate(_PASTE_CHAR_MAP)
+    paragraphs = re.split(r"\n[ \t]*\n", text)
+    out = []
+    for p in paragraphs:
+        # prop-\nerty → property. A hyphen kept at a line break for a
+        # genuinely hyphenated word is indistinguishable from a soft split;
+        # the spec resolves the ambiguity in favor of joining.
+        p = re.sub(r"(\w)-[ \t]*\n[ \t]*(\w)", r"\1\2", p)
+        p = re.sub(r"\s+", " ", p).strip()
+        if p:
+            out.append(p)
+    return "\n\n".join(out)
+
+
+def _derivation_clause(result: dict) -> str:
+    """
+    "For title, see ..." reference built from the deed metadata. Missing
+    values become ___ blanks for the attorney to fill in — never guessed.
+    """
+    reg = result.get("registry") or "___"
+    if result.get("land_court"):
+        doc = result.get("document_number") or "___"
+        ctf = result.get("certificate_of_title") or "___"
+        return (f"For title, see deed filed with the {reg} Registry District "
+                f"of the Land Court as Document No. {doc}, as noted on "
+                f"Certificate of Title No. {ctf}.")
+    book = result.get("book") or "___"
+    page = result.get("page") or "___"
+    return (f"For title, see deed recorded with the {reg} Registry of Deeds "
+            f"in Book {book}, Page {page}.")
+
+
+def _copy_text_to_clipboard(text: str) -> bool:
+    """
+    Put `text` on the system clipboard with OS-native tools only (no pip
+    dependency). Returns True on success, False on any failure — callers
+    treat False as a note, never an error.
+    """
+    import subprocess
+    import tempfile
+
+    def _run(cmd, **kw):
+        return subprocess.run(cmd, timeout=15, capture_output=True, **kw)
+
+    try:
+        if sys.platform == "win32":
+            # clip.exe mangles non-ANSI text; Set-Clipboard reading a UTF-8
+            # temp file is deterministic regardless of console codepage.
+            tmp = tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", suffix=".txt", delete=False)
+            try:
+                tmp.write(text)
+                tmp.close()
+                r = _run([
+                    "powershell", "-NoProfile", "-NonInteractive", "-Command",
+                    "Set-Clipboard -Value (Get-Content -LiteralPath "
+                    f"'{tmp.name}' -Raw -Encoding UTF8)",
+                ])
+                return r.returncode == 0
+            finally:
+                try:
+                    os.unlink(tmp.name)
+                except OSError:
+                    pass
+        data = text.encode("utf-8")
+        if sys.platform == "darwin":
+            return _run(["pbcopy"], input=data).returncode == 0
+        for cmd in (["xclip", "-selection", "clipboard"],
+                    ["xsel", "--clipboard", "--input"],
+                    ["wl-copy"]):
+            try:
+                if _run(cmd, input=data).returncode == 0:
+                    return True
+            except FileNotFoundError:
+                continue
+        return False
+    except Exception:
+        return False
+
+
+def _deliver_legal_description(result: dict, base_name: str,
+                               output_folder: Path,
+                               copy_to_clipboard: bool = False,
+                               write_docx: bool = False) -> None:
+    """
+    v3.19 — Step 7 delivery, run centrally for every registry. On a
+    successful run with a populated legal_description this writes the
+    three-form .txt (verbatim / paste-ready / paste-ready + derivation
+    clause), optionally a .docx, and optionally puts the paste-ready form
+    on the clipboard. Existing .txt/.docx files are NEVER overwritten
+    (same policy as the report draft). Callers wrap non-fatally; every
+    outcome lands in result["txt_file"] / ["docx_file"] /
+    ["clipboard_copied"] / ["legal_description_paste_ready"] + notes.
+    """
+    result.setdefault("txt_file", None)
+    result.setdefault("docx_file", None)
+    result.setdefault("clipboard_copied", None)
+    result.setdefault("legal_description_paste_ready", None)
+    if result.get("status") != "success" or not result.get("legal_description"):
+        return
+    notes = result.setdefault("notes", [])
+
+    verbatim = result["legal_description"].strip("\n")
+    paste_ready = _reflow_legal_description(verbatim)
+    result["legal_description_paste_ready"] = paste_ready
+    clause = _derivation_clause(result)
+
+    lc = bool(result.get("land_court"))
+    if lc:
+        source = (f"{result.get('registry')}, Land Court Document No. "
+                  f"{result.get('document_number')}, Certificate of Title "
+                  f"No. {result.get('certificate_of_title')}, filed "
+                  f"{result.get('recorded_date')}")
+    else:
+        source = (f"{result.get('registry')}, Book {result.get('book')}, "
+                  f"Page {result.get('page')}, recorded "
+                  f"{result.get('recorded_date')}")
+
+    forms = [
+        ("1. VERBATIM (as recorded — line breaks preserved)", verbatim),
+        ("2. PASTE-READY (whitespace-only reflow; wording untouched)",
+         paste_ready),
+        ("3. PASTE-READY + DERIVATION CLAUSE", paste_ready + "\n\n" + clause),
+    ]
+
+    txt_path = output_folder / f"Legal Description - {base_name}.txt"
+    if txt_path.exists():
+        notes.append(
+            f"Legal-description .txt NOT written — '{txt_path.name}' already "
+            "exists (existing deliverables are never overwritten)."
+        )
+    else:
+        L = [
+            f"LEGAL DESCRIPTION — {base_name}",
+            f"Source deed: {source}",
+            f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')} by "
+            "legal_desc_fetch.py — verify against the deed images before use",
+        ]
+        for heading, body in forms:
+            L += ["", "=" * 66, heading, "=" * 66, "", body]
+        txt_path.write_text("\n".join(L) + "\n", encoding="utf-8")
+        result["txt_file"] = str(txt_path)
+        notes.append(f"Legal-description .txt written: '{txt_path.name}'")
+
+    if write_docx:
+        docx_path = output_folder / f"Legal Description - {base_name}.docx"
+        try:
+            import docx  # python-docx — optional
+        except ImportError:
+            docx = None
+        if docx is None:
+            notes.append(
+                ".docx skipped — python-docx is not installed "
+                "(pip install python-docx)."
+            )
+        elif docx_path.exists():
+            notes.append(
+                f".docx NOT written — '{docx_path.name}' already exists "
+                "(existing deliverables are never overwritten)."
+            )
+        else:
+            try:
+                d = docx.Document()
+                d.add_heading(f"Legal Description — {base_name}", level=1)
+                d.add_paragraph(f"Source deed: {source}")
+                for heading, body in forms:
+                    d.add_heading(heading, level=2)
+                    for para in body.split("\n\n"):
+                        d.add_paragraph(para)
+                d.save(str(docx_path))
+                result["docx_file"] = str(docx_path)
+                notes.append(f"Legal-description .docx written: "
+                             f"'{docx_path.name}'")
+            except Exception as e:
+                notes.append(f".docx write failed (non-fatal): {e}")
+
+    if copy_to_clipboard:
+        ok = _copy_text_to_clipboard(paste_ready)
+        result["clipboard_copied"] = ok
+        notes.append(
+            "Paste-ready legal description copied to clipboard." if ok else
+            "Clipboard copy failed (non-fatal) — paste from the .txt instead."
+        )
+
+
+def run_alis_http(
+    registry_label: str,
+    base_url: str,
+    seller_last: str,
+    seller_first: str,
+    base_name: str,
+    output_folder: Path,
+    town: str,
+    grantor_town: str = None,
+    target_book: str = "",
+    target_page: str = "",
+    extract_pdf: bool = True,
+    extraction_mode: str = "api",
+    verify_grantor_hit: str = "",
+    show_timings: bool = True,
+) -> dict:
+    """
+    Shared pure-HTTP runner for the Browntech ALIS registries (Norfolk,
+    Barnstable). Same workflow and result JSON as run_barnstable()/
+    run_norfolk(), plus:
+      engine                      "http"
+      multiple_deed_candidates    populated when the grantee search yields
+                                  >1 distinct conveyance instrument — each
+                                  entry carries index metadata, whether it
+                                  was the selected row, and a downloaded
+                                  page-1 sample PDF for address verification
+      --book/--page targeting     target_book (+ optional target_page)
+                                  overrides the most-recent heuristic; on
+                                  Land Court, target_book matches the
+                                  document number
+      pdf_extraction (v3.10)      when extract_pdf is True, the downloaded
+                                  deed (and candidate page-1 samples) are
+                                  read by the Claude API and the structured
+                                  fields returned in the JSON — no Read
+                                  tool step needed on success
+      auto_retargeted (v3.14)     True when the selected deed's extracted
+                                  address failed to match the street from
+                                  --base-name and exactly one candidate's
+                                  did, so the script swapped to that
+                                  instrument in the same invocation
+      grantor_check.samples       (v3.15) page-1 sample PDF + light
+                                  extraction for each conveyance-type
+                                  grantor-check hit (cap 5), with a
+                                  subject-address comparison note
+      grantor_check.needs_review  (v3.23) the short set of hits that need
+      grantor_check.summary       judgment + per-tier counts — Plymouth
+                                  v3.21 shape; hit addresses resolved from
+                                  registry abstracts in parallel
+      grantor_hit_verification    (v3.15) full download + extraction of
+                                  the one grantor hit named by
+                                  verify_grantor_hit ("BOOK/PAGE", or the
+                                  document number on Land Court)
+    """
+    grantor_town = grantor_town if grantor_town is not None else town
+    result = {
+        "status": "error",
+        "engine": "http",
+        # v3.27 — "api" or "claude-code"; claude-code is a supported mode,
+        # not a failure (extraction_error stays null in it).
+        "extraction_mode": extraction_mode,
+        "registry": registry_label,
+        "registry_url": f"{base_url}/ALIS/WW400R.HTM?WSIQTP=LR01D&WSKYCD=N",
+        "registry_system": "Browntech ALIS",
+        "land_court": False,
+        "book": None,
+        "page": None,
+        "ctl_num": None,
+        "certificate_of_title": None,  # Land Court only — read from the search index
+        "document_number": None,   # Land Court: from search index | Recorded Land: from PDF
+        "recorded_date": None,
+        "deed_type": None,
+        "consideration": None,     # extracted from PDF by Claude
+        "grantors": [],
+        "grantees": [],
+        "deed_property_address": None,
+        # v3.23 — needs_review + summary mirror the Plymouth v3.21 shape.
+        # v3.30 — `searches`: per-search accounting (see _plymouth_record_searches).
+        "grantor_check": {"has_subsequent_deed": False, "deeds": [],
+                          "needs_review": [], "summary": None, "samples": [],
+                          "searches": []},
+        "multiple_deed_candidates": [],
+        "auto_retargeted": False,   # v3.14 — True when the address check swapped the selected deed
+        # v3.22 — the registry's own abstract record for the selected row
+        # (address, Doc$ consideration, page count, cross-references).
+        "abstract": None,
+        "deed_property_address_abstract": None,
+        # v3.26 — normalised cross-references (shared shape across all
+        # registries); leads for the discharge / title-rundown workflows,
+        # NOT discharge verification.
+        "cross_references": [],
+        "grantor_hit_verification": None,   # v3.15 — populated by --verify-grantor-hit
+        "report_file": None,   # v3.16 — path of the script-rendered Step 6 report draft
+        "files": [],
+        "total_pages_in_deed": None,
+        # v3.10 — populated by inline PDF extraction (null/[] when skipped
+        # or failed; see extraction_error / notes in that case)
+        "legal_description": None,
+        "signing_date": None,
+        "grantors_full": [],
+        "grantees_full": [],
+        "tenancy": None,
+        "prior_deed_reference": None,
+        "title_flags": [],
+        "deed_property_address_pdf": None,
+        "recording_stamp": None,
+        # v3.28 — set when an extraction failure will recur for the rest of
+        # the run (no credit, bad key, revoked model access), after which
+        # the remaining extraction calls are skipped rather than repeated.
+        "extraction_unavailable": None,
+        "notes": [],
+        "errors": [],
+    }
+    # v3.31 — measure the run's shape. Always on (the cost is a
+    # perf_counter read per stage); --timings only adds the report
+    # footer. Nothing here is ever transmitted.
+    _tm = _Timings()
+    session = requests.Session()
+
+    _tm.mark("STEP 1 - grantee search")
+    # -----------------------------------------------------------
+    # STEP 1 — GRANTEE SEARCH (Recorded Land, then Land Court fallback)
+    # -----------------------------------------------------------
+    rows = []
+    for land_court in (False, True):
+        section = "Land Court" if land_court else "Recorded Land"
+        result["notes"].append(
+            f"Searching {section}: "
+            + _alis_url(base_url, seller_last, seller_first, "E",
+                        town=town, land_court=land_court, doc_type="*DD", per_page=30)
+        )
+        rows = _alis_search_http(
+            session, base_url, seller_last, seller_first, "E", town=town,
+            land_court=land_court, doc_type="*DD", notes=result["notes"],
+        )
+        if rows:
+            result["land_court"] = land_court
+            result["notes"].append(f"Found {len(rows)} result(s) in {section}.")
+            break
+        result["notes"].append(f"No results in {section}.")
+
+    if not rows:
+        result["status"] = "deed_not_found"
+        result["notes"].append(
+            f"No results for {seller_last}, {seller_first} as Grantee "
+            f"in {registry_label} (town={town})."
+        )
+        _tm.finish(result)
+        return result
+
+    result["notes"].append(
+        "All rows: " + " | ".join(
+            f"[{_alis_row_id(r)} {r['doc_type']!r} {r['date_received']} "
+            f"{'cert=' + repr(r['certificate']) if r.get('land_court') else 'rev=' + repr(r['reverse_party'])}]"
+            for r in rows
+        )
+    )
+
+    _tm.mark("STEP 2 - select deed row")
+    # -----------------------------------------------------------
+    # STEP 2 — SELECT DEED ROW (--book/--page target, else heuristic)
+    #          + multi-candidate detection (v3.9)
+    # -----------------------------------------------------------
+    # Distinct conveyance instruments (dual-indexed rows collapse to one).
+    candidates, cand_seen = [], set()
+    for r in rows:
+        if _is_non_conveyance_instrument(r.get("doc_type") or ""):
+            continue
+        inst = _alis_instrument_id(r)
+        if inst in cand_seen:
+            continue
+        cand_seen.add(inst)
+        candidates.append(r)
+
+    row = None
+    if target_book:
+        tb, tp = _norm_num(target_book), _norm_num(target_page)
+        for r in rows:
+            if r.get("land_court"):
+                match = _norm_num(r.get("document_number")) == tb
+            else:
+                match = (_norm_num(r.get("book")) == tb
+                         and (not tp or _norm_num(r.get("page")) == tp))
+            if match:
+                row = r
+                break
+        if row is None:
+            result["status"] = "deed_not_found"
+            result["notes"].append(
+                f"--book {target_book}" + (f" --page {target_page}" if target_page else "")
+                + " did not match any result row. Available: "
+                + ", ".join(_alis_row_id(r) for r in rows)
+            )
+            return result
+        result["notes"].append(f"Selected by --book/--page target: {_alis_row_id(row)}")
+    else:
+        row = _alis_select_deed_row(rows)
+        if row is None:
+            result["status"] = "deed_not_found"
+            result["notes"].append("Could not select a deed row from results.")
+            return result
+
+    result["notes"].append(
+        f"Selected: {row['doc_type']} {_alis_row_id(row)} {row['date_received']} | "
+        + (f"Certificate: {row['certificate']}" if row.get("land_court")
+           else f"Grantor: {row['reverse_party']}")
+        + f" | Grantee: {row['name']} | Desc: {row['doc_desc']}"
+    )
+
+    _alis_apply_row_fields(result, row)
+
+    _tm.mark("STEP 2.5 - document abstract")
+    # -----------------------------------------------------------
+    # STEP 2.5 — DOCUMENT ABSTRACT for the selected row (v3.22)
+    # The registry's own index record carries the property address as
+    # plain text. Fetch it before any PDF work: it verifies the parcel
+    # with no download and no model call, and it still answers when
+    # extraction is disabled or has no API key.
+    # -----------------------------------------------------------
+    sel_abstract = _alis_fetch_abstract_http(session, base_url, row, result["notes"])
+    if sel_abstract:
+        sel_addrs = _alis_abstract_address_strings(sel_abstract)
+        result["abstract"] = {
+            "url": sel_abstract.get("url"),
+            "addresses": sel_abstract.get("addresses"),
+            "consideration": sel_abstract.get("consideration"),
+            "pages": sel_abstract.get("pages"),
+            "refs": sel_abstract.get("refs"),
+            # v3.28 — every party on both sides, in index format. The
+            # grantor check derives co-owner search names from these.
+            "grantors": sel_abstract.get("grantors"),
+            "grantees": sel_abstract.get("grantees"),
+        }
+        result["deed_property_address_abstract"] = sel_addrs[0] if sel_addrs else None
+        if not result.get("consideration") and sel_abstract.get("consideration"):
+            result["consideration"] = sel_abstract["consideration"]
+        # v3.25 — Land Court: the abstract's Ctf# fills certificate_of_title
+        # when the index row didn't carry one.
+        if not result.get("certificate_of_title") and sel_abstract.get("certificate"):
+            result["certificate_of_title"] = sel_abstract["certificate"]
+        # v3.26 — normalise the abstract's cross-references into the shared
+        # `cross_references` shape (see _normalize_cross_references).
+        result["cross_references"] = _normalize_cross_references(
+            sel_abstract.get("refs"),
+            "registry abstract (Land Court)" if result["land_court"]
+            else "registry abstract",
+        )
+        xnote = _cross_reference_note(result["cross_references"])
+        if xnote:
+            result["notes"].append(xnote)
+        result["notes"].append(
+            f"Abstract (v3.22) for {_alis_row_id(row)}: "
+            + (f"address {sel_addrs}" if sel_addrs
+               else "NO address field on the abstract (parcel unverified from "
+                    "the index — the PDF check below still applies)")
+            + (f", Doc$ {sel_abstract['consideration']}"
+               if sel_abstract.get("consideration") else "")
+            + (f", {len(sel_abstract.get('refs') or [])} cross-reference(s)"
+               if sel_abstract.get("refs") else "")
+        )
+
+    # Multi-candidate guard: the most-recent heuristic picks the wrong
+    # parcel when the seller owns several same-town properties (Renwick —
+    # ALIS Desc "UNIT 8T01" vs "LOT 38" can't be matched to a street
+    # address from the index alone). Surface every candidate with a
+    # page-1 sample so the address on each can be verified. v3.14: the
+    # auto-retarget (STEP 6) resolves a mismatch in this invocation when
+    # it can; --book/--page re-run remains the manual fallback.
+    selected_inst = _alis_instrument_id(row)
+    cand_rows = []   # v3.14 — raw rows aligned with multiple_deed_candidates
+    if len(candidates) > 1 and not target_book:
+        result["notes"].append(
+            f"MULTIPLE DEED CANDIDATES ({len(candidates)}) — verify the selected "
+            "deed's property address against the subject property; if wrong, "
+            "re-run with --book/--page targeting the correct instrument."
+        )
+        for cand in candidates[:8]:
+            inst_selected = _alis_instrument_id(cand) == selected_inst
+            entry = {
+                "book": cand["book"] or None,
+                "page": cand["page"] or None,
+                "document_number": cand["document_number"] or None,
+                "certificate_of_title": cand["certificate"] or None,
+                "doc_type": cand["doc_type"],
+                "recorded_date": cand["date_received"],
+                "town": cand["town"],
+                "doc_desc": cand["doc_desc"],
+                "grantor": cand["reverse_party"] or None,
+                "grantee": cand["name"] or None,
+                "selected": inst_selected,
+                "sample_file": None,
+                # v3.22 — addresses straight off the registry's abstract page
+                "abstract_addresses": [],
+                "abstract_url": None,
+            }
+            # v3.22 — try the abstract FIRST. When it names an address there
+            # is nothing left to learn from a page-1 scan, so the download
+            # and its vision-model call are both skipped. When it does not
+            # (the `Addr:` field is often blank), fall through to the
+            # existing page-1 sample — an absent address means UNVERIFIED,
+            # never "a different parcel".
+            if inst_selected:
+                cand_abs = sel_abstract
+            else:
+                cand_abs = _alis_fetch_abstract_http(
+                    session, base_url, cand, result["notes"])
+            cand_addrs = _alis_abstract_address_strings(cand_abs)
+            if cand_abs:
+                entry["abstract_url"] = cand_abs.get("url")
+                entry["abstract_addresses"] = cand_addrs
+            if not inst_selected and not cand_addrs:
+                # Page-1 sample only — full deed is downloaded for the
+                # selected row below.
+                info = _alis_get_pdf_hrefs_http(session, base_url, cand["img_href"])
+                if info["pdf_hrefs"]:
+                    label = ("candidate_Doc" + (cand["document_number"] or cand["ctl_num"])
+                             if cand.get("land_court")
+                             else f"candidate_Bk{cand['book']}_Pg{cand['page']}")
+                    saved, errs = _alis_download_pdfs_http(
+                        session, base_url, info["pdf_hrefs"][:1],
+                        base_name, output_folder, label=label,
+                    )
+                    if saved:
+                        entry["sample_file"] = saved[0]
+                    result["errors"] += errs
+            result["multiple_deed_candidates"].append(entry)
+            cand_rows.append(cand)
+
+        _by_abstract = sum(1 for c in result["multiple_deed_candidates"]
+                           if c["abstract_addresses"] and not c["selected"])
+        _by_sample = sum(1 for c in result["multiple_deed_candidates"]
+                         if c.get("sample_file"))
+        result["notes"].append(
+            f"Candidate address resolution (v3.22): {_by_abstract} from the "
+            f"registry abstract (no PDF, no model call), {_by_sample} needing "
+            "a page-1 sample because the abstract carried no address."
+        )
+
+    _tm.mark("STEP 3+4 - download deed PDFs")
+    # -----------------------------------------------------------
+    # STEP 3+4 — DOCUMENT IMAGE LIST → DOWNLOAD PDFs
+    # -----------------------------------------------------------
+    fetch = _alis_fetch_deed_files(
+        session, base_url, row, base_name, output_folder,
+        result["notes"], result["errors"],
+    )
+    if not fetch["ok"]:
+        result["image_list_url"] = fetch["img_info"]["image_list_url"]
+        result["all_pdf_hrefs_on_image_list"] = fetch["img_info"]["all_pdfs"]
+        return result
+    result["files"] = fetch["files"]
+    result["total_pages_in_deed"] = len(fetch["img_info"]["pdf_hrefs"])
+
+    _tm.mark("STEP 4.5 - prefetch grantor searches")
+    # -----------------------------------------------------------
+    # STEP 4.5 — PREFETCH ROW-INDEPENDENT GRANTOR SEARCHES (v3.16)
+    # The user-name and broad-surname searches depend on neither the
+    # retarget outcome nor the extracted co-owner names, so they run on a
+    # worker thread (own Session) while the extraction API calls run.
+    # Filtering still happens in STEP 7 against the FINAL row. Fails
+    # soft: STEP 7 just searches live for any pair that isn't here.
+    # -----------------------------------------------------------
+    prefetched, prefetch_notes = {}, []
+    prefetch_pool = prefetch_future = None
+
+    def _prefetch_grantor_searches():
+        psession = requests.Session()
+        pairs = [(seller_last.upper(), seller_first.upper())]
+        if not result["land_court"]:
+            pairs.append((seller_last.upper(), ""))
+        # v3.29 — window from the row selected SO FAR. A later auto-retarget
+        # can move to an earlier deed, which would make this window too late;
+        # the window rides along in the entry and _alis_grantor_check_http
+        # discards and re-searches any prefetched set that is too narrow.
+        pf_window = _grantor_window_start(
+            _parse_deed_date(result.get("recorded_date") or ""))
+        pf_param = _alis_date_param(pf_window)
+        for last, first in pairs:
+            try:
+                # v3.20 — the truncation flag rides along so the grantor
+                # check can trigger its town-scoped retry on capped
+                # prefetched searches too.
+                meta = {}
+                rows = _alis_search_http(
+                    psession, base_url, last, first, "R", town=grantor_town,
+                    land_court=result["land_court"], doc_type="*ALL",
+                    date_from=pf_param, notes=prefetch_notes, meta=meta,
+                )
+                prefetched[(last, first)] = {
+                    "rows": rows,
+                    "truncated": meta.get("truncated", False),
+                    "window": pf_window,
+                }
+            except Exception as e:
+                prefetch_notes.append(
+                    f"Grantor-search prefetch for '{last}, {first or '(surname only)'}' "
+                    f"failed (non-fatal, will search live): {e}"
+                )
+
+    try:
+        prefetch_pool = ThreadPoolExecutor(max_workers=1)
+        prefetch_future = prefetch_pool.submit(_prefetch_grantor_searches)
+    except Exception as e:
+        result["notes"].append(f"Grantor-search prefetch not started (non-fatal): {e}")
+
+    _tm.mark("STEP 5 - PDF extraction")
+    # -----------------------------------------------------------
+    # STEP 5 — INLINE PDF EXTRACTION (v3.10, non-fatal)
+    # v3.14: moved BEFORE the grantor check — the auto-retarget needs the
+    # extracted addresses, and the grantor check needs the final
+    # acquisition row plus the extracted co-owner names. The two steps
+    # were sequential anyway, so the reorder costs nothing.
+    # -----------------------------------------------------------
+    if extract_pdf and result["files"]:
+        _run_pdf_extraction(result, land_court=result["land_court"])
+    elif not extract_pdf:
+        # v3.27 — in claude-code mode this is a MODE, not a failure: the
+        # mode note was already emitted by _resolve_extraction_mode and
+        # extraction_error stays null. Only the legacy
+        # --no-extract-pdf-text-without-a-mode path lands in the else.
+        if extraction_mode != "claude-code":
+            result["notes"].append(
+                "PDF extraction disabled — Claude should Read the PDFs to "
+                "extract deed details."
+            )
+        else:
+            result["notes"].append(
+                "READ THE DEED PDFs to extract the legal description and "
+                "deed fields (claude-code extraction mode): "
+                + ", ".join(Path(f).name for f in result["files"])
+            )
+
+    _tm.mark("STEP 6 - auto-retarget check")
+    # -----------------------------------------------------------
+    # STEP 6 — AUTO-RETARGET BY EXTRACTED ADDRESS (v3.14, non-fatal)
+    # The heuristic pick is only kept if its extracted address matches the
+    # street parsed from --base-name; on a mismatch with exactly ONE
+    # address-matching candidate, the script swaps to that instrument in
+    # this same invocation (previously: a manual --book/--page re-run).
+    # -----------------------------------------------------------
+    # v3.22 — no longer gated on PDF extraction succeeding. The registry
+    # abstract supplies addresses for the selected row and the candidates
+    # with no API call, so the wrong-parcel guard now also runs under
+    # --no-extract-pdf-text, and when extraction failed or has no API key.
+    # It runs whenever there is at least one address to reason about.
+    _have_address = bool(
+        result.get("deed_property_address_pdf")
+        or result.get("deed_property_address_abstract")
+        or any(c.get("abstract_addresses")
+               or (c.get("sample_extraction") or {}).get("property_address")
+               for c in result["multiple_deed_candidates"])
+    )
+    # v3.26 — abstract vs PDF disagreement (see _address_sources_disagree).
+    if _address_sources_disagree(result.get("deed_property_address_pdf"),
+                                 result.get("deed_property_address_abstract"),
+                                 base_name):
+        result["notes"].append(
+            f"WARNING: the registry abstract and the deed PDF disagree about "
+            f"the property address — abstract "
+            f"{result['deed_property_address_abstract']!r} vs PDF "
+            f"{result['deed_property_address_pdf']!r}. One of them is wrong: "
+            "either the abstract is misindexed or the downloaded PDF is a "
+            "different parcel. Resolve before relying on the legal "
+            "description; the deed image is authoritative for the premises "
+            "conveyed."
+        )
+
+    if not target_book and _have_address:
+        st_num, st_word = _parse_street_from_base_name(base_name)
+        expected = f"{st_num} {st_word}".strip()
+        # v3.22 — the selected deed's own address: PDF extraction first
+        # (it reads the granting clause), then the registry abstract, so
+        # the check still runs when extraction is off or came back null.
+        main_addr = (result.get("deed_property_address_pdf")
+                     or result.get("deed_property_address_abstract"))
+        if not (st_num and st_word):
+            if cand_rows:
+                result["notes"].append(
+                    "Auto-retarget skipped: no street number/name parsed from "
+                    "the base name — verify the selected deed's address against "
+                    "the candidate sample extractions manually."
+                )
+        elif _alis_address_matches(st_num, st_word, main_addr):
+            result["notes"].append(
+                f"Address verified: extracted deed address {main_addr!r} "
+                f"matches expected street '{expected}' from the base name."
+            )
+        elif not cand_rows:
+            result["notes"].append(
+                f"ADDRESS MISMATCH: extracted deed address {main_addr!r} "
+                f"does not match expected street '{expected}', and there is "
+                "no other conveyance candidate to retarget to — verify the "
+                "parcel manually (check the street number, Registered Land, "
+                "and misindexed grantee names)."
+            )
+        else:
+            cands = result["multiple_deed_candidates"]
+
+            def _cand_addr(i):
+                # v3.22 — prefer the registry abstract's address over the
+                # vision-extracted page-1 sample. It is structured index
+                # data rather than an OCR read, so it has no null-address
+                # failure mode on deeds whose page 1 only says "SEE
+                # ATTACHED FULL LEGAL" (the Keegan Bk15978/412 defect). On a
+                # multi-parcel deed prefer whichever listed address matches
+                # the subject street.
+                abs_addrs = cands[i].get("abstract_addresses") or []
+                for a in abs_addrs:
+                    if _alis_address_matches(st_num, st_word, a):
+                        return a
+                if abs_addrs:
+                    return abs_addrs[0]
+                return (cands[i].get("sample_extraction") or {}).get(
+                    "property_address")
+
+            def _cand_date(i):
+                return _parse_deed_date(cands[i].get("recorded_date") or "")
+
+            def _cand_label(i):
+                return (f"{_alis_row_id(cand_rows[i])} "
+                        f"({cands[i]['doc_type']} {cands[i]['recorded_date']})")
+
+            # v3.20 — a candidate whose sample yielded NO address is
+            # UNVERIFIABLE, not a non-match. Keegan/402 Sedgefield St: the
+            # operative 2002 deed's page 1 read only "SEE ATTACHED FULL
+            # LEGAL", its sample address came back null, and the retarget
+            # silently dropped it — selecting the superseded 1998 deed at
+            # exit 0. Sample deeper before matching; whatever still can't
+            # be verified is warned about, never discarded quietly.
+            unverified = [
+                i for i, c in enumerate(cands)
+                if not c.get("selected") and not _cand_addr(i)
+            ]
+            if unverified:
+                _alis_extend_candidate_samples(
+                    session, base_url, result, cand_rows, unverified,
+                    base_name, output_folder,
+                )
+                unverified = [i for i in unverified if not _cand_addr(i)]
+
+            def _warn_unverified(chosen_idx=None):
+                if not unverified:
+                    return
+                names = ", ".join(_cand_label(i) for i in unverified)
+                newer = (chosen_idx is not None and any(
+                    _cand_date(i) > _cand_date(chosen_idx)
+                    for i in unverified))
+                result["notes"].append(
+                    ("CRITICAL" if newer or chosen_idx is None else "WARNING")
+                    + f": candidate(s) {names} could NOT be address-verified "
+                    "(no property address found in the sampled pages) and "
+                    "were NOT ruled out"
+                    + (" — at least one is recorded LATER than the selected "
+                       "deed and could supersede it" if newer else "")
+                    + ". Verify each with a --book/--page re-run before "
+                    "relying on the selected deed."
+                )
+
+            match_idxs = [
+                i for i, cand in enumerate(cands)
+                if not cand.get("selected")
+                and _alis_address_matches(st_num, st_word, _cand_addr(i))
+            ]
+            target_idx = None
+            if len(match_idxs) == 1:
+                target_idx = match_idxs[0]
+            elif len(match_idxs) > 1:
+                # v3.20 — several candidates match the subject street: they
+                # are the same parcel's chain of deeds to this owner (e.g.
+                # purchase deed + later re-vesting deed). The most recently
+                # recorded match is the operative vesting instrument —
+                # previously this branch gave up and asked for a manual
+                # --book/--page pick.
+                ranked = sorted(match_idxs, key=_cand_date, reverse=True)
+                if (_cand_date(ranked[0]) > (0, 0, 0)
+                        and _cand_date(ranked[0]) > _cand_date(ranked[1])):
+                    target_idx = ranked[0]
+                    result["notes"].append(
+                        f"ADDRESS MATCH x{len(ranked)}: "
+                        + ", ".join(_cand_label(i) for i in ranked[1:])
+                        + f" also match '{expected}' but are recorded "
+                        "EARLIER — selecting the most recent match "
+                        f"{_cand_label(target_idx)} as the operative vesting "
+                        "deed; the earlier one(s) are its chain of title and "
+                        "are likely superseded."
+                    )
+                else:
+                    result["notes"].append(
+                        f"ADDRESS MISMATCH: extracted deed address "
+                        f"{main_addr!r} does not match expected street "
+                        f"'{expected}'; {len(match_idxs)} candidates match "
+                        "it but their recorded dates are missing or tied, "
+                        "so the script cannot rank them — pick via the "
+                        "sample extractions and re-run with --book/--page."
+                    )
+            if target_idx is not None:
+                new_row = cand_rows[target_idx]
+                new_entry = result["multiple_deed_candidates"][target_idx]
+                # v3.22 — the address that justified the swap, from whichever
+                # source supplied it (abstract or page-1 sample). Reading
+                # sample_extraction directly reported None for candidates the
+                # abstract had resolved without a sample.
+                new_addr = _cand_addr(target_idx)
+                old_id = _alis_row_id(row)
+                old_files = list(result["files"])
+                old_grantees = list(result.get("grantees_full") or [])
+                label = ("deed_Doc" + (new_row["document_number"] or new_row["ctl_num"])
+                         if new_row.get("land_court")
+                         else f"deed_Bk{new_row['book']}_Pg{new_row['page']}")
+                refetch = _alis_fetch_deed_files(
+                    session, base_url, new_row, base_name, output_folder,
+                    result["notes"], result["errors"], label=label,
+                )
+                if refetch["ok"]:
+                    # Demote the heuristic pick into the candidates list,
+                    # keeping its page-1 file and extracted address so the
+                    # evidence for the swap stays in the output.
+                    for cand in result["multiple_deed_candidates"]:
+                        if cand.get("selected"):
+                            cand["selected"] = False
+                            cand["sample_file"] = old_files[0]
+                            cand["sample_extraction"] = {
+                                "property_address": main_addr,
+                                "lot_or_unit": None,
+                                "grantees": old_grantees,
+                            }
+                    new_entry["selected"] = True
+                    row = new_row
+                    _alis_apply_row_fields(result, row)
+                    result["files"] = refetch["files"]
+                    result["total_pages_in_deed"] = len(refetch["img_info"]["pdf_hrefs"])
+                    result["auto_retargeted"] = True
+                    result["notes"].append(
+                        f"AUTO-RETARGETED (v3.14): heuristic picked {old_id} "
+                        f"({main_addr or 'no address extracted'}); address "
+                        f"match selected {_alis_row_id(row)} "
+                        f"({new_addr or 'address source unrecorded'}"
+                        + (" — from the registry abstract"
+                           if new_entry.get("abstract_addresses")
+                           else " — from the page-1 sample") + "). "
+                        f"The wrong pick's PDFs remain on disk: "
+                        f"{[Path(f).name for f in old_files]}"
+                    )
+                    # Wipe every field extracted from the wrong deed before
+                    # re-extracting — a failed re-extraction must not leave
+                    # the wrong parcel's legal description in place.
+                    result["consideration"] = None
+                    result["legal_description"] = None
+                    result["signing_date"] = None
+                    result["grantors_full"] = []
+                    result["grantees_full"] = []
+                    result["tenancy"] = None
+                    result["prior_deed_reference"] = None
+                    result["title_flags"] = []
+                    result["deed_property_address_pdf"] = None
+                    result["recording_stamp"] = None
+                    result.pop("pdf_extraction", None)
+                    # v3.22 — the retarget can now fire without extraction
+                    # ever having run; only re-extract if it is enabled.
+                    # v3.28 — and not once extraction is known to be down.
+                    if extract_pdf and not result.get("extraction_unavailable"):
+                        _run_pdf_extraction(result, land_court=result["land_court"])
+                    elif extract_pdf:
+                        result["notes"].append(
+                            "READ THE RETARGETED DEED PDFs — re-extraction "
+                            "was skipped because extraction is unavailable "
+                            f"({result['extraction_unavailable']}): "
+                            + ", ".join(Path(f).name for f in result["files"])
+                        )
+                    # v3.22 — refresh the abstract for the newly selected row.
+                    new_abs = _alis_fetch_abstract_http(
+                        session, base_url, row, result["notes"])
+                    if new_abs:
+                        new_addrs = _alis_abstract_address_strings(new_abs)
+                        result["abstract"] = {
+                            "url": new_abs.get("url"),
+                            "addresses": new_abs.get("addresses"),
+                            "consideration": new_abs.get("consideration"),
+                            "pages": new_abs.get("pages"),
+                            "refs": new_abs.get("refs"),
+                            "grantors": new_abs.get("grantors"),
+                            "grantees": new_abs.get("grantees"),
+                        }
+                        result["deed_property_address_abstract"] = (
+                            new_addrs[0] if new_addrs else None)
+                        if not result.get("consideration") and new_abs.get("consideration"):
+                            result["consideration"] = new_abs["consideration"]
+                        result["notes"].append(
+                            f"Abstract (v3.22) for the retargeted deed "
+                            f"{_alis_row_id(row)}: "
+                            + (f"address {new_addrs}" if new_addrs
+                               else "no address field")
+                            + (f", {len(new_abs.get('refs') or [])} cross-reference(s)"
+                               if new_abs.get("refs") else "")
+                        )
+                    if (extract_pdf and not result.get("extraction_error")
+                            and not _alis_address_matches(
+                                st_num, st_word,
+                                result.get("deed_property_address_pdf"))):
+                        result["notes"].append(
+                            "WARNING: the retargeted deed's full extraction "
+                            f"address is {result.get('deed_property_address_pdf')!r}, "
+                            f"which does not match '{expected}' either — "
+                            "verify the parcel manually."
+                        )
+                    # v3.20 — grantor == grantee on the selected deed is
+                    # affirmative evidence it is the operative instrument.
+                    if _alis_same_party_reconveyance(new_entry):
+                        result["notes"].append(
+                            "Note: the selected deed's grantor and grantee "
+                            "are the SAME party — a re-vesting deed "
+                            "(marriage/trust/tenancy change), which "
+                            "routinely supersedes the purchase deed as the "
+                            "operative vesting instrument."
+                        )
+                    _warn_unverified(target_idx)
+                else:
+                    result["notes"].append(
+                        f"Auto-retarget FAILED to download {_alis_row_id(new_row)} "
+                        f"— keeping the heuristic pick {old_id}. Its address did "
+                        f"NOT match '{expected}'; verify manually or re-run with "
+                        "--book/--page."
+                    )
+                    _warn_unverified(None)
+            elif not match_idxs:
+                result["notes"].append(
+                    f"ADDRESS MISMATCH: extracted deed address {main_addr!r} "
+                    f"does not match expected street '{expected}', and no "
+                    "candidate sample matches either — verify via the sample "
+                    "extractions and re-run with --book/--page if wrong."
+                )
+                _warn_unverified(None)
+            else:
+                # Multi-match with unrankable dates (note appended above) —
+                # still surface any unverified candidates.
+                _warn_unverified(None)
+
+    _tm.mark("STEP 7 - grantor check")
+    # -----------------------------------------------------------
+    # STEP 7 — GRANTOR CHECK (v3.9: paginated, full-name variants;
+    # v3.14: runs after extraction/retarget, so the acquisition row is
+    # final and co-owner names from the deed join the search;
+    # v3.16: the row-independent searches were prefetched in STEP 4.5)
+    # -----------------------------------------------------------
+    if prefetch_future is not None:
+        try:
+            prefetch_future.result()
+        except Exception as e:
+            result["notes"].append(f"Grantor-search prefetch failed (non-fatal): {e}")
+        prefetch_pool.shutdown(wait=False)
+        result["notes"].extend(prefetch_notes)
+
+    grantor_rows = []
+    try:
+        lc = result["land_court"]
+        name_pairs = [(seller_last.upper(), seller_first.upper())]
+        idx_pair = _alis_indexed_name_pair(row.get("name") or "")
+        if idx_pair[0] and idx_pair not in name_pairs:
+            name_pairs.append(idx_pair)
+
+        # v3.14 — co-owner names extracted from the deed itself. A co-owner
+        # with a different surname conveying alone was invisible to every
+        # existing search; on Land Court even same-surname co-owners were
+        # (the index shows one grantee + "(&AL)" and gets no broad search).
+        co_pairs = []
+
+        def _add_co_pair(co_last, co_first, label):
+            if not co_last:
+                return
+            covered = any(
+                p[0] == co_last and p[1] and co_first.startswith(p[1])
+                for p in name_pairs + co_pairs
+            )
+            if not covered:
+                co_pairs.append((co_last, co_first, label))
+
+        for g in result.get("grantees_full") or []:
+            co_last, co_first = _grantee_full_name_pair(g)
+            _add_co_pair(co_last, co_first,
+                         f"{co_last}, {co_first} (co-owner from deed)")
+
+        # v3.28 — the same names off the registry ABSTRACT, which needs no
+        # API and covers two cases the deed extraction cannot: a run whose
+        # extraction failed or was never enabled, and a co-owner REMOVED by
+        # the vesting deed (named only on its grantor side). See
+        # _alis_abstract_party_pairs.
+        for co_last, co_first, label in _alis_abstract_party_pairs(
+                result.get("abstract"), result["notes"]):
+            _add_co_pair(co_last, co_first, label)
+
+        if co_pairs:
+            result["notes"].append(
+                "Grantor check includes co-owner name(s) from the deed and "
+                "its registry abstract: "
+                + "; ".join(f"{p[0]}, {p[1]}" for p in co_pairs)
+            )
+        name_pairs.extend(co_pairs)
+
+        if not lc:
+            # Broad surname search — catches same-surname joint owners.
+            # Skipped on Land Court (Kowalczyk: namesake noise buries the
+            # seller's real instruments).
+            broad = (seller_last.upper(), "")
+            if broad not in name_pairs:
+                name_pairs.append(broad)
+
+        grantor_rows = _alis_grantor_check_http(
+            session, base_url, name_pairs, town=grantor_town,
+            acq_row=row, land_court=lc, notes=result["notes"],
+            prefetched=prefetched,
+            # v3.20 — subject town code for the capped-search retry, and
+            # the grantor_check dict so truncation state lands in the JSON.
+            retry_town=town, check_meta=result["grantor_check"],
+        )
+        result["grantor_check"]["has_subsequent_deed"] = len(grantor_rows) > 0
+        if grantor_rows:
+            # v3.23 — classify, order and summarise (Plymouth v3.21 parity).
+            # Per-hit addresses come from registry abstracts, fetched in
+            # parallel well beyond the PDF-sampling cap; builds
+            # grantor_check.deeds (tagged, most-relevant first),
+            # .needs_review and .summary, and emits the subject /
+            # possible-subject notes.
+            _alis_finalize_grantor_check(result, grantor_rows, base_name,
+                                         town, base_url)
+        elif result["grantor_check"].get("incomplete_searches"):
+            # v3.20 — Keegan: a truncated check with zero hits in the rows
+            # that DID come back is not a clean-title finding.
+            result["notes"].append(
+                "Grantor check: no subsequent instruments in the rows "
+                "searched, but one or more searches were TRUNCATED (see "
+                "warnings above) — do NOT report this as a clean title "
+                "without completing the capped search(es)."
+            )
+        else:
+            result["notes"].append(
+                "Grantor check: no subsequent instruments found — clean title."
+            )
+    except Exception as e:
+        result["notes"].append(f"Grantor check failed (non-fatal): {e}")
+
+    _tm.mark("STEP 8 - grantor-hit samples")
+    # -----------------------------------------------------------
+    # STEP 8 — GRANTOR-HIT SAMPLES + TARGETED VERIFICATION (v3.15,
+    # non-fatal). The grantor check *finds* instruments but its rows were
+    # never fetchable — confirming a suspected deed-out took ad hoc
+    # scripting (Brandt Bk36890/431, 2026-07-13). Now every
+    # conveyance-type hit gets a page-1 sample + light extraction, and
+    # --verify-grantor-hit fully fetches one named hit.
+    # -----------------------------------------------------------
+    try:
+        st_num, st_word = _parse_street_from_base_name(base_name)
+
+        def _hit_meta(r: dict) -> dict:
+            return {
+                "book": r["book"] or None,
+                "page": r["page"] or None,
+                "document_number": r["document_number"] or None,
+                "certificate_of_title": r["certificate"] or None,
+                "doc_type": r["doc_type"],
+                "recorded_date": r["date_received"],
+                "grantee": r["reverse_party"] or None,
+                "via": r.get("via_search"),
+            }
+
+        def _hit_label(r: dict) -> str:
+            return ("grantorhit_Doc" + (r["document_number"] or r["ctl_num"])
+                    if r.get("land_court")
+                    else f"grantorhit_Bk{r['book']}_Pg{r['page']}")
+
+        def _hit_address_note(r: dict, address, what: str) -> None:
+            """Compare a fetched hit's extracted address to the subject
+            street. v3.23 — thin wrapper over the hoisted helper, which the
+            classification pass shares for identical wording."""
+            _alis_hit_address_note(result, r, address, st_num, st_word, what)
+
+        # --- Targeted verification (--verify-grantor-hit) ---
+        target_hit = None
+        if verify_grantor_hit:
+            vb, _, vp = verify_grantor_hit.partition("/")
+            vb, vp = _norm_num(vb.strip()), _norm_num(vp.strip())
+            for r in grantor_rows:
+                if r.get("land_court"):
+                    match = _norm_num(r.get("document_number")) == vb
+                else:
+                    match = (_norm_num(r.get("book")) == vb
+                             and (not vp or _norm_num(r.get("page")) == vp))
+                if match:
+                    target_hit = r
+                    break
+            if target_hit is None:
+                result["notes"].append(
+                    f"--verify-grantor-hit {verify_grantor_hit} did not match "
+                    "any grantor-check hit. Hits found: "
+                    + (", ".join(_alis_row_id(r) for r in grantor_rows) or "none")
+                    + ". (The hit must come from the same searches the check "
+                    "runs — see the grantor-search notes above.)"
+                )
+            else:
+                vfetch = _alis_fetch_deed_files(
+                    session, base_url, target_hit, base_name, output_folder,
+                    result["notes"], result["errors"], label=_hit_label(target_hit),
+                )
+                result["grantor_hit_verification"] = {
+                    **_hit_meta(target_hit),
+                    "files": vfetch["files"],
+                    "extraction": None,
+                }
+                if not vfetch["ok"]:
+                    result["notes"].append(
+                        f"--verify-grantor-hit: download FAILED for "
+                        f"{_alis_row_id(target_hit)} — see errors."
+                    )
+
+        # --- Page-1 samples for conveyance-type hits ---
+        # v3.16 — pre-acquisition hits are not sampled: a conveyance
+        # recorded before the seller acquired the subject property cannot
+        # be a deed-out of it (Renwick: 3 of 5 sampled hits predated the
+        # acquisition). They stay in grantor_check.deeds. Unparseable
+        # dates are still sampled (safe default).
+        acq_date = _parse_deed_date(row.get("date_received") or "")
+        pre_acq_unsampled = 0
+        conveyance_hits = []
+        for r in grantor_rows:
+            dt = (r.get("doc_type") or "").strip()
+            if not dt or _is_non_conveyance_instrument(dt):
+                continue
+            if (target_hit is not None
+                    and _alis_instrument_id(r) == _alis_instrument_id(target_hit)):
+                continue
+            if acq_date > (0, 0, 0):
+                rd = _parse_deed_date(r.get("date_received") or "")
+                if (0, 0, 0) < rd < acq_date:
+                    pre_acq_unsampled += 1
+                    continue
+            conveyance_hits.append(r)
+        if pre_acq_unsampled:
+            result["notes"].append(
+                f"{pre_acq_unsampled} pre-acquisition conveyance hit(s) not "
+                "sampled (recorded before the seller acquired the subject "
+                "property, so they cannot convey it away; still listed in "
+                "grantor_check.deeds)."
+            )
+        if len(conveyance_hits) > _GRANTOR_HIT_SAMPLE_CAP:
+            result["notes"].append(
+                f"Grantor-hit sampling capped at {_GRANTOR_HIT_SAMPLE_CAP} of "
+                f"{len(conveyance_hits)} conveyance-type hit(s) — assess the "
+                "rest from the index rows or verify one with "
+                "--verify-grantor-hit."
+            )
+        samples = []
+        abstract_resolved = 0
+        for r in conveyance_hits[:_GRANTOR_HIT_SAMPLE_CAP]:
+            entry = {**_hit_meta(r), "sample_file": None, "sample_extraction": None,
+                     "abstract_addresses": [], "abstract_url": None}
+            # v3.22 — the abstract answers "which parcel?" for a grantor hit
+            # with one GET. Only download and vision-read a page-1 sample
+            # when the abstract carries no address. v3.23 — the
+            # classification pass usually fetched it already; reuse the
+            # cached copy ({} counts: it means "fetched, empty" — refetching
+            # cannot help).
+            if "_abstract" in r:
+                hit_abs = r["_abstract"]
+            else:
+                hit_abs = _alis_fetch_abstract_http(session, base_url, r, result["notes"])
+            hit_addrs = _alis_abstract_address_strings(hit_abs)
+            if hit_abs:
+                entry["abstract_url"] = hit_abs.get("url")
+                entry["abstract_addresses"] = hit_addrs
+            if hit_addrs:
+                abstract_resolved += 1
+                # Compare every listed address; a multi-parcel deed conveys
+                # the subject away if ANY of its parcels is the subject.
+                # v3.23 — skip the note when classification already emitted
+                # it for this row (subject / possible-subject hits).
+                if not r.get("_class_noted"):
+                    matched = next(
+                        (a for a in hit_addrs
+                         if _alis_address_matches(st_num, st_word, a)), None)
+                    _hit_address_note(r, matched or hit_addrs[0], "registry abstract")
+            else:
+                info = _alis_get_pdf_hrefs_http(session, base_url, r["img_href"])
+                if info["pdf_hrefs"]:
+                    saved, errs = _alis_download_pdfs_http(
+                        session, base_url, info["pdf_hrefs"][:1],
+                        base_name, output_folder, label=_hit_label(r),
+                    )
+                    result["errors"] += errs
+                    if saved:
+                        entry["sample_file"] = saved[0]
+            samples.append(entry)
+        result["grantor_check"]["samples"] = samples
+        if abstract_resolved:
+            result["notes"].append(
+                f"Grantor-hit parcel check (v3.22): {abstract_resolved} of "
+                f"{len(samples)} sampled hit(s) resolved from the registry "
+                "abstract — no PDF download or model call needed."
+            )
+
+        # --- Extraction for the samples + the verified hit ---
+        need_extract = ([s for s in samples if s["sample_file"]]
+                        or (result["grantor_hit_verification"] or {}).get("files"))
+        if extract_pdf and need_extract and result.get("extraction_unavailable"):
+            # v3.28 — the API already failed in a way that will fail again;
+            # name the PDFs instead of making N more doomed calls.
+            pending = [Path(s["sample_file"]).name for s in samples if s["sample_file"]]
+            pending += [Path(f).name for f in
+                        ((result["grantor_hit_verification"] or {}).get("files") or [])]
+            result["notes"].append(
+                "READ THESE GRANTOR-HIT PDFs to answer the which-parcel "
+                "question — extraction is unavailable for the rest of this "
+                f"run ({result['extraction_unavailable']}), so these samples "
+                "were downloaded but not extracted: " + ", ".join(pending)
+            )
+        elif extract_pdf and need_extract:
+            client, reason = _anthropic_client()
+            if client is None:
+                result["notes"].append(
+                    f"Grantor-hit extraction skipped ({reason}) — Read the "
+                    "sample/verification PDFs to assess the hits."
+                )
+            else:
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    jobs = []
+                    for i, s in enumerate(samples):
+                        if s["sample_file"]:
+                            jobs.append((("sample", i), pool.submit(
+                                _extract_pdf_fields_light, client, [s["sample_file"]],
+                                _GRANTOR_HIT_SCHEMA,
+                                "This is page 1 of an instrument the seller "
+                                "(or a co-owner) executed as GRANTOR after "
+                                "acquiring the subject property. Extract the "
+                                "property address, lot/unit, and parties so "
+                                "it can be determined whether it affects the "
+                                "subject parcel.",
+                            )))
+                    ver = result["grantor_hit_verification"]
+                    if ver and ver["files"]:
+                        jobs.append((("verify", None), pool.submit(
+                            _extract_pdf_fields, client, ver["files"],
+                            _DEED_SCHEMA,
+                            "This is a suspected subsequent conveyance "
+                            "(deed-out) by the seller of the subject "
+                            "property, surfaced by a grantor-index search. "
+                            "Extract the requested fields.",
+                        )))
+                    for (kind, i), job in jobs:
+                        try:
+                            fields = job.result()
+                        except Exception as e:
+                            fields = {"error": f"{type(e).__name__}: {e}"}
+                            # v3.28 — an account/credentials failure here
+                            # (extraction was fine for the deed and died
+                            # mid-run) latches the same way.
+                            _mark_extraction_unavailable(result, e)
+                        if kind == "sample":
+                            # v3.16 — escalation: if the light model read a
+                            # street-name match without a confirmable number,
+                            # re-read with the main model before concluding
+                            # (Renwick Bk39044/162: Haiku returned 'Cloverfield
+                            # Avenue' with no number, which would have
+                            # downgraded a real deed-out of the subject).
+                            if "error" not in fields and st_num and st_word:
+                                addr = fields.get("property_address")
+                                if (not _alis_address_matches(st_num, st_word, addr)
+                                        and _alis_street_word_matches(st_word, addr)):
+                                    try:
+                                        fields = _extract_pdf_fields(
+                                            client, [samples[i]["sample_file"]],
+                                            _GRANTOR_HIT_SCHEMA,
+                                            "This is page 1 of an instrument the "
+                                            "seller executed as GRANTOR. Extract "
+                                            "the property address, lot/unit, and "
+                                            "parties. Read the STREET NUMBER "
+                                            "carefully, including margin "
+                                            "notations, stamps, and the granting "
+                                            "clause.",
+                                            model=_EXTRACT_MODEL_MAIN,
+                                        )
+                                        result["notes"].append(
+                                            f"Grantor hit "
+                                            f"{_alis_row_id(conveyance_hits[i])}: "
+                                            "street-name match without a number "
+                                            "from the light model — re-extracted "
+                                            "with the main model."
+                                        )
+                                    except Exception:
+                                        pass  # keep the light-model fields
+                            samples[i]["sample_extraction"] = fields
+                            if "error" not in fields:
+                                _hit_address_note(
+                                    conveyance_hits[i], fields.get("property_address"),
+                                    "page-1 sample")
+                        else:
+                            result["grantor_hit_verification"]["extraction"] = fields
+                            if "error" not in fields:
+                                _hit_address_note(
+                                    target_hit, fields.get("property_address"),
+                                    "full extraction via --verify-grantor-hit")
+        elif not extract_pdf and need_extract:
+            # v3.27 — name the files: in claude-code mode these are an
+            # instruction, not a warning. Only hits whose registry abstract
+            # carried no address get here (v3.22+ answers the rest).
+            result["notes"].append(
+                "READ these grantor-hit sample PDF(s) to answer the "
+                "which-parcel question (claude-code extraction mode; the "
+                "registry abstract carried no address for them): "
+                + ", ".join(
+                    Path(f).name for f in
+                    ([s["sample_file"] for s in samples if s["sample_file"]]
+                     + list((result.get("grantor_hit_verification") or {}).get("files") or []))
+                )
+            )
+    except Exception as e:
+        result["notes"].append(f"Grantor-hit sampling/verification failed (non-fatal): {e}")
+
+    result["status"] = "success" if result["files"] else "error"
+    if not result["files"] and not result["errors"]:
+        result["errors"].append("No files downloaded.")
+
+    # v3.31 — finalise timings here rather than at the return, because the
+    # report footer below reads them. Report rendering is therefore the one
+    # stage not measured; it cannot report its own duration anyway.
+    _tm.finish(result)
+    # -----------------------------------------------------------
+    # STEP 9 — MARKDOWN REPORT DRAFT (v3.16, non-fatal)
+    # -----------------------------------------------------------
+    try:
+        _write_markdown_report(
+            result, base_name, f"{seller_first} {seller_last}".strip(),
+            output_folder, show_timings=show_timings,
+        )
+    except Exception as e:
+        result["notes"].append(f"Report draft failed (non-fatal): {e}")
+    return result
+
+
+async def run_barnstable(
+    seller_last: str,
+    seller_first: str,
+    base_name: str,
+    output_folder: Path,
+    headless: bool,
+    town: str = "BARN",
+) -> dict:
+    """
+    Barnstable County Registry of Deeds — full workflow:
+    1. Grantee search (Recorded Land, then Land Court fallback)
+    2. Select best deed row
+    3. Document Image List → extract individual-page PDF hrefs
+    4. Download PDFs via page.request.get()
+    5. Grantor check (last name only, blank first — catches joint owners)
+    """
+    result = {
+        "status": "error",
+        "registry": "Barnstable County",
+        "registry_url": f"{BARNSTABLE_BASE}/ALIS/WW400R.HTM?WSIQTP=LR01D&WSKYCD=N",
+        "registry_system": "Browntech ALIS",
+        "land_court": False,
+        "book": None,
+        "page": None,
+        "ctl_num": None,
+        "certificate_of_title": None,  # Land Court only — read from the search index
+        "document_number": None,   # Land Court: from search index | Recorded Land: from PDF
+        "recorded_date": None,
+        "deed_type": None,
+        "consideration": None,     # extracted from PDF by Claude
+        "grantors": [],
+        "grantees": [],
+        "deed_property_address": None,
+        "grantor_check": {"has_subsequent_deed": False, "deeds": []},
+        "files": [],
+        "total_pages_in_deed": None,
+        "notes": [],
+        "errors": [],
+    }
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=headless)
+        context = await browser.new_context(accept_downloads=True)
+        page = await context.new_page()
+
+        try:
+            # -----------------------------------------------------------
+            # STEP 1 — GRANTEE SEARCH (Recorded Land, then Land Court fallback)
+            # -----------------------------------------------------------
+            rows = []
+            for land_court in (False, True):
+                url = _alis_url(
+                    BARNSTABLE_BASE, seller_last, seller_first, "E",
+                    town=town, land_court=land_court, doc_type="*DD",
+                )
+                result["notes"].append(
+                    f"Searching {'Land Court' if land_court else 'Recorded Land'}: {url}"
+                )
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                except Exception as e:
+                    # v3.23 — a hard-down registry (ERR_CONNECTION_REFUSED /
+                    # _RESET / _TIMED_OUT) gets the same handling as the
+                    # maintenance page: retry later, conclude nothing.
+                    if "ERR_CONNECTION" not in str(e).upper():
+                        raise
+                    result["status"] = "registry_unavailable"
+                    result["errors"].append(
+                        "REGISTRY UNAVAILABLE: connection refused/failed "
+                        "(hard-down outage). Do NOT treat as deed-not-found; "
+                        "retry later.")
+                    await browser.close()
+                    return result
+                if _alis_registry_unavailable_html(await page.content()):
+                    result["status"] = "registry_unavailable"
+                    result["errors"].append(
+                        "REGISTRY UNAVAILABLE: maintenance page detected "
+                        "(nightly backup / periodic maintenance). Do NOT "
+                        "treat as deed-not-found; retry later.")
+                    await browser.close()
+                    return result
+                rows = await _alis_parse_results(page)
+                if rows:
+                    result["land_court"] = land_court
+                    result["notes"].append(
+                        f"Found {len(rows)} result(s) in "
+                        f"{'Land Court' if land_court else 'Recorded Land'}."
+                    )
+                    break
+                result["notes"].append(
+                    f"No results in {'Land Court' if land_court else 'Recorded Land'}."
+                )
+
+            if not rows:
+                result["status"] = "deed_not_found"
+                result["notes"].append(
+                    f"No results for {seller_last}, {seller_first} as Grantee "
+                    f"in Barnstable (town={town})."
+                )
+                await browser.close()
+                return result
+
+            # -----------------------------------------------------------
+            # STEP 2 — SELECT BEST DEED ROW
+            # -----------------------------------------------------------
+            row = _alis_select_deed_row(rows)
+            if row is None:
+                result["status"] = "deed_not_found"
+                result["notes"].append("Could not select a deed row from results.")
+                await browser.close()
+                return result
+
+            result["notes"].append(
+                "All rows: " + " | ".join(
+                    f"[{_alis_row_id(r)} {r['doc_type']!r} {r['date_received']} "
+                    f"{'cert=' + repr(r['certificate']) if r.get('land_court') else 'rev=' + repr(r['reverse_party'])}]"
+                    for r in rows
+                )
+            )
+            result["notes"].append(
+                f"Selected: {row['doc_type']} {_alis_row_id(row)} {row['date_received']} | "
+                + (f"Certificate: {row['certificate']}" if row.get("land_court")
+                   else f"Grantor: {row['reverse_party']}")
+                + f" | Grantee: {row['name']} | Desc: {row['doc_desc']}"
+            )
+
+            result["book"]          = row["book"] or None
+            result["page"]          = row["page"] or None
+            result["ctl_num"]       = row["ctl_num"]
+            result["certificate_of_title"] = row["certificate"] or None
+            result["document_number"] = row["document_number"] or None
+            result["deed_type"]     = row["doc_type"]
+            result["recorded_date"] = row["date_received"]
+            # Land Court index has no opposite-party column — grantors stays
+            # empty and Claude reads them from the deed PDF.
+            result["grantors"]      = [row["reverse_party"]] if row["reverse_party"] else []
+            result["grantees"]      = [row["name"]] if row["name"] else []
+            result["deed_property_address"] = row["doc_desc"] or ""
+
+            # -----------------------------------------------------------
+            # STEP 3 — DOCUMENT IMAGE LIST → extract PDF hrefs
+            # -----------------------------------------------------------
+            img_info = await _alis_get_pdf_hrefs(page, BARNSTABLE_BASE, row["img_href"])
+            pdf_hrefs = img_info["pdf_hrefs"]
+            if not pdf_hrefs:
+                # Surface the image list URL and any hrefs we found so Claude
+                # can recover manually without re-navigating from the search.
+                result["errors"].append(
+                    f"Document Image List: no .PDF links found at {img_info['image_list_url']}"
+                )
+                result["image_list_url"] = img_info["image_list_url"]
+                result["all_pdf_hrefs_on_image_list"] = img_info["all_pdfs"]
+                await browser.close()
+                return result
+
+            if img_info["is_fallback"]:
+                result["notes"].append(
+                    "Document Image List: numbered-page pattern matched 0 links; "
+                    f"using permissive fallback — selected {len(pdf_hrefs)} .PDF "
+                    f"link(s): " + ", ".join(pdf_hrefs)
+                )
+            else:
+                result["notes"].append(
+                    f"Document Image List: {len(pdf_hrefs)} page(s) — " + ", ".join(pdf_hrefs)
+                )
+
+            result["total_pages_in_deed"] = len(pdf_hrefs)
+
+            # -----------------------------------------------------------
+            # STEP 4 — DOWNLOAD PDFs
+            # -----------------------------------------------------------
+            saved, dl_errors = await _alis_download_pdfs(
+                page, BARNSTABLE_BASE, pdf_hrefs, base_name, output_folder
+            )
+            result["files"]  = saved
+            result["errors"] += dl_errors
+            if not saved:
+                result["errors"].append("PDF download failed for all pages.")
+                result["image_list_url"] = img_info["image_list_url"]
+                result["all_pdf_hrefs_on_image_list"] = img_info["all_pdfs"]
+                await browser.close()
+                return result
+            result["notes"].append(
+                f"Downloaded {len(saved)} PDF(s): {[Path(f).name for f in saved]}"
+            )
+
+        except Exception as e:
+            result["errors"].append(f"Main workflow failed: {e}")
+            await browser.close()
+            return result
+        finally:
+            try:
+                await page.close()
+            except Exception:
+                pass
+
+        # -----------------------------------------------------------
+        # STEP 5 — GRANTOR CHECK (last name only, blank first = catches all joint owners)
+        # -----------------------------------------------------------
+        try:
+            g_page = await context.new_page()
+            _lc = result.get("land_court", False)
+            grantor_rows = await _alis_grantor_check(
+                g_page, BARNSTABLE_BASE, seller_last, town=town,
+                original_id=(result.get("document_number") if _lc
+                             else result.get("book")) or "",
+                land_court=_lc,
+            )
+            result["grantor_check"]["has_subsequent_deed"] = len(grantor_rows) > 0
+            result["grantor_check"]["deeds"] = [
+                (
+                    f"Doc#{r['document_number']} Ctf#{r['certificate']} {r['doc_type']} "
+                    f"{r['date_received']} | Desc: {r['doc_desc']} | Ctl#: {r['ctl_num']}"
+                    if r.get("land_court") else
+                    f"Bk{r['book']}/{r['page']} {r['doc_type']} {r['date_received']} "
+                    f"| Grantee: {r['reverse_party']} | Desc: {r['doc_desc']} | Ctl#: {r['ctl_num']}"
+                )
+                for r in grantor_rows
+            ]
+            if grantor_rows:
+                result["notes"].append(
+                    f"Grantor check: {len(grantor_rows)} subsequent deed(s) found — "
+                    "Claude must assess title flags."
+                )
+            else:
+                result["notes"].append(
+                    "Grantor check: no subsequent deeds found — clean title."
+                )
+            await g_page.close()
+        except Exception as e:
+            result["notes"].append(f"Grantor check failed (non-fatal): {e}")
+
+        await browser.close()
+
+    result["status"] = "success" if result["files"] else "error"
+    if not result["files"] and not result["errors"]:
+        result["errors"].append("No files downloaded.")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Norfolk County (Browntech ALIS — uses shared _alis_* helpers)
+# ---------------------------------------------------------------------------
+
+async def run_norfolk(
+    seller_last: str,
+    seller_first: str,
+    base_name: str,
+    output_folder: Path,
+    headless: bool,
+    town: str = "*ALL",
+) -> dict:
+    """
+    Norfolk County Registry of Deeds — full workflow:
+    1. Grantee search (Recorded Land, then Land Court fallback)
+    2. Select best deed row
+    3. Document Image List → extract individual-page PDF hrefs
+    4. Download PDFs via page.request.get()
+    5. Grantor check (last name only, blank first — catches joint owners)
+
+    Norfolk runs identical Browntech ALIS software to Barnstable — the entire
+    workflow body is parallel to run_barnstable() and shares the _alis_* helpers.
+    The only differences are NORFOLK_BASE as the base URL and the town code
+    convention (each Norfolk municipality has its own code; no umbrella default).
+    """
+    result = {
+        "status": "error",
+        "registry": "Norfolk County",
+        "registry_url": f"{NORFOLK_BASE}/ALIS/WW400R.HTM?WSIQTP=LR01D&WSKYCD=N",
+        "registry_system": "Browntech ALIS",
+        "land_court": False,
+        "book": None,
+        "page": None,
+        "ctl_num": None,
+        "certificate_of_title": None,  # Land Court only — read from the search index
+        "document_number": None,   # Land Court: from search index | Recorded Land: from PDF
+        "recorded_date": None,
+        "deed_type": None,
+        "consideration": None,     # extracted from PDF by Claude
+        "grantors": [],
+        "grantees": [],
+        "deed_property_address": None,
+        "grantor_check": {"has_subsequent_deed": False, "deeds": []},
+        "files": [],
+        "total_pages_in_deed": None,
+        "notes": [],
+        "errors": [],
+    }
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=headless)
+        context = await browser.new_context(accept_downloads=True)
+        page = await context.new_page()
+
+        try:
+            # -----------------------------------------------------------
+            # STEP 1 — GRANTEE SEARCH (Recorded Land, then Land Court fallback)
+            # -----------------------------------------------------------
+            rows = []
+            for land_court in (False, True):
+                url = _alis_url(
+                    NORFOLK_BASE, seller_last, seller_first, "E",
+                    town=town, land_court=land_court, doc_type="*DD",
+                )
+                result["notes"].append(
+                    f"Searching {'Land Court' if land_court else 'Recorded Land'}: {url}"
+                )
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                except Exception as e:
+                    # v3.23 — a hard-down registry (ERR_CONNECTION_REFUSED /
+                    # _RESET / _TIMED_OUT) gets the same handling as the
+                    # maintenance page: retry later, conclude nothing.
+                    if "ERR_CONNECTION" not in str(e).upper():
+                        raise
+                    result["status"] = "registry_unavailable"
+                    result["errors"].append(
+                        "REGISTRY UNAVAILABLE: connection refused/failed "
+                        "(hard-down outage). Do NOT treat as deed-not-found; "
+                        "retry later.")
+                    await browser.close()
+                    return result
+                if _alis_registry_unavailable_html(await page.content()):
+                    result["status"] = "registry_unavailable"
+                    result["errors"].append(
+                        "REGISTRY UNAVAILABLE: maintenance page detected "
+                        "(nightly backup / periodic maintenance). Do NOT "
+                        "treat as deed-not-found; retry later.")
+                    await browser.close()
+                    return result
+                rows = await _alis_parse_results(page)
+                if rows:
+                    result["land_court"] = land_court
+                    result["notes"].append(
+                        f"Found {len(rows)} result(s) in "
+                        f"{'Land Court' if land_court else 'Recorded Land'}."
+                    )
+                    break
+                result["notes"].append(
+                    f"No results in {'Land Court' if land_court else 'Recorded Land'}."
+                )
+
+            if not rows:
+                result["status"] = "deed_not_found"
+                result["notes"].append(
+                    f"No results for {seller_last}, {seller_first} as Grantee "
+                    f"in Norfolk (town={town})."
+                )
+                await browser.close()
+                return result
+
+            # -----------------------------------------------------------
+            # STEP 2 — SELECT BEST DEED ROW
+            # -----------------------------------------------------------
+            row = _alis_select_deed_row(rows)
+            if row is None:
+                result["status"] = "deed_not_found"
+                result["notes"].append("Could not select a deed row from results.")
+                await browser.close()
+                return result
+
+            result["notes"].append(
+                "All rows: " + " | ".join(
+                    f"[{_alis_row_id(r)} {r['doc_type']!r} {r['date_received']} "
+                    f"{'cert=' + repr(r['certificate']) if r.get('land_court') else 'rev=' + repr(r['reverse_party'])}]"
+                    for r in rows
+                )
+            )
+            result["notes"].append(
+                f"Selected: {row['doc_type']} {_alis_row_id(row)} {row['date_received']} | "
+                + (f"Certificate: {row['certificate']}" if row.get("land_court")
+                   else f"Grantor: {row['reverse_party']}")
+                + f" | Grantee: {row['name']} | Desc: {row['doc_desc']}"
+            )
+
+            result["book"]          = row["book"] or None
+            result["page"]          = row["page"] or None
+            result["ctl_num"]       = row["ctl_num"]
+            result["certificate_of_title"] = row["certificate"] or None
+            result["document_number"] = row["document_number"] or None
+            result["deed_type"]     = row["doc_type"]
+            result["recorded_date"] = row["date_received"]
+            # Land Court index has no opposite-party column — grantors stays
+            # empty and Claude reads them from the deed PDF.
+            result["grantors"]      = [row["reverse_party"]] if row["reverse_party"] else []
+            result["grantees"]      = [row["name"]] if row["name"] else []
+            result["deed_property_address"] = row["doc_desc"] or ""
+
+            # -----------------------------------------------------------
+            # STEP 3 — DOCUMENT IMAGE LIST → extract PDF hrefs
+            # -----------------------------------------------------------
+            img_info = await _alis_get_pdf_hrefs(page, NORFOLK_BASE, row["img_href"])
+            pdf_hrefs = img_info["pdf_hrefs"]
+            if not pdf_hrefs:
+                # Surface the image list URL and any hrefs we found so Claude
+                # can recover manually without re-navigating from the search.
+                result["errors"].append(
+                    f"Document Image List: no .PDF links found at {img_info['image_list_url']}"
+                )
+                result["image_list_url"] = img_info["image_list_url"]
+                result["all_pdf_hrefs_on_image_list"] = img_info["all_pdfs"]
+                await browser.close()
+                return result
+
+            if img_info["is_fallback"]:
+                result["notes"].append(
+                    "Document Image List: numbered-page pattern matched 0 links; "
+                    f"using permissive fallback — selected {len(pdf_hrefs)} .PDF "
+                    f"link(s): " + ", ".join(pdf_hrefs)
+                )
+            else:
+                result["notes"].append(
+                    f"Document Image List: {len(pdf_hrefs)} page(s) — " + ", ".join(pdf_hrefs)
+                )
+
+            result["total_pages_in_deed"] = len(pdf_hrefs)
+
+            # -----------------------------------------------------------
+            # STEP 4 — DOWNLOAD PDFs
+            # -----------------------------------------------------------
+            saved, dl_errors = await _alis_download_pdfs(
+                page, NORFOLK_BASE, pdf_hrefs, base_name, output_folder
+            )
+            result["files"]  = saved
+            result["errors"] += dl_errors
+            if not saved:
+                result["errors"].append("PDF download failed for all pages.")
+                result["image_list_url"] = img_info["image_list_url"]
+                result["all_pdf_hrefs_on_image_list"] = img_info["all_pdfs"]
+                await browser.close()
+                return result
+            result["notes"].append(
+                f"Downloaded {len(saved)} PDF(s): {[Path(f).name for f in saved]}"
+            )
+
+        except Exception as e:
+            result["errors"].append(f"Main workflow failed: {e}")
+            await browser.close()
+            return result
+        finally:
+            try:
+                await page.close()
+            except Exception:
+                pass
+
+        # -----------------------------------------------------------
+        # STEP 5 — GRANTOR CHECK (last name only, blank first = catches all joint owners)
+        # Norfolk's grantor check uses town=*ALL so subsequent deeds are caught even
+        # if the seller has moved to a different Norfolk municipality.
+        # -----------------------------------------------------------
+        try:
+            g_page = await context.new_page()
+            _lc = result.get("land_court", False)
+            grantor_rows = await _alis_grantor_check(
+                g_page, NORFOLK_BASE, seller_last, town="*ALL",
+                original_id=(result.get("document_number") if _lc
+                             else result.get("book")) or "",
+                land_court=_lc,
+            )
+            result["grantor_check"]["has_subsequent_deed"] = len(grantor_rows) > 0
+            result["grantor_check"]["deeds"] = [
+                (
+                    f"Doc#{r['document_number']} Ctf#{r['certificate']} {r['doc_type']} "
+                    f"{r['date_received']} | Desc: {r['doc_desc']} | Ctl#: {r['ctl_num']}"
+                    if r.get("land_court") else
+                    f"Bk{r['book']}/{r['page']} {r['doc_type']} {r['date_received']} "
+                    f"| Grantee: {r['reverse_party']} | Desc: {r['doc_desc']} | Ctl#: {r['ctl_num']}"
+                )
+                for r in grantor_rows
+            ]
+            if grantor_rows:
+                result["notes"].append(
+                    f"Grantor check: {len(grantor_rows)} subsequent deed(s) found — "
+                    "Claude must assess title flags."
+                )
+            else:
+                result["notes"].append(
+                    "Grantor check: no subsequent deeds found — clean title."
+                )
+            await g_page.close()
+        except Exception as e:
+            result["notes"].append(f"Grantor check failed (non-fatal): {e}")
+
+        await browser.close()
+
+    result["status"] = "success" if result["files"] else "error"
+    if not result["files"] and not result["errors"]:
+        result["errors"].append("No files downloaded.")
+    return result
+
+
+_PLACEHOLDER_RE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_.]*\}")
+
+
+def _unresolved_placeholders(args) -> list:
+    """
+    v3.31 — find argument values that still contain an unsubstituted
+    `${...}` placeholder.
+
+    The plugin's skill text parameterises its invocations with
+    `${user_config.output_dir}` and friends, which the plugin host
+    substitutes at enable time. When the plugin is loaded straight from a
+    directory (`claude --plugin-dir`, the documented way to develop and
+    test one) those values are NOT configured, and the placeholders reach
+    the command line as literal text.
+
+    `--output` is the dangerous one, and it fails silently without this
+    check: `Path("${user_config.output_dir}").mkdir(parents=True)` cheerfully
+    creates a directory with that literal name in the current working
+    directory and writes a client's deed PDFs into it. Nothing errors, the
+    run reports success, and the documents are somewhere nobody will look —
+    possibly inside a git repository.
+
+    So: refuse, name every offending argument, and say how to fix it. The
+    house rule is that missing information must never be read as a value,
+    and an unsubstituted placeholder is the purest form of that.
+    """
+    bad = []
+    for name, value in sorted(vars(args).items()):
+        if isinstance(value, str) and _PLACEHOLDER_RE.search(value):
+            bad.append(f"--{name.replace('_', '-')} = {value!r}")
+    return bad
+
+
+# ---------------------------------------------------------------------------
+# doctor — preflight environment check (v3.31)
+# ---------------------------------------------------------------------------
+
+_DOCTOR_PROBE_TIMEOUT = 12      # seconds per registry probe
+
+
+def _doctor_wrap(text: str, width: int = 68) -> list:
+    """Wrap a detail string so long remediation advice stays readable."""
+    lines, cur = [], ""
+    for w in text.split():
+        if len(cur) + len(w) + 1 > width:
+            lines.append(cur)
+            cur = w
+        else:
+            cur = f"{cur} {w}".strip()
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def _doctor_check_deps() -> list:
+    """
+    Report on every dependency, TIERED BY WHAT IT ACTUALLY BLOCKS.
+
+    The tiering is the point. This tool has one hard requirement —
+    requests + beautifulsoup4, which drive the pure-HTTP engine behind
+    Norfolk and Barnstable — and several that matter only if you use the
+    county or the feature that needs them. A flat "missing dependency"
+    list would send a new user to install a browser engine they may never
+    launch and, worse, imply the API key is required. It is not: in
+    claude-code extraction mode every safety check (deed selection, the
+    abstract-based wrong-parcel guard, the grantor check and its
+    classification) runs with no key at all. Reporting a supported
+    configuration as broken is a lie that costs someone an afternoon.
+
+    Returns [{name, status, detail, blocks}], status in ok|missing|note.
+    """
+    out = []
+    v = sys.version_info
+    out.append({
+        "name": f"Python {v.major}.{v.minor}.{v.micro}",
+        "status": "ok" if v >= (3, 9) else "missing",
+        "detail": "" if v >= (3, 9) else "Python 3.9 or newer is required.",
+        "blocks": "everything",
+    })
+    out.append({
+        "name": "requests + beautifulsoup4",
+        "status": "ok" if _HTTP_AVAILABLE else "missing",
+        "detail": "" if _HTTP_AVAILABLE else _HTTP_INSTALL_MSG,
+        "blocks": "everything",
+    })
+
+    pw_detail = ""
+    if _PLAYWRIGHT_AVAILABLE:
+        # Importing playwright does NOT mean a browser exists: `pip install
+        # playwright` and `playwright install chromium` are separate steps
+        # and the second is the one people skip. Checking the executable
+        # turns a mid-run launch failure into one preflight line.
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as p:
+                exe = p.chromium.executable_path
+            if exe and Path(exe).exists():
+                pw_status = "ok"
+            else:
+                pw_status = "note"
+                pw_detail = ("the playwright package is installed but its "
+                             "Chromium build is not. Run: python -m playwright "
+                             "install chromium")
+        except Exception as e:
+            pw_status = "note"
+            pw_detail = (f"playwright imported but its browser could not be "
+                         f"located ({type(e).__name__}). Run: python -m "
+                         f"playwright install chromium")
+    else:
+        pw_status = "note"
+        pw_detail = _PLAYWRIGHT_INSTALL_MSG
+    out.append({
+        "name": "playwright + chromium",
+        "status": pw_status,
+        "detail": pw_detail,
+        "blocks": "Plymouth and Middlesex South only — Norfolk and "
+                  "Barnstable never launch a browser",
+    })
+
+    client, why = _anthropic_client()
+    out.append({
+        "name": "anthropic SDK + credentials",
+        "status": "ok" if client else "note",
+        "detail": "" if client else (
+            f"{why}. This is NOT a problem. Without it the plugin runs in "
+            "claude-code extraction mode, where Claude reads the downloaded "
+            "deed PDFs in-session. The registry search, the wrong-parcel "
+            "guard and the grantor check never use the API in any mode."),
+        "blocks": "nothing — only single-shot API extraction (--extraction api)",
+    })
+
+    try:
+        import docx           # noqa: F401
+        docx_ok = True
+    except Exception:
+        docx_ok = False
+    out.append({
+        "name": "python-docx",
+        "status": "ok" if docx_ok else "note",
+        "detail": "" if docx_ok else ("not installed — --docx is skipped with a "
+                                      "note. Run: python -m pip install python-docx"),
+        "blocks": "nothing — only --docx output",
+    })
+    return out
+
+
+def _doctor_probe_registry(label: str, url: str) -> dict:
+    """
+    Probe one registry. Distinguishes three outcomes where a naive
+    reachability check sees two, and the third is the one that matters: a
+    registry serving its nightly-backup maintenance page answers HTTP 200
+    with zero result rows. This workflow treats that as
+    `registry_unavailable` precisely so it can never be read as "no deed
+    found", and doctor reports it the same way.
+    """
+    if not _HTTP_AVAILABLE:
+        return {"name": label, "status": "skip",
+                "detail": "requests/beautifulsoup4 not installed"}
+    try:
+        r = requests.get(url, timeout=_DOCTOR_PROBE_TIMEOUT,
+                         headers=_ALIS_HTTP_HEADERS)
+        body = (r.text or "")[:4000].lower()
+        if any(w in body for w in ("maintenance", "nightly backup",
+                                   "temporarily unavailable")):
+            return {"name": label, "status": "maintenance",
+                    "detail": f"HTTP {r.status_code}, but the page reads as a "
+                              "maintenance/backup window. Retry later: a run "
+                              "now aborts as registry_unavailable rather than "
+                              "reporting a missing deed."}
+        if r.status_code >= 400:
+            return {"name": label, "status": "down",
+                    "detail": f"HTTP {r.status_code}"}
+        return {"name": label, "status": "ok", "detail": f"HTTP {r.status_code}"}
+    except Exception as e:
+        return {"name": label, "status": "down",
+                "detail": f"{type(e).__name__}: {e}"}
+
+
+def _doctor_check_output_dir(path_str: str) -> dict:
+    """Is the configured output folder real and writable?"""
+    if not path_str:
+        return {"name": "output folder", "status": "skip",
+                "detail": "not checked — pass --output to include it"}
+    p = Path(path_str)
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+        probe = p / ".ma-registry-doctor-probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        return {"name": "output folder", "status": "ok", "detail": str(p)}
+    except Exception as e:
+        return {"name": "output folder", "status": "down",
+                "detail": f"{p} is not writable — {type(e).__name__}: {e}"}
+
+
+_DOCTOR_ICON = {"ok": "  OK  ", "missing": " FAIL ", "note": " note ",
+                "down": " FAIL ", "skip": " skip ", "maintenance": " note "}
+
+
+def run_doctor(output_dir: str = "", probe_network: bool = True) -> int:
+    """
+    Print the preflight report; return the process exit code — 0 when
+    everything REQUIRED is present, 1 otherwise.
+
+    Optional components print as notes and never fail the check. A
+    keyless, browser-less install is a fully supported configuration for
+    Norfolk and Barnstable, and a registry being down is not a broken
+    install either — both say so in as many words.
+    """
+    print("ma-registry doctor — preflight check\n")
+    hard_fail = False
+
+    print("Dependencies")
+    for d in _doctor_check_deps():
+        print(f"[{_DOCTOR_ICON[d['status']]}] {d['name']}")
+        for line in _doctor_wrap(d["detail"]):
+            print(f"           {line}")
+        if d["status"] != "ok":
+            print(f"           blocks: {d['blocks']}")
+        if d["status"] == "missing":
+            hard_fail = True
+
+    print("\nOutput")
+    o = _doctor_check_output_dir(output_dir)
+    print(f"[{_DOCTOR_ICON[o['status']]}] {o['name']}: {o['detail']}")
+    if o["status"] == "down":
+        hard_fail = True
+
+    if probe_network:
+        print("\nRegistries (live probe)")
+        for label, url in (("Norfolk (norfolkresearch.org)", NORFOLK_BASE),
+                           ("Barnstable (search.barnstabledeeds.org)", BARNSTABLE_BASE),
+                           ("Plymouth (titleview.org)", PLYMOUTH_SEARCH)):
+            p = _doctor_probe_registry(label, url)
+            print(f"[{_DOCTOR_ICON[p['status']]}] {p['name']} — {p['detail']}")
+            if p["status"] == "down":
+                print("           the registry is unreachable right now; that "
+                      "is not a problem with your install.")
+    else:
+        print("\nRegistries: skipped (--no-network)")
+
+    print("\n" + ("FAIL — a required component is missing (see above)."
+                  if hard_fail else
+                  "OK — ready to run. Norfolk and Barnstable need neither a "
+                  "browser nor an API key."))
+    return 1 if hard_fail else 0
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    # Declared up front: --model-main/--model-light rebind these below, and
+    # Python rejects a `global` that appears after the name is first used.
+    global _EXTRACT_MODEL_MAIN, _EXTRACT_MODEL_LIGHT
+
+    # v3.31 — `--doctor` is handled before the main parser because that
+    # parser requires --registry/--last/--first/--base-name/--output, and a
+    # preflight check that cannot run until you have a search to run is
+    # useless. Its own parser accepts the two flags it needs and ignores
+    # the rest.
+    if "--doctor" in sys.argv:
+        dp = argparse.ArgumentParser(add_help=False)
+        dp.add_argument("--doctor", action="store_true")
+        dp.add_argument("--output", default="")
+        dp.add_argument("--no-network", dest="network",
+                        action="store_false", default=True)
+        dargs, _ = dp.parse_known_args()
+        sys.exit(run_doctor(dargs.output, probe_network=dargs.network))
+
+    parser = argparse.ArgumentParser(
+        description="Playwright fast-path for Legal Description Search Workflow"
+    )
+    parser.add_argument("--doctor", action="store_true",
+                        help="v3.31: check the environment (dependencies, "
+                             "Chromium install, API credentials, output "
+                             "folder, registry reachability) and exit. Needs "
+                             "none of the search arguments; --output is "
+                             "checked when given and --no-network skips the "
+                             "live registry probes.")
+    parser.add_argument("--no-network", dest="network", action="store_false",
+                        default=True,
+                        help="With --doctor: skip the live registry probes.")
+    parser.add_argument("--registry", required=True,
+                        choices=["plymouth", "norfolk", "barnstable", "suffolk",
+                                 "middlesex-south", "middlesex_south", "middlesexsouth"])
+    parser.add_argument("--last",      required=True,  help="Seller last name")
+    parser.add_argument("--first",     required=True,
+                        help="Seller first name (compound names without spaces, e.g. JEANMARIE)")
+    parser.add_argument("--base-name", required=True,
+                        help="Base filename for images, e.g. '62 Halyard Way Plymouth - Donnelly'")
+    parser.add_argument("--output",    required=True,  help="Output folder path")
+    parser.add_argument("--town",       default="",
+                        help="Town name or registry abbreviation for result filtering. "
+                             "Plymouth: e.g. 'Scituate' or 'SCIT'. "
+                             "Barnstable: town name (e.g. 'Dennis') or ALIS code (e.g. DENN, FALM, YARM). "
+                             "If omitted, auto-derived from --base-name; falls back to BARN if unrecognized. "
+                             "Norfolk: town name (e.g. 'Braintree') or ALIS code "
+                             "(e.g. BRAI, QUIN, WEYM). If omitted, auto-derived from "
+                             "--base-name; falls back to *ALL if unrecognized.")
+    parser.add_argument("--headed", dest="headless", action="store_false", default=True,
+                        help="Run with a visible browser window (default: headless — "
+                             "pass --headed to watch the browser for debugging)")
+    parser.add_argument("--street-number", default="",
+                        help="Property street number for Plymouth address-search fallback "
+                             "(auto-parsed from --base-name first numeric token if omitted)")
+    parser.add_argument("--street", default="",
+                        help="Property street name (first word recommended) for Plymouth "
+                             "address-search fallback (auto-parsed from --base-name second "
+                             "token if omitted)")
+    parser.add_argument("--force-address-search", action="store_true",
+                        help="Plymouth only: skip grantee name search entirely and go "
+                             "directly to property address search. Requires --street-number "
+                             "and --street (or a parseable --base-name).")
+    parser.add_argument("--engine", choices=["auto", "http", "playwright"],
+                        default="auto",
+                        help="Norfolk/Barnstable only. 'http' = pure-HTTP engine "
+                             "(requests+bs4, seconds instead of minutes); 'playwright' = "
+                             "browser engine; 'auto' (default) = HTTP with automatic "
+                             "Playwright fallback on hard HTTP failure.")
+    parser.add_argument("--book", default="",
+                        help="Norfolk/Barnstable HTTP engine only: target a specific "
+                             "instrument instead of the most-recent heuristic — book "
+                             "number (Recorded Land) or document number (Land Court). "
+                             "Use after a multiple_deed_candidates result identified "
+                             "the correct deed.")
+    parser.add_argument("--page", default="",
+                        help="Page number to pair with --book (Recorded Land only).")
+    parser.add_argument("--verify-grantor-hit", default="",
+                        help="Norfolk/Barnstable HTTP engine only: fully download "
+                             "and extract ONE grantor-check hit to confirm a "
+                             "suspected deed-out — 'BOOK/PAGE' (Recorded Land) or "
+                             "document number (Land Court). The hit must appear in "
+                             "the grantor check's results. Result lands in the "
+                             "grantor_hit_verification JSON field. Combine with "
+                             "--book/--page to keep the main deed selection pinned.")
+    parser.add_argument("--no-timings", dest="timings", action="store_false",
+                        default=True,
+                        help="v3.31: omit the per-stage timing footer from the "
+                             "report draft. Timings are always recorded in the "
+                             "result JSON (they cost one clock read per stage "
+                             "and are what diagnosed the grantor check as 85%% "
+                             "of a slow run); this only controls the report.")
+    parser.add_argument("--extraction", choices=("auto", "api", "claude-code"),
+                        default="auto",
+                        help="v3.27, Norfolk/Barnstable HTTP engine: how the deed "
+                             "PDFs get read. 'auto' (default) uses the Claude API "
+                             "when ANTHROPIC_API_KEY and the anthropic SDK are "
+                             "available and otherwise runs in claude-code mode; "
+                             "'api' forces the API and errors out clearly if it is "
+                             "unavailable; 'claude-code' skips the API entirely and "
+                             "has Claude read the downloaded PDFs. The registry "
+                             "search, the abstract-based wrong-parcel guard, the "
+                             "grantor check and its classification need no API in "
+                             "any mode.")
+    parser.add_argument("--no-extract-pdf-text", dest="extract_pdf",
+                        action="store_false", default=True,
+                        help="Deprecated alias for --extraction claude-code "
+                             "(kept so existing invocations keep working).")
+    parser.add_argument("--model-main", default=_EXTRACT_MODEL_MAIN,
+                        help="Model for the main deed extraction and "
+                             "--verify-grantor-hit (default: %(default)s). Also "
+                             "settable via MA_REGISTRY_MODEL_MAIN.")
+    parser.add_argument("--model-light", default=_EXTRACT_MODEL_LIGHT,
+                        help="Model for page-1 sample extractions (default: "
+                             "%(default)s). Also settable via "
+                             "MA_REGISTRY_MODEL_LIGHT.")
+    parser.add_argument("--copy", action="store_true",
+                        help="v3.19: on success, copy the paste-ready legal "
+                             "description to the system clipboard "
+                             "(Set-Clipboard / pbcopy / xclip — no extra "
+                             "dependency; failure is a note, never an error).")
+    parser.add_argument("--docx", action="store_true",
+                        help="v3.19: also write the legal description as a "
+                             ".docx (requires python-docx; skipped with a "
+                             "note if unavailable).")
+    parser.add_argument("--deliver-text-file", default="",
+                        help="v3.27, claude-code extraction mode: path to a "
+                             "UTF-8 text file holding the legal description "
+                             "Claude transcribed from the deed PDFs. The "
+                             "script re-enters delivery with it, so a no-API "
+                             "run still gets the same three-form .txt "
+                             "(plus --copy / --docx) as an API run instead of "
+                             "the description being hand-assembled. Combine "
+                             "with the same --base-name/--output as the "
+                             "original run. Nothing else is re-fetched.")
+    args = parser.parse_args()
+
+    # CLI flags win over the environment, which wins over the built-in
+    # defaults. Rebinding the module globals keeps every existing call site
+    # (which reads these names directly) working unchanged. See the `global`
+    # declaration at the top of main().
+    _EXTRACT_MODEL_MAIN = args.model_main
+    _EXTRACT_MODEL_LIGHT = args.model_light
+
+    # v3.31 — refuse unsubstituted `${user_config.*}` placeholders before
+    # anything is created on disk. See _unresolved_placeholders.
+    _placeholders = _unresolved_placeholders(args)
+    if _placeholders:
+        print(json.dumps({
+            "status": "error",
+            "notes": [],
+            "errors": [
+                "Unsubstituted plugin configuration placeholder(s) reached the "
+                "command line: " + "; ".join(_placeholders) + ". No search was "
+                "performed and nothing was written. This happens when the "
+                "plugin is loaded with `claude --plugin-dir` (or otherwise "
+                "without its configuration), so ${user_config.*} values were "
+                "never filled in. Fix: pass real values on the command line — "
+                "in particular --output must be an actual folder path, or the "
+                "run would have created a directory literally named "
+                "'${user_config.output_dir}' and written client documents "
+                "into it."
+            ],
+        }, indent=2))
+        sys.exit(1)
+
+    output_folder = Path(args.output)
+    output_folder.mkdir(parents=True, exist_ok=True)
+
+    # v3.27 — resolve the extraction mode once, before any network work, so
+    # `--extraction api` with no key fails immediately instead of after a
+    # full search. The deprecated --no-extract-pdf-text forces claude-code.
+    _requested = "claude-code" if not args.extract_pdf else args.extraction
+    extract_pdf, extraction_mode, _mode_note, _mode_err = \
+        _resolve_extraction_mode(_requested)
+    if _mode_err:
+        # Print + exit, do NOT `return` — main() returns None and the
+        # JSON is printed at the bottom, so a bare return would exit 0
+        # with no output at all.
+        print(json.dumps({"status": "error",
+                          "extraction_mode": args.extraction,
+                          "notes": [], "errors": [_mode_err]}, indent=2))
+        sys.exit(1)
+    if not args.extract_pdf and args.extraction == "api":
+        _mode_note = ((_mode_note or "") + " NOTE: --no-extract-pdf-text "
+                      "(deprecated) overrode --extraction api.").strip()
+
+    def _run_alis_registry(label: str, base_url: str, town: str,
+                           grantor_town: str, pw_runner) -> dict:
+        """
+        Engine dispatch for the ALIS registries: HTTP first (v3.9 default),
+        Playwright on request or as automatic fallback when the HTTP engine
+        errors out (network failure, WAF, markup change).
+        """
+        want_http = args.engine in ("auto", "http")
+        if want_http and not _HTTP_AVAILABLE and args.engine == "http":
+            return {"status": "error", "notes": [], "errors": [_HTTP_INSTALL_MSG]}
+
+        if want_http and _HTTP_AVAILABLE:
+            try:
+                result = run_alis_http(
+                    label, base_url, args.last, args.first, args.base_name,
+                    output_folder, town=town, grantor_town=grantor_town,
+                    target_book=args.book, target_page=args.page,
+                    extract_pdf=extract_pdf, extraction_mode=extraction_mode,
+                    verify_grantor_hit=args.verify_grantor_hit,
+                    show_timings=args.timings,
+                )
+                if _mode_note:
+                    result.setdefault("notes", []).insert(0, _mode_note)
+            except AlisRegistryUnavailableError as e:
+                # No Playwright fallback: the browser would load the same
+                # maintenance page and parse it as zero rows — a false
+                # deed_not_found. Exit 1, retry the whole run later.
+                return {"status": "registry_unavailable", "engine": "http",
+                        "notes": [
+                            "REGISTRY UNAVAILABLE: the registry is serving its "
+                            "maintenance page (nightly backup / periodic "
+                            "maintenance). No search was performed — do NOT "
+                            "treat this as deed-not-found. Retry when the "
+                            "registry is back online."],
+                        "errors": [str(e)]}
+            except Exception as e:
+                result = {"status": "error", "engine": "http",
+                          "notes": [], "errors": [f"HTTP engine failed: {e}"]}
+            if args.engine == "http" or result.get("status") in ("success", "deed_not_found"):
+                return result
+            http_errors = "; ".join(result.get("errors") or []) or "unknown error"
+        else:
+            http_errors = "" if args.engine == "playwright" else _HTTP_INSTALL_MSG
+
+        # Playwright path (requested, or auto-fallback).
+        if not _PLAYWRIGHT_AVAILABLE:
+            return {"status": "error", "notes": [],
+                    "errors": [f"HTTP engine unavailable/failed ({http_errors}) "
+                               f"and {_PLAYWRIGHT_INSTALL_MSG}"]}
+        if args.book:
+            print(f"WARNING: --book/--page targeting is HTTP-engine only; "
+                  f"the Playwright engine uses the most-recent heuristic.",
+                  file=sys.stderr)
+        if args.verify_grantor_hit:
+            print(f"WARNING: --verify-grantor-hit is HTTP-engine only; "
+                  f"the Playwright engine ignores it.",
+                  file=sys.stderr)
+        pw_result = asyncio.run(pw_runner(
+            args.last, args.first, args.base_name, output_folder,
+            args.headless, town=town,
+        ))
+        pw_result["engine"] = "playwright"
+        if http_errors:
+            pw_result.setdefault("notes", []).insert(
+                0, f"HTTP engine failed ({http_errors}) — fell back to Playwright.")
+        return pw_result
+
+    if args.registry in ("plymouth", "middlesex-south", "middlesex_south",
+                         "middlesexsouth", "suffolk") and not _PLAYWRIGHT_AVAILABLE:
+        print(json.dumps({"status": "error",
+                          "error_message": _PLAYWRIGHT_INSTALL_MSG}))
+        sys.exit(1)
+
+    if args.registry == "plymouth":
+        sn = args.street_number
+        st = args.street
+        if not sn or not st:
+            sn_auto, st_auto = _parse_street_from_base_name(args.base_name)
+            if not sn:
+                sn = sn_auto
+            if not st:
+                st = st_auto
+        # Auto-detect town from base_name if --town not provided (v2.7)
+        resolved_town = args.town or _parse_town_from_base_name(args.base_name)
+        result = asyncio.run(
+            run_plymouth(
+                args.last, args.first, args.base_name, output_folder,
+                args.headless, town=resolved_town,
+                street_number=sn, street_name=st,
+                force_address_search=args.force_address_search,
+            )
+        )
+    elif args.registry == "barnstable":
+        barnstable_town, barnstable_notes = _barnstable_resolve_town(args.town, args.base_name)
+        result = _run_alis_registry(
+            "Barnstable County", BARNSTABLE_BASE,
+            town=barnstable_town, grantor_town=barnstable_town,
+            pw_runner=run_barnstable,
+        )
+        if barnstable_notes:
+            result.setdefault("notes", []).extend(barnstable_notes)
+    elif args.registry == "norfolk":
+        # Resolve --town: accepts town name ('Braintree'), ALIS code ('BRAI'),
+        # or empty (auto-derive from base_name). Returns *ALL on unknown town.
+        # Norfolk's grantor check always uses *ALL so subsequent deeds are
+        # caught even if the seller moved to a different Norfolk municipality.
+        norfolk_town, norfolk_notes = _norfolk_resolve_town(args.town, args.base_name)
+        result = _run_alis_registry(
+            "Norfolk County", NORFOLK_BASE,
+            town=norfolk_town, grantor_town="*ALL",
+            pw_runner=run_norfolk,
+        )
+        # Surface town-resolution notes in the result so the user sees them
+        if norfolk_notes:
+            result.setdefault("notes", [])
+            for n in norfolk_notes:
+                result["notes"].insert(0, n)
+    elif args.registry in ("middlesex-south", "middlesex_south", "middlesexsouth"):
+        sn = args.street_number
+        st = args.street
+        if not sn or not st:
+            sn_auto, st_auto = _parse_street_from_base_name(args.base_name)
+            sn = sn or sn_auto
+            st = st or st_auto
+        result = asyncio.run(
+            run_middlesex_south(
+                args.last, args.first, args.base_name, output_folder,
+                args.headless, street_number=sn, street_name=st,
+            )
+        )
+    else:
+        result = asyncio.run(run_stub(args.registry))
+
+    # -----------------------------------------------------------
+    # STEP 7 DELIVERY (v3.19, non-fatal) — runs for every registry
+    # v3.27: --deliver-text-file lets a claude-code-mode run come back for
+    # delivery once Claude has read the deed PDFs. Delivery only fires on a
+    # populated legal_description, so without this a no-API run would have
+    # to hand-assemble the three paste forms.
+    # -----------------------------------------------------------
+    if args.deliver_text_file:
+        try:
+            _supplied = Path(args.deliver_text_file).read_text(encoding="utf-8").strip()
+            if not _supplied:
+                result.setdefault("notes", []).append(
+                    f"--deliver-text-file {args.deliver_text_file!r} is empty "
+                    "— nothing delivered.")
+            else:
+                result["legal_description"] = _supplied
+                # Delivery is gated on status == "success"; a claude-code run
+                # that found and downloaded its deed qualifies.
+                if result.get("status") != "success" and result.get("files"):
+                    result["status"] = "success"
+                result.setdefault("notes", []).append(
+                    f"Legal description supplied via --deliver-text-file "
+                    f"({len(_supplied)} chars, read from "
+                    f"{Path(args.deliver_text_file).name}) — delivering the "
+                    "paste-ready forms from it. NOTE: this text was NOT read "
+                    "off the deed by this script; whoever supplied it owns "
+                    "its accuracy against the recorded instrument."
+                )
+        except Exception as e:
+            result.setdefault("notes", []).append(
+                f"--deliver-text-file could not be read (non-fatal): {e}")
+    try:
+        _deliver_legal_description(
+            result, args.base_name, output_folder,
+            copy_to_clipboard=args.copy, write_docx=args.docx,
+        )
+    except Exception as e:
+        result.setdefault("notes", []).append(
+            f"Legal-description delivery failed (non-fatal): {e}")
+
+    # v3.30 (item 9b) — write the result beside the PDFs BEFORE printing, so
+    # an unredirected run (or one whose stdout tail is truncated by the
+    # caller) no longer loses needs_review/book/page to the terminal.
+    _write_result_json(result, args.base_name, output_folder)
+    print(json.dumps(result, indent=2))
+
+    status = result.get("status")
+    sys.exit(0 if status == "success" else 2 if status == "deed_not_found" else 1)
+
+
+if __name__ == "__main__":
+    main()
