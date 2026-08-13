@@ -621,241 +621,60 @@ Logging is optional — skip this step entirely if it isn't wanted.
 
 ## TECHNICAL NOTES BY REGISTRY
 
-### Plymouth County — titleview.org/plymouthdeeds/
-
-**System:** Avenu/20-20 Perfect Vision Land Records I2 (ASP.NET `__doPostBack`)
-
-**Name format:** Last name first, no comma, no space between compound first name parts.
-- Example: `DONNELLY JEANMARIE`
-
-**Form field IDs:**
-- Last name: `SearchFormEx1_ACSTextBox_LastName1`
-- First name: `SearchFormEx1_ACSTextBox_FirstName1`
-- Party type (SELECT): `SearchFormEx1_ACSRadioButtonList_PartyType1` — values: `""` = Both, `"D"` = Grantor, `"I"` = Grantee
-- Search button: `SearchFormEx1_btnSearch`
-
-**Image viewer:** Opens as a **popup window** (`ImageViewerEx.aspx`). The popup is frequently blocked by Chrome and lands in a separate browser window outside the MCP tab group.
-
-**Popup workaround — two options (use Option A first):**
-
-Option A — Navigate directly (Plymouth County only): After clicking View Images, simply navigate your current tab to `https://titleview.org/plymouthdeeds/ImageViewerEx.aspx`. No parameters needed — the server session holds the document context. The image viewer will load with the correct deed.
-
-Option B — Monkey-patch `window.open` (general, works for any registry): Inject this JS *before* clicking View Images, then read the captured URL after:
-```javascript
-window._popupUrl = null;
-const _origOpen = window.open;
-window.open = function(url, name, features) {
-  window._popupUrl = url;
-  return _origOpen.call(this, url, name, features);
-};
-```
-After clicking View Images: `window._popupUrl` contains the exact URL. Navigate your tab there.
-
-**Image viewer elements (once loaded in any tab):**
-- Deed image element: `ImageViewer1_docImage` (NOT `ImageViewer1_WaterMarkImage`)
-- Page nav buttons: `ImageViewer1_BtnNext`, `ImageViewer1_BtnPrevious`, `ImageViewer1_BtnFirst`, `ImageViewer1_BtnLast`
-- Page label: `ImageViewer1_lblPageNum`
-
-**Capturing images:** Use canvas API — `ctx.drawImage(img, 0, 0)` on `ImageViewer1_docImage`. Store in `window._deedDataUrl_pN`.
-
-**Download limitation:** Chrome blocks bulk blob/data-URL downloads after the first per tab session.
-- Page 1: trigger direct download, move to output folder via Bash
-- Page 2+: store in `localStorage`, create a new tab, navigate to same origin, read and download from new tab, then `localStorage.removeItem(key)`
-
-**Document types seen:** `UNIT DEE` = Condo Unit Deed, `TR CRTF` = Trustee's Certificate, `DCLN HMS` = Declaration of Homestead, `MLC` = Mechanics Lien Certificate, `TAX LIEN` = Massachusetts tax lien (often "SEEBK" — attaches to all real property), `PR` = Probate-related instrument
-
-**Multi-property sellers (v2.7):** When a seller owns multiple Plymouth County properties, the grantee name search returns results for all of them. The v2.7 script handles this automatically via Python date sort + town-aware selection + address-search retry. If the script's JSON shows `"deed_property_address"` for the wrong town and `"found_via_address_search": false`, the town filter found no match and fell through to the most recent deed regardless of town — read the deed image to confirm before proceeding. The `notes` array will contain a `"WARNING: no name-search result matched town"` entry in this case.
-
-**Non-monotonic book numbers:** Plymouth County's digitized old records can have book numbers that don't increase monotonically with date (e.g. a 1978 deed at Bk32450, a 2002 deed at Bk22572). The v2.7 Python date sort handles this correctly; the prior browser-side book-number sort validation (v2.6 and earlier) was unreliable in this scenario. **v3.13:** the same broken proxy was still being used to validate the *Rec Date sort direction* (`ctl02 book < ctl03 book` ⇒ "still ascending") — it is now validated by reading the Rec Date column itself.
-
-**Results grid pagination (v3.13) — registry mechanics:**
-- Default page size is **20 rows/page**. Page-size controls are `__doPostBack` targets: `DocList1$PageView2Btn` (20), `DocList1$PageView5Btn` (50), `DocList1$PageView100Btn` (100). The anchor for the *active* size loses its `href`, which makes "already at 100" easy to detect.
-- The pager is **not** a standard ASP.NET `Page$N` GridView pager. It is a single **`DocList1$LinkButtonNext`** (plus `DocList1$LinkButtonPrev`). On the last page the **Next link is absent** and Previous appears — that is the termination signal.
-- The site caps results at **1000 rows** ("Your search results have been limited to the first 1000 records"), i.e. 10 pages at 100/page. **The cap is server-side and applied BEFORE the Rec Date sort**, so a capped set is the *oldest* 1000 rows, not the newest — and page 10 has no Next link, making a truncated walk indistinguishable from a complete one by pager signals alone. Detected since v3.18 via `results_truncated_at_cap` (see 4f above).
-- **Every one of these controls is an UpdatePanel postback, and the OLD grid stays in the DOM until the re-render lands.** Waiting on `wait_for_selector('ctl02 …')` or `networkidle` returns immediately against the stale grid — the cause of several silent wrong-data bugs. Wait for the rendered row content to actually change instead.
-- **Order matters: set the page size BEFORE sorting.** The 100/Page postback re-renders from the default index order and discards the Rec Date sort.
-- `ctl` numbers are unique only **within** a pager page. After walking pages the grid is parked on the last one, so a row read from page 1 must be re-located (and its ctl re-derived by book/doc identity) before its Book link can be clicked — otherwise the click opens a different deed.
-
-**Town abbreviations (v2.9):** Plymouth County's grid uses short abbreviations that mostly match via substring check. Known non-substring cases in `_PLYMOUTH_TOWN_ABBREVS`: `HLFX` (Halifax), `DXBY` (Duxbury), `HNGHM` (Hingham), `PLMTH` (Plymouth), `CRVR` (Carver — confirmed 2026-05-14 from failed run), `KGSTN` (Kingston — confirmed 2026-06-19), `MSHFD` (Marshfield — confirmed 2026-07-08, KDM Realty Corp run). As of v2.9, an unrecognized abbreviation only matters for sellers with multiple Plymouth County properties (multi-result name search). Single-result runs: script accepts any abbreviation and logs a `NOTE` — add the entry to the dict when you see one. Multi-result runs: a `WARNING` appears and the address-search retry fires; add the entry to fix it permanently.
-
----
-
-### Suffolk County — masslandrecords.com/suffolk/D/Default.aspx
-
-**System:** Avenu/20-20 Perfect Vision Land Records I2 (ASP.NET) — **identical field IDs to Plymouth County**
-
-**Name format:** Same as Plymouth County — last name first in `ACSTextBox_LastName1`, first name in `ACSTextBox_FirstName1`, no special formatting needed.
-
-**Form field IDs:** Same as Plymouth County (see above).
-
-**Image viewer:** Loads **inline** on the page (popup viewer checkbox is unchecked by default). Same `ImageViewer1_docImage` element. `OpenImageViewer()` calls `__doPostBack('ButOpenImageViewer','')`.
-
-**Popup blocker:** The site may show a popup-blocker notification on first use. The user must allow popups for `masslandrecords.com` in Chrome settings before the image viewer will load.
-
-**Image resolution:** Native deed images are served at ~217×281 px (low resolution). Scale up 3× via canvas for usability. Some text (e.g., Master Deed page numbers) may not be clearly legible.
-
-**Renderer freezes:** The renderer frequently becomes unresponsive while loading deed images — screenshot calls will time out. Wait 8–10 seconds and retry. JavaScript calls typically succeed even when screenshots fail; use JS to check page state and capture images.
-
-**Download method:** Same Chrome bulk-download limitation as Plymouth County. Use localStorage + fresh tab for pages 2 and 3.
-
-**Recording cover sheet:** Page 1 is always a Suffolk County recording cover sheet ("Electronically Recorded Document — This is the first page of the document. Do not remove"). The deed content begins on page 2.
-
----
-
-### Middlesex South District — masslandrecords.com/MiddlesexSouth/D/Default.aspx
-
-**System:** Avenu/20-20 Perfect Vision Land Records I2 (ASP.NET) — same platform as Plymouth/Suffolk but hosted on masslandrecords.com behind **Incapsula (Imperva) bot protection**.
-
-**Playwright fast path (v3.8):** Supported by `legal_desc_fetch.py --registry middlesex-south` — see Step 1B. First live-validated 2026-07-09 (Trevisan test case, Medford). The notes below matter mainly for manual fallback or debugging.
-
-**Incapsula WAF (critical):** Headless browsers of any flavor get HTTP 403 on the search POST (initial GET returns 200, so the form *looks* reachable — the failure mode is a silently empty page after clicking Search, with no error text). Headful real Chrome passes. The script forces `headless=False, channel="chrome"`; for manual browser work, the user's normal Chrome session works fine.
-
-**Name search:** Separate `SearchFormEx1_ACSTextBox_LastName1` / `_FirstName1` / `_Middle1` fields — do NOT concatenate Plymouth-style. Prefix matching on both fields (searching first name `ROBERT` matches `CLAUDIA`). Party type select identical to Plymouth (`""`/`D`/`I`). A hidden advanced area has `ACSDropDownList_Towns` (server-side town filter, numeric values, e.g. 120=CAMBRIDGE, 115=NEWTON, 103=FRAMINGHAM) and a Compressed/Like search-mode radio — not used by the fast path yet.
-
-**Results grid columns:** `Type` (terse, e.g. GT) | `Name/ Corporation` | `Book` | `Page` | `Type Desc.` (spelled out — DEED/MORTGAGE/DISCHARGE) | `File Date` | `Street #` (full street: "10 ASHGROVE PL") | `Property Descr`. **No Town, Doc #, or Reverse Party columns.** No `Sort$Rec Date` header — selection relies on the script's Python date sort.
-
-**Detail panel:** Header table: Doc. # | File Date | Rec Time | Type Desc. | # of Pgs. | Book/Page | Consideration | Doc. Status. Grantor/Grantee list uses the same `DocDetails1$GridView_GrantorGrantee` markup as Plymouth. Also shows a **References** cross-ref list (discharges, death certificates, related same-day deeds) — high-value for title flags; the script surfaces it in `notes`. Beware: the panel's Rec Time value (e.g. `10:38:19.043`) defeats naive consideration regexes — parse the table structurally (innermost table wins; outer wrapper tables report the whole header as one cell).
-
-**Image viewer:** View Images tab → navigate directly to `https://www.masslandrecords.com/MiddlesexSouth/D/ImageViewerEx.aspx` (Plymouth Option A works — session holds document context). Same `ImageViewer1_docImage` / `BtnNext` / `lblPageNum` elements. **Hi-res trick:** the img src is an `ACSResource.axd` URL whose `CNTWIDTH`/`CNTHEIGHT`/`ZOOM` params control server-side render size; rewriting `CNTHEIGHT=2000` returns a fully legible ~2000px scan (verified on a 1969 typewritten deed) instead of the ~682px container-sized default. This likely works on Suffolk too (same platform) — untested there.
-
-**Old records (~pre-1986):** Consideration blank in the index (read the excise stamp on the deed image); Doc # may be synthetic — cite Bk/Pg. References list still populated and reliable.
-
-**Registered Land:** Not searched by the fast path. Middlesex South Land Court records need a manual search (navigator menu on the left of the search page switches record types) — document the flow on first live Registered Land run.
-
----
-
-### Norfolk County — norfolkresearch.org
-
-**System:** Browntech ALIS
-
-**Playwright fast path (v3.0+):** Norfolk is supported by `legal_desc_fetch.py` — see Step 1B. Use the fast path first; only fall back to the manual notes below if the script returns exit 2 (deed not found) or exit 1 (script error). The fast path uses the same shared `_alis_*` helpers as Barnstable (Norfolk and Barnstable run identical Browntech ALIS software).
-
-**Town codes:** Each Norfolk municipality has its own ALIS code (unlike Barnstable's BARN which covers all villages). Full list enumerated 2026-05-16 from the `W9TOWN` dropdown on the LC01D form — codes appear to be shared between Recorded and Land Court forms (✓ = confirmed on a live Recorded Land run):
-
-| Code | Municipality | Code | Municipality |
-|---|---|---|---|
-| `AVON` | Avon | `NORF` | Norfolk |
-| `BELL` | Bellingham | `NRWD` | Norwood |
-| `BRAI` | Braintree ✓ | `PLNV` | Plainville |
-| `BRKL` | Brookline | `QUIN` | Quincy ✓ |
-| `CANT` | Canton | `RAND` | Randolph |
-| `COHS` | Cohasset | `ROXB` | Roxbury |
-| `DEDH` | Dedham | `SHRN` | Sharon |
-| `DORC` | Dorchester | `STOU` | Stoughton |
-| `DOVE` | Dover | `WALP` | Walpole |
-| `FOXB` | Foxborough ✓ | `WELL` | Wellesley |
-| `FRKL` | Franklin | `WROX` | West Roxbury |
-| `HLBK` | Holbrook | `WSTD` | Westwood |
-| `HYDE` | Hyde Park | | |
-| `MEDF` | Medfield | `WREN` | Wrentham |
-| `MDWY` | Medway | `WEYM` | Weymouth ✓ |
-| `MILS` | Millis | | |
-| `MLTN` | Milton | | |
-| `NDHM` | Needham | | |
-
-Weymouth: **`WEYM` confirmed live 2026-07-09** (Renwick run — `WEYB` returns zero rows *silently*, no error message). The script's `_NORFOLK_TOWN_CODES` already maps WEYMOUTH→WEYM; do not pass `WEYB`.
-
-For any unlisted municipality, pass the ALIS code directly via `--town` and the script will use it as-is, or pass the town name and the script will fall back to `*ALL` with a NOTE.
-
-**Recorded Land search URL:** `https://www.norfolkresearch.org/ALIS/WW400R.HTM?WSIQTP=LR01D&WSKYCD=N`
-
-**Recorded Land form fields:**
-- `W9SNM` — Last Name
-- `W9GNM` — First Name
-- `W9IXTP` — Party type: `A` = All, `R` = Grantors, `E` = Grantees
-- `W9ABR` — Doc type: `*ALL` = all, `*DD` = deed group
-- `W9TOWN` — Town code (see table above)
-- `W9INQ` — Date range: `AY` = All Years
-
-**Land Court search URL:** `https://www.norfolkresearch.org/ALIS/WW400R.HTM?WSIQTP=LC01D&WSKYCD=N`
-
-**Land Court form fields (different from Recorded Land — use these field names for LC searches):**
-- `W9SN8` — Last Name
-- `W9GN8` — First Name
-- `W9IXTP` — Party type: same values as Recorded Land
-- `W9ABR` — Doc type: same values
-- `W9TOWN` — Town code: same codes as Recorded Land
-- Results page hidden fields: `WSHTNM=WW401L00`, `WSIQTP=LC01LP`
-
-**Land Court direct search URL (name search):**
-```
-https://www.norfolkresearch.org/ALIS/WW400R.HTM?W9SN8=[LAST]&W9GN8=[FIRST]&W9IXTP=E&W9ABR=*ALL&W9TOWN=[TOWN]&W9FDTA=&W9TDTA=&WSHTNM=WW401L00&WSIQTP=LC01LP&WSKYCD=N&WSWVER=2
-```
-
-**Image viewer:** NOT a popup. Navigates to Document Image List page with links to individual page PDFs:
-- Individual pages: prefix varies by recording batch — do NOT hardcode. Always read the actual href values from the Document Image List page links before fetching (e.g., `/WwwImg/DB3R0001.PDF`, `/WwwImg/DB3R0002.PDF` — prefix `DB3R` seen in February 2020 recording). The pattern is `[PREFIX]0001.PDF`, `[PREFIX]0002.PDF`, etc.
-- **Exception — short/non-standard filenames:** Some deeds (observed on a 1988 Foxborough deed, Bk7906/Pg271) use a short filename with no page-number suffix (e.g., `/WwwImg/D1UJ.PDF`). The entire deed is in a single file with no `0001` suffix. **v3.1+ handles this automatically** via the permissive fallback in `_alis_get_pdf_hrefs` — when the `[PREFIX]NNNN.PDF` pattern matches 0 links, the script downloads any `.PDF` link found on the Document Image List page. The `notes` array confirms when the fallback fires. It is still unknown whether this naming applies broadly to older Norfolk deeds or is isolated to certain recording batches — note occurrences as discovered. If even the fallback fails, the JSON includes `image_list_url` and `all_pdf_hrefs_on_image_list` so Claude can recover by fetching directly.
-- PDFs are image-based (no text layer); open in Chrome Acrobat extension which blocks automation tools
-
-**USE the abstract page for the property address (v3.22) — this guidance was previously the opposite:** The Document Abstract page (`WSIQTP=LR09A`, `WSKYCD=B`, keyed by recording date + control number) carries a **`Town:` / `Addr:` field giving the property address as plain text**, which the results grid does not (its Document Desc is often just `SEE RECORD` or `LOT N`). The old rule here said to skip this page because Bk/Pg, date, parties and page count are available elsewhere — an enumeration that missed the address, the one field that answers the wrong-parcel question. The script now fetches it automatically for the selected row, every candidate, and every sampled grantor hit, and only falls back to downloading a page-1 PDF when `Addr:` is blank. Doing this by hand in a manual run is one navigation, and it is cheaper and more reliable than reading a scan: it is structured index data, so it has no null-address failure mode on deeds whose first page only says "SEE ATTACHED FULL LEGAL" (Keegan Bk 15978/412 — the v3.20 defect). The abstract also gives `Doc$` consideration, page count, full grantor/grantee lists, and `Ref By:` / `Refers to Book:` cross-references to later homesteads, discharges and deeds. **Caveats:** `Addr:` is frequently absent (an absent address means UNVERIFIED, never "a different parcel"); a multi-parcel deed lists several `Town:`/`Addr:` pairs and any of them may be the subject; some entries carry a street name with no number, which is the "possible subject" tier, not a dismissal; and it is staff-typed index data, so the deed image remains authoritative for the legal description itself. Land Court abstracts use the same date+ctl keying with `WSIQTP=LC09A&WSKYCD=D` (v3.25) — own label vocabulary (`Address:`/`Descr:`/`Grantor:`/`Grantee:`/`Consideration:`/`Ctf#:`, with `Address:` PRECEDING `Town:`), plus `Parent doc:`/`Related doc:` chain cross-refs.
-
-**Capturing images — preferred method (fetch-download + Read tool):**
-1. Stay on Document Image List page. Read the actual PDF hrefs from the page links, then fetch each page using the correct prefix. For each page PDF, download it to the output folder via browser JS:
-```javascript
-fetch('/WwwImg/[PREFIX]0001.PDF')
-  .then(r => r.blob())
-  .then(blob => {
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = 'MyAddress - SellerName - deed_p1.pdf';
-    a.click();
-  });
-```
-2. Use the `Read` tool on the saved `.pdf` file — Claude reads it natively as a multimodal model, extracting text and metadata directly. No rendering pipeline needed.
-3. Repeat for page 2 (`DUIP0002.PDF`), saving as `deed_p2.pdf`.
-4. After reading both pages via `Read`, save JPEG screenshots for auditability using the canvas approach only if needed (see PDF.js fallback below).
-
-**"EST." suffix in the Name column — meaning unconfirmed:** Search results sometimes display a name as `SARNO, THOMAS (EST.&AL)` or `TURNER, JEAN (EST.&AL)` in the **Name** column. The meaning of this `EST.` suffix as displayed in the Norfolk ALIS name index is **not yet confirmed** — do not assume it indicates the named person is deceased or that it refers to their estate. Research is ongoing. Until the meaning is established, treat `EST.` in the Name column as an unknown qualifier and do not draw title conclusions from it alone. (Note: `EST.` appearing in the **Document Type** column — e.g., "ESTATE DEED" — is a separate matter and refers to the instrument type.)
-
-**Grantor Check — direct URL (preferred over form submission):** Rather than navigating to the name search form and submitting it (which can redirect to the homepage on session timeout), run the Grantor Check by navigating directly to the results URL. For Norfolk County:
-```
-https://www.norfolkresearch.org/ALIS/WW400R.HTM?W9SNM=[LAST]&W9GNM=[FIRST]&W9IXTP=R&W9ABR=*ALL&W9TOWN=*ALL&W9INQ=AY&W9FDTA=&W9TDTA=&AYVAL=+1793&CYVAL=2006&WSHTNM=WW401R00&WSIQTP=LR01LP&WSKYCD=N&WSWVER=2
-```
-Replace `[LAST]` and `[FIRST]` with the URL-encoded name as indexed at the registry (e.g., `YOEST` and `PETER`). For Barnstable County, substitute the Barnstable domain and adjust `WSHTNM`/`WSIQTP` parameters to match their equivalent result page values.
-
-**Chrome setting (recommended):** Chrome Settings → Privacy and security → Site Settings → Additional content settings → PDF documents → set to **"Download PDFs"**. This prevents the Acrobat extension from intercepting PDF navigations, making the download step trivial.
-
-**Fallback — PDF.js (use only if fetch-download fails):**
-1. Load PDF.js from CDN: `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js`
-2. Set worker: `pdfjsLib.GlobalWorkerOptions.workerSrc = '[cdn]/pdf.worker.min.js'`
-3. Fetch PDF via same-origin: `fetch('/WwwImg/DUIP0001.PDF')`
-4. Render at `scale: 2.0`, store canvas data URL in `window._deedPage1DataUrl`
-5. Page 1: trigger direct download; Page 2: use localStorage + fresh tab
-6. **Note:** PDF.js rendering exceeds the 45s JS timeout — code continues in background. Always screenshot to confirm render completed before proceeding.
-
----
-
-### Barnstable County — search.barnstabledeeds.org
-
-**System:** Browntech ALIS — **identical to Norfolk County** (shares the `_alis_*` helpers in `legal_desc_fetch.py`)
-
-**Playwright fast path (v2.3+):** Barnstable is supported by `legal_desc_fetch.py` — see Step 1B. The manual notes below apply only when the script returns exit 2 or exit 1.
-
-**Search URL:** `https://search.barnstabledeeds.org/ALIS/WW400R.HTM?WSIQTP=LR01D&WSKYCD=N`
-
-**PDF file prefix (Recorded Land):** Varies by recording batch — do NOT hardcode. Always read the actual href values from the Document Image List page links before fetching. Known prefixes seen: `DX26`, `DN6D`. The pattern is `[PREFIX]0001.PDF`, `[PREFIX]0002.PDF`, etc.
-
-**PDF file prefix (Land Court / Registered Land):** `D05D` (e.g., `/WwwImg/D05D0001.PDF`, `/WwwImg/D05D0002.PDF`). Land Court search URL: `https://search.barnstabledeeds.org/ALIS/WW400R.HTM?WSIQTP=LC01D&WSKYCD=N`. Always try Recorded Land first; if no results, switch to Land Court.
-
-**Common town codes:** `BARN` = Barnstable — and since v3.28 the **village names themselves** (Hyannis, Hyannisport, Centerville, Osterville, Cotuit, Marstons Mills, West Barnstable, Cummaquid) resolve to `BARN` directly, so a Hyannis address no longer emits an "unrecognised town" NOTE on a run that was correctly scoped all along. `BOUR` = Bourne, `BREW` = Brewster, `CHAT` = Chatham, `DENN` = Dennis ✓, `EAST` = Eastham, `FALM` = Falmouth ✓, `HARW` = Harwich, `MASH` = Mashpee ✓, `ORLE` = Orleans, `PROV` = Provincetown, `SAND` = Sandwich ✓, `TRUR` = Truro, `WELL` = Wellfleet, `YARM` = Yarmouth ✓. **`--town` auto-detection (v3.2+):** `legal_desc_fetch.py` now resolves Barnstable towns from `--base-name` automatically (same as Norfolk). Omit `--town` and the script derives the code from the last town word in the address. Falls back to `BARN` if unrecognized. For unlisted towns, use the JS query `Array.from(document.querySelector('[name="W9TOWN"]').options).map(o=>o.value+'='+o.text)` on the search form page.
-
-**USE the abstract page for the property address (v3.22) — this guidance was previously the opposite:** The Document Abstract page (`WSIQTP=LR09A`, `WSKYCD=B`, keyed by recording date + control number) carries a **`Town:` / `Addr:` field giving the property address as plain text**, which the results grid does not (its Document Desc is often just `SEE RECORD` or `LOT N`). The old rule here said to skip this page because Bk/Pg, date, parties and page count are available elsewhere — an enumeration that missed the address, the one field that answers the wrong-parcel question. The script now fetches it automatically for the selected row, every candidate, and every sampled grantor hit, and only falls back to downloading a page-1 PDF when `Addr:` is blank. Doing this by hand in a manual run is one navigation, and it is cheaper and more reliable than reading a scan: it is structured index data, so it has no null-address failure mode on deeds whose first page only says "SEE ATTACHED FULL LEGAL" (Keegan Bk 15978/412 — the v3.20 defect). The abstract also gives `Doc$` consideration, page count, full grantor/grantee lists, and `Ref By:` / `Refers to Book:` cross-references to later homesteads, discharges and deeds. **Caveats:** `Addr:` is frequently absent (an absent address means UNVERIFIED, never "a different parcel"); a multi-parcel deed lists several `Town:`/`Addr:` pairs and any of them may be the subject; some entries carry a street name with no number, which is the "possible subject" tier, not a dismissal; and it is staff-typed index data, so the deed image remains authoritative for the legal description itself. Land Court abstracts use the same date+ctl keying with `WSIQTP=LC09A&WSKYCD=D` (v3.25) — own label vocabulary (`Address:`/`Descr:`/`Grantor:`/`Grantee:`/`Consideration:`/`Ctf#:`, with `Address:` PRECEDING `Town:`), plus `Parent doc:`/`Related doc:` chain cross-refs.
-
-**Capture method — preferred (fetch-download + Read tool):** Stay on the Document Image List page. Read the actual PDF hrefs from the page links, then fetch each page using the correct prefix. Save each page as a `.pdf` to the output folder, then use the `Read` tool to extract content. Registry authentication is preserved via the page session.
-
-**CRITICAL — blob worker required if using PDF.js fallback:** barnstabledeeds.org blocks cross-origin Web Worker scripts. CDN-based `workerSrc` silently fails — `page.render().promise` never resolves. Required fix before calling `getDocument()`:
-```javascript
-const wr = await fetch('https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js');
-const wt = await wr.text();
-pdfjsLib.GlobalWorkerOptions.workerSrc = URL.createObjectURL(new Blob([wt], {type:'text/javascript'}));
-```
-NEVER set `workerSrc = ''` — runs PDF.js on main thread, permanently blocks JS event loop. Only run one render per tab; multiple pending renders share the worker and may deadlock.
-
-**Unique:** Barnstable County charges both Massachusetts State Excise Tax AND a Barnstable County Excise Tax — unique among MA counties.
-
-**Corporate/LLC search:** Enter full or partial LLC name in `W9SNM` (Last Name/Corporation field), leave `W9GNM` blank.
-
----
+Per-registry mechanics — form field names and POST shapes, town codes, PDF
+href patterns, pager behaviour, WAF and viewer quirks — live in one reference
+file per registry, listed below.
+
+**Read the file for the registry you are working before any manual or
+fallback step in that registry.** The script fast path (Step 1B) does not
+need them; they matter when you are driving a registry by hand, debugging a
+failure, or working a registry the fast path does not cover.
+
+They are split out because they are *lookup* detail: needed only once you are
+already in that registry, and their absence is self-announcing — without the
+field name or town code you visibly cannot proceed, so you come and get it.
+
+**What is deliberately NOT in them:** anything that changes what you
+*report* or *conclude*. Those rules stay in this file. If you ever find
+yourself reaching for a reference file to decide whether a title is clean,
+whether a parcel matches, or whether a search was complete, stop — that
+answer belongs here, and its absence here is a bug.
+
+| Registry | Reference file |
+|---|---|
+| Plymouth County — titleview.org/plymouthdeeds/ | `${CLAUDE_PLUGIN_ROOT}/skills/legal-description/references/plymouth.md` |
+| Suffolk County — masslandrecords.com/suffolk/D/Default.aspx | `${CLAUDE_PLUGIN_ROOT}/skills/legal-description/references/suffolk.md` |
+| Middlesex South District — masslandrecords.com/MiddlesexSouth/D/Default.aspx | `${CLAUDE_PLUGIN_ROOT}/skills/legal-description/references/middlesex-south.md` |
+| Norfolk County — norfolkresearch.org | `${CLAUDE_PLUGIN_ROOT}/skills/legal-description/references/norfolk.md` |
+| Barnstable County — search.barnstabledeeds.org | `${CLAUDE_PLUGIN_ROOT}/skills/legal-description/references/barnstable.md` |
+
+### Registry facts that change what you REPORT — these stay here
+
+Three rules were pulled back out of the reference files above, because each
+one ends in a conclusion about title or parcel rather than in a mechanical
+step. They are registry-specific but they are not lookup detail: you would
+need them at exactly the moment nothing prompts you to open a reference file.
+
+**Plymouth — multi-property sellers (v2.7):** When a seller owns multiple
+Plymouth County properties, the grantee name search returns results for all
+of them. The v2.7 script handles this automatically via Python date sort +
+town-aware selection + address-search retry. If the script's JSON shows
+`"deed_property_address"` for the wrong town and `"found_via_address_search":
+false`, the town filter found no match and fell through to the most recent
+deed regardless of town — **read the deed image to confirm before
+proceeding.** The `notes` array will contain a `"WARNING: no name-search
+result matched town"` entry in this case.
+
+**Norfolk — "EST." suffix in the Name column, meaning unconfirmed:** Search
+results sometimes display a name as `SARNO, THOMAS (EST.&AL)` or `TURNER,
+JEAN (EST.&AL)` in the **Name** column. The meaning of this `EST.` suffix as
+displayed in the Norfolk ALIS name index is **not yet confirmed** — do not
+assume it indicates the named person is deceased or that it refers to their
+estate. Research is ongoing. Until the meaning is established, treat `EST.`
+in the Name column as an unknown qualifier and do not draw title conclusions
+from it alone. (Note: `EST.` appearing in the **Document Type** column —
+e.g., "ESTATE DEED" — is a separate matter and refers to the instrument
+type.)
 
 ## PERFORMANCE NOTES
 

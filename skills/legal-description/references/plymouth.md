@@ -1,0 +1,59 @@
+# Plymouth County — titleview.org/plymouthdeeds/
+
+Registry mechanics for the `/legal-description` workflow.
+Split out of SKILL.md; the workflow steps and every reporting rule live there, not here.
+
+**System:** Avenu/20-20 Perfect Vision Land Records I2 (ASP.NET `__doPostBack`)
+
+**Name format:** Last name first, no comma, no space between compound first name parts.
+- Example: `DONNELLY JEANMARIE`
+
+**Form field IDs:**
+- Last name: `SearchFormEx1_ACSTextBox_LastName1`
+- First name: `SearchFormEx1_ACSTextBox_FirstName1`
+- Party type (SELECT): `SearchFormEx1_ACSRadioButtonList_PartyType1` — values: `""` = Both, `"D"` = Grantor, `"I"` = Grantee
+- Search button: `SearchFormEx1_btnSearch`
+
+**Image viewer:** Opens as a **popup window** (`ImageViewerEx.aspx`). The popup is frequently blocked by Chrome and lands in a separate browser window outside the MCP tab group.
+
+**Popup workaround — two options (use Option A first):**
+
+Option A — Navigate directly (Plymouth County only): After clicking View Images, simply navigate your current tab to `https://titleview.org/plymouthdeeds/ImageViewerEx.aspx`. No parameters needed — the server session holds the document context. The image viewer will load with the correct deed.
+
+Option B — Monkey-patch `window.open` (general, works for any registry): Inject this JS *before* clicking View Images, then read the captured URL after:
+```javascript
+window._popupUrl = null;
+const _origOpen = window.open;
+window.open = function(url, name, features) {
+  window._popupUrl = url;
+  return _origOpen.call(this, url, name, features);
+};
+```
+After clicking View Images: `window._popupUrl` contains the exact URL. Navigate your tab there.
+
+**Image viewer elements (once loaded in any tab):**
+- Deed image element: `ImageViewer1_docImage` (NOT `ImageViewer1_WaterMarkImage`)
+- Page nav buttons: `ImageViewer1_BtnNext`, `ImageViewer1_BtnPrevious`, `ImageViewer1_BtnFirst`, `ImageViewer1_BtnLast`
+- Page label: `ImageViewer1_lblPageNum`
+
+**Capturing images:** Use canvas API — `ctx.drawImage(img, 0, 0)` on `ImageViewer1_docImage`. Store in `window._deedDataUrl_pN`.
+
+**Download limitation:** Chrome blocks bulk blob/data-URL downloads after the first per tab session.
+- Page 1: trigger direct download, move to output folder via Bash
+- Page 2+: store in `localStorage`, create a new tab, navigate to same origin, read and download from new tab, then `localStorage.removeItem(key)`
+
+**Document types seen:** `UNIT DEE` = Condo Unit Deed, `TR CRTF` = Trustee's Certificate, `DCLN HMS` = Declaration of Homestead, `MLC` = Mechanics Lien Certificate, `TAX LIEN` = Massachusetts tax lien (often "SEEBK" — attaches to all real property), `PR` = Probate-related instrument
+
+**Multi-property sellers (v2.7):** When a seller owns multiple Plymouth County properties, the grantee name search returns results for all of them. The v2.7 script handles this automatically via Python date sort + town-aware selection + address-search retry. If the script's JSON shows `"deed_property_address"` for the wrong town and `"found_via_address_search": false`, the town filter found no match and fell through to the most recent deed regardless of town — read the deed image to confirm before proceeding. The `notes` array will contain a `"WARNING: no name-search result matched town"` entry in this case.
+
+**Non-monotonic book numbers:** Plymouth County's digitized old records can have book numbers that don't increase monotonically with date (e.g. a 1978 deed at Bk32450, a 2002 deed at Bk22572). The v2.7 Python date sort handles this correctly; the prior browser-side book-number sort validation (v2.6 and earlier) was unreliable in this scenario. **v3.13:** the same broken proxy was still being used to validate the *Rec Date sort direction* (`ctl02 book < ctl03 book` ⇒ "still ascending") — it is now validated by reading the Rec Date column itself.
+
+**Results grid pagination (v3.13) — registry mechanics:**
+- Default page size is **20 rows/page**. Page-size controls are `__doPostBack` targets: `DocList1$PageView2Btn` (20), `DocList1$PageView5Btn` (50), `DocList1$PageView100Btn` (100). The anchor for the *active* size loses its `href`, which makes "already at 100" easy to detect.
+- The pager is **not** a standard ASP.NET `Page$N` GridView pager. It is a single **`DocList1$LinkButtonNext`** (plus `DocList1$LinkButtonPrev`). On the last page the **Next link is absent** and Previous appears — that is the termination signal.
+- The site caps results at **1000 rows** ("Your search results have been limited to the first 1000 records"), i.e. 10 pages at 100/page. **The cap is server-side and applied BEFORE the Rec Date sort**, so a capped set is the *oldest* 1000 rows, not the newest — and page 10 has no Next link, making a truncated walk indistinguishable from a complete one by pager signals alone. Detected since v3.18 via `results_truncated_at_cap` (see 4f above).
+- **Every one of these controls is an UpdatePanel postback, and the OLD grid stays in the DOM until the re-render lands.** Waiting on `wait_for_selector('ctl02 …')` or `networkidle` returns immediately against the stale grid — the cause of several silent wrong-data bugs. Wait for the rendered row content to actually change instead.
+- **Order matters: set the page size BEFORE sorting.** The 100/Page postback re-renders from the default index order and discards the Rec Date sort.
+- `ctl` numbers are unique only **within** a pager page. After walking pages the grid is parked on the last one, so a row read from page 1 must be re-located (and its ctl re-derived by book/doc identity) before its Book link can be clicked — otherwise the click opens a different deed.
+
+**Town abbreviations (v2.9):** Plymouth County's grid uses short abbreviations that mostly match via substring check. Known non-substring cases in `_PLYMOUTH_TOWN_ABBREVS`: `HLFX` (Halifax), `DXBY` (Duxbury), `HNGHM` (Hingham), `PLMTH` (Plymouth), `CRVR` (Carver — confirmed 2026-05-14 from failed run), `KGSTN` (Kingston — confirmed 2026-06-19), `MSHFD` (Marshfield — confirmed 2026-07-08, KDM Realty Corp run). As of v2.9, an unrecognized abbreviation only matters for sellers with multiple Plymouth County properties (multi-result name search). Single-result runs: script accepts any abbreviation and logs a `NOTE` — add the entry to the dict when you see one. Multi-result runs: a `WARNING` appears and the address-search retry fires; add the entry to fix it permanently.

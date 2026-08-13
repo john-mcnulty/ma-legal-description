@@ -62,6 +62,8 @@ FORBIDDEN_GLOBS = [
     ("*.png",  "a screenshot (deed images and registry pages are client data)"),
     ("*.docx", "a generated deliverable"),
     ("*result.json", "a run result (holds seller name, address, book/page)"),
+    ("*.rules.json", "a rule-inventory snapshot (quotes SKILL.md verbatim, "
+                     "so from the private copy it carries client names)"),
     ("*run_log*", "the run log (seller + address on every entry)"),
     ("*registry_profile.json", "a per-client registry profile"),
     ("*namemap*", "THE NAME MAP — this must never be in the repository"),

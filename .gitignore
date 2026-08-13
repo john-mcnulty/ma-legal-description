@@ -19,6 +19,9 @@ __pycache__/
 *.docx
 * - result.json
 *result.*.json
+# A rule-inventory snapshot quotes SKILL.md verbatim; taken from the
+# private working copy it carries the client names in the guardrail prose.
+*.rules.json
 legal_description_run_log.json
 run_log*
 registry_profile.json

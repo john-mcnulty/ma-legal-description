@@ -1,0 +1,56 @@
+{
+  "_readme": [
+    "Rules consciously judged to be registry MECHANICS rather than reporting",
+    "guardrails, and therefore allowed to live in an on-demand reference file",
+    "under skills/legal-description/references/.",
+    "",
+    "The test applied to every id below: does its absence change what the",
+    "workflow REPORTS or CONCLUDES, or does it merely block a mechanical step",
+    "in a way you cannot miss? A wrong form-field name yields an HTTP 403 or an",
+    "empty grid; a wrong PDF prefix yields a 404. That is self-announcing, so",
+    "the rule travels safely with the registry section you already had to open",
+    "in order to need it.",
+    "",
+    "Nothing that decides whether a title is clean, whether a parcel matches,",
+    "or whether a search was complete may ever be listed here. Three rules from",
+    "the first split were REFUSED this treatment and promoted back into the",
+    "core skill file instead: the two Norfolk 'EST. suffix' rules (they end in",
+    "'do not draw title conclusions from it alone') and the Plymouth",
+    "multi-property town-mismatch WARNING (it is a wrong-parcel guard).",
+    "",
+    "Adding an id here is a decision, not a formality. Record why."
+  ],
+
+  "5c1b037faa31": "Plymouth: navigate-direct option for the image viewer. Navigation mechanics; a wrong URL fails visibly.",
+  "c0611c7709e8": "Plymouth: ctl numbers are unique only within a pager page. Selector mechanics.",
+  "7b9fc3db6c77": "Plymouth: a row read from page 1 must be re-located after a pager walk. Selector mechanics; the script owns this path.",
+  "306ea7ed5fb3": "Plymouth: when an unrecognised town abbreviation matters. The reporting consequence is the WARNING rule, which stays in core.",
+  "5cb99aa333aa": "Plymouth: multi-result runs emit a WARNING and fire the address retry. Same — the WARNING itself is core.",
+
+  "5bb94809aa04": "Suffolk: popups must be allowed for masslandrecords.com. The viewer visibly fails to load otherwise.",
+  "d8da9e868f83": "Suffolk: some scanned text may not be legible. An observation about scan quality.",
+  "e2181ea5cff0": "Suffolk: page 1 is always a recording cover sheet. Page-offset mechanics.",
+
+  "babae99a34c2": "Middlesex South: Incapsula WAF returns 403 to headless browsers. Maximally self-announcing — the run fails outright.",
+  "56e5b08bb799": "Middlesex South: separate last/first/middle fields, do not concatenate. A wrong shape returns an empty grid.",
+  "0c6d295b9627": "Middlesex South: ACSResource.axd hi-res image trick. Image-fetch mechanics.",
+
+  "3cd9a741c51c": "Norfolk: use the script fast path first, fall back on exit 2/1. Routing, and Step 1B in core already states it.",
+  "78439b5cc4bc": "Norfolk: town code is WEYM, not WEYB. A wrong code yields no rows.",
+  "526fee342e54": "Norfolk: PDF page prefix varies by batch, do not hardcode. A wrong prefix is a 404.",
+  "4698df219f8b": "Norfolk: read actual href values off the image-list page. Same fetch mechanics.",
+  "d2d2c4cab83c": "Norfolk: the script auto-fetches the abstract for selected/candidate/grantor rows. Describes script behaviour documented in core.",
+  "32d416c7db29": "Norfolk: fetching the abstract by hand in a manual run. Manual-path mechanics.",
+  "ceaf5cec5445": "Norfolk: the abstract also carries Doc$, page count, party lists, cross-refs. Descriptive; cross_references handling is core.",
+  "3c1dcd038750": "Norfolk: save JPEG screenshots for auditability if needed. Output mechanics.",
+  "e5cbc97519e8": "Norfolk: PDF.js fallback, use only if fetch-download fails. Fallback mechanics.",
+  "7d065c0f84ef": "Norfolk: screenshot to confirm the render completed. Mechanics of a render that outlives the JS timeout.",
+
+  "a58ec310eedf": "Barnstable: manual notes apply only on exit 2/1. Routing, stated in core.",
+  "afb7d262f30e": "Barnstable: read actual href values before fetching. Fetch mechanics.",
+  "0747e7eccb9e": "Barnstable: try Recorded Land first, then Land Court. Search ordering when the section is unknown; the stronger conditional rule (Registered Land known -> Land Court FIRST) stays in core.",
+  "93808e1e1ec8": "Barnstable: PDF.js needs a blob worker, cross-origin workers are blocked. Viewer mechanics.",
+  "165461ad96e5": "Barnstable: a CDN workerSrc silently never resolves. Viewer mechanics — and it only applies inside the PDF.js fallback this file describes.",
+  "dcfa8addda9a": "Barnstable: never set workerSrc to empty, it blocks the JS event loop. Reads as a hard rule, but it is a rule about ONE line of the fallback snippet in this same file.",
+  "eb6a2fc0eb10": "Barnstable: one render per tab, concurrent renders deadlock. Viewer mechanics."
+}
