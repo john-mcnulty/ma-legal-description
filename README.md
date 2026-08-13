@@ -88,7 +88,7 @@ Requires **Python 3.9+** and [Claude Code](https://claude.com/claude-code).
 **1. Install the plugin.** In Claude Code:
 
 ```
-/plugin marketplace add <you>/ma-legal-description
+/plugin marketplace add john-mcnulty/ma-legal-description
 /plugin install ma-registry@ma-registry
 ```
 
@@ -96,7 +96,7 @@ You will be asked for the settings in the next section; the output folder is
 the only required one. From a terminal instead:
 
 ```bash
-claude plugin marketplace add <you>/ma-legal-description
+claude plugin marketplace add john-mcnulty/ma-legal-description
 claude plugin install ma-registry@ma-registry \
   --config "output_dir=/path/to/your/closings" \
   --config "extraction_mode=claude-code" \
