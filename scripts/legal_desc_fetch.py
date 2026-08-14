@@ -1,7 +1,40 @@
 #!/usr/bin/env python3
 """
 legal_desc_fetch.py — fast-path for Legal Description Search Workflow
-Version: 3.38
+Version: 3.39
+
+v3.39 changes (item 22 — ownership that changes with NO deed was being
+hidden, on the exact case v3.38 was written for):
+
+  A live Norfolk Land Court run named a seller who had DIED; title had
+  passed to his surviving spouse by tenancy-by-the-entirety survivorship
+  with no deed ever recorded. The deed-out check was correctly clean, and
+  the DEATH CERTIFICATE was demoted out of `needs_review`. Three
+  independent defects, each of which alone would have hidden it:
+
+  22a  _instrument_significance() was passed doc_type ONLY. Plymouth
+       indexes the terse code `DEATH CRTF` as the TYPE, but ALIS Land
+       Court indexes a GENERIC type (`CERTIFICATE`, `AFFIDAVIT`) and puts
+       the real nature in the Desc cell ("DEATH OF <name>"). Every
+       DEATH/DIVORCE/PROBATE substring was therefore unreachable on ALIS.
+       Now matches type+desc; the exact-CODE set stays keyed on the type,
+       because Desc may ESCALATE a hit but never dismiss one (v3.23).
+
+  22b  The registry writes a literal placeholder `Addr: N/A` rather than
+       leaving the field blank, and it was consumed as a real,
+       NON-MATCHING address — demoting rows from `parcel unknown` (kept)
+       to `other street, subject town`. The v3.20 lesson one layer out:
+       a placeholder MEANS missing information.
+
+  22c  On Registered Land the Certificate of Title number is an EXACT
+       parcel key, already on every index row, and nothing used it. A hit
+       whose Ctf# equals the selected deed's Ctf# is now the subject
+       parcel outright, with no abstract fetch. Absence still asserts
+       nothing, in either direction.
+
+  Test: ownership_surfacing_test.py (4 sections). Also fixed a fixture in
+  alis_grantor_classify_test.py that went stale at v3.37 and had been
+  failing since — item 18 updated two of the three affected tests.
 
 v3.38 changes (item 10 — the grantor check, refocused on the question it
 actually answers, and made ~4x faster as a consequence):
@@ -3174,7 +3207,7 @@ _BURDEN_SUBSTR = ("EASEMENT", "COVENANT", "RESTRICTION", "RSTN")
 _BURDEN_CODES = {"ESMT", "RSTNS"}
 
 
-def _instrument_significance(deed_type: str) -> str:
+def _instrument_significance(deed_type: str, desc: str = "") -> str:
     """
     v3.38 — for an instrument that is NOT a conveyance, say WHY it might
     still matter: 'ownership_change' | 'burden' | ''.
@@ -3184,22 +3217,47 @@ def _instrument_significance(deed_type: str) -> str:
     must keep warning), and it is ALSO ownership-relevant. The two answer
     different questions — "did this convey?" and "does this change who owns
     or signs?" — and collapsing them is what buried the death certificate.
+
+    v3.39 (item 22a) — `desc` is the registry's Document Description cell,
+    and WITHOUT IT this function could not see a death certificate on ALIS.
+    Plymouth indexes the terse code `DEATH CRTF` as the TYPE, but ALIS Land
+    Court indexes a GENERIC type — `CERTIFICATE`, `AFFIDAVIT`, `DOCUMENT` —
+    and puts the instrument's real nature in Desc ("DEATH OF <name>",
+    "AFFIDAVIT NO DIVORCE"). Every substring in _OWNERSHIP_CHANGE_SUBSTR was
+    therefore unreachable on that platform, and the v3.38 needs_review clause
+    that depends on this answer never fired on the very case it was written
+    for: the seller had died, title had passed to the survivor with no deed,
+    and the death certificate was demoted out of the review set.
+
+    SUBSTRINGS match type+desc; CODES stay keyed on the TYPE ALONE. Desc is
+    staff-typed low-signal text — the v3.23 rule is that it may ESCALATE a
+    hit, never dismiss one — and allowing an exact code match out of free
+    text would let a Desc that merely mentions "TT" masquerade as a taking.
+    Escalation is the safe direction: reading Desc can only ADD rows to
+    needs_review, never remove one.
     """
     t = (deed_type or "").upper().strip()
-    if not t:
+    hay = (t + " " + (desc or "").upper().strip()).strip()
+    if not hay:
         return ""
-    if t in _OWNERSHIP_CHANGE_CODES or any(s in t for s in _OWNERSHIP_CHANGE_SUBSTR):
+    if t in _OWNERSHIP_CHANGE_CODES or any(s in hay for s in _OWNERSHIP_CHANGE_SUBSTR):
         return "ownership_change"
-    if t in _BURDEN_CODES or any(s in t for s in _BURDEN_SUBSTR):
+    if t in _BURDEN_CODES or any(s in hay for s in _BURDEN_SUBSTR):
         return "burden"
     return ""
 
 
-def _significance_note(rid: str, deed_type: str, date: str, where: str) -> str | None:
+def _significance_note(rid: str, deed_type: str, date: str, where: str,
+                       desc: str = "") -> str | None:
     """v3.38 — the elevated note for a non-conveyance that still bears on
     ownership or burdens the parcel. Returns None when neither applies, so
-    the caller falls through to the generic encumbrance wording."""
-    sig = _instrument_significance(deed_type)
+    the caller falls through to the generic encumbrance wording.
+
+    v3.39 (item 22a) — takes the registry's Desc cell for the same reason
+    the classifier does; without it an ALIS death certificate got the
+    generic "assess as an encumbrance" wording, which is the opposite of
+    the truth."""
+    sig = _instrument_significance(deed_type, desc)
     if sig == "ownership_change":
         return (
             f"OWNERSHIP-RELEVANT: grantor hit {rid} ({deed_type} {date}) at "
@@ -6257,16 +6315,44 @@ def _alis_fetch_abstract_http(session, base_url: str, row: dict,
     return parsed
 
 
+# v3.39 (item 22b) — the registry does not always leave Addr blank when it
+# has no address; it writes a PLACEHOLDER. Confirmed live on the Norfolk
+# Land Court abstracts for a death certificate and its companion affidavit:
+# `Addr: N/A`. Consumed as a real address that string is a NON-MATCH, which
+# demoted those rows out of "parcel unknown" (kept for review) and into
+# "other street, subject town" (demoted) — the v3.20 lesson exactly, one
+# layer out: a placeholder MEANS missing information, and reading it as a
+# value is how missing information becomes a negative answer.
+_ADDRESS_PLACEHOLDERS = {
+    "N/A", "NA", "N.A.", "N.A", "NONE", "NULL", "UNKNOWN", "UNK",
+    "-", "--", "---", "?", "SEE RECORD", "SEE DEED", "SEE DOCUMENT",
+    "NOT AVAILABLE", "NO ADDRESS", "NOT GIVEN",
+}
+
+
+def _is_placeholder_address(addr: str) -> bool:
+    """v3.39 — True when the registry wrote 'no address' rather than one."""
+    t = (addr or "").strip().upper().strip(".").strip()
+    return not t or t in _ADDRESS_PLACEHOLDERS
+
+
 def _alis_abstract_address_strings(abstract: dict) -> list:
     """
     v3.22 — the abstract's addresses as match-ready strings ("402 SEDGEFIELD
     STREET, WEYMOUTH"). Entries with no Addr are omitted: a Town alone
     cannot answer the parcel question, and treating it as an answer is the
     exact mistake v3.20 was written to prevent.
+
+    v3.39 (item 22b) — a PLACEHOLDER Addr ("N/A", "NONE", "SEE RECORD") is
+    omitted for the same reason and under the same rule; see
+    _ADDRESS_PLACEHOLDERS. This is the single choke point every consumer of
+    an abstract address goes through — the selected row's own address
+    verification, the candidate wrong-parcel guard, and the grantor-hit
+    classifier all read it — so the fix reaches all three at once.
     """
     out = []
     for a in (abstract or {}).get("addresses") or []:
-        if a.get("addr"):
+        if a.get("addr") and not _is_placeholder_address(a["addr"]):
             out.append(", ".join(x for x in (a["addr"], a.get("town")) if x))
     return out
 
@@ -6369,9 +6455,24 @@ def _alis_hit_address_note(result: dict, r: dict, address, st_num: str,
         )
 
 
+def _certificates_match(a: str, b: str) -> bool:
+    """
+    v3.39 (item 22c) — do two Land Court certificate numbers name the same
+    certificate? Compared as digits so "123456", "0123456" and "Ctf 123456"
+    agree. Returns False whenever either side is missing or non-numeric
+    (an LC abstract can carry "See parent list" instead of a number, and a
+    death certificate's abstract carries no Ctf# at all): absence must never
+    manufacture a match, in either direction.
+    """
+    da = "".join(ch for ch in str(a or "") if ch.isdigit()).lstrip("0")
+    db = "".join(ch for ch in str(b or "") if ch.isdigit()).lstrip("0")
+    return bool(da) and da == db
+
+
 def _alis_classify_grantor_hit(row: dict, st_num: str, st_word: str,
                                town_code: str, town_name: str,
-                               acq_date: tuple) -> dict:
+                               acq_date: tuple,
+                               subject_certificate: str = "") -> dict:
     """
     v3.23 — classify ONE ALIS grantor-check hit against the subject parcel.
     Same tiers, tags, and needs_review rule as _plymouth_classify_grantor_hit
@@ -6384,11 +6485,29 @@ def _alis_classify_grantor_hit(row: dict, st_num: str, st_word: str,
     Desc cell can only ESCALATE a hit to possible_subject (it is staff-typed
     low-signal text like "STANTON ROAD" or "SEE RECORD"); it can never
     dismiss one, and never outranks a real abstract address.
+
+    v3.39 (item 22c) — on REGISTERED LAND the certificate number outranks
+    every address. It is the Land Court's own parcel key: exact, carried on
+    every index row already, and needing no abstract fetch. Matching it is
+    therefore checked FIRST, and it is the only signal here strong enough to
+    assert `subject` on its own. It was simply never used — the classifier
+    was address-only on both sections — which is how seven hits that all sat
+    on the subject certificate got sorted by street address instead.
+
+    Absence is still not an answer: a missing certificate on EITHER side
+    falls through to the address/town logic rather than asserting anything.
     """
     addrs = row.get("abstract_addresses") or []
     town_match = _alis_hit_town_matches(row.get("town"), town_code, town_name)
+    ctf_match = (row.get("land_court")
+                 and _certificates_match(row.get("certificate"),
+                                         subject_certificate))
 
-    if any(_alis_address_matches(st_num, st_word, a) for a in addrs):
+    if ctf_match:
+        # The Land Court parcel key matched. Nothing an address says can
+        # move this row off the subject parcel.
+        parcel = "subject"
+    elif any(_alis_address_matches(st_num, st_word, a) for a in addrs):
         parcel = "subject"
     elif any(_alis_street_word_matches(st_word, a) for a in addrs):
         parcel = "possible_subject"
@@ -6409,7 +6528,11 @@ def _alis_classify_grantor_hit(row: dict, st_num: str, st_word: str,
     # way to a CRITICAL deed-out. Same for unrecognised types (item 13).
     instrument_class = _classify_instrument(dt)
     conveyance = instrument_class == "conveyance"
-    significance = _instrument_significance(dt)
+    # v3.39 (item 22a) — the Desc cell goes to significance but NOT to
+    # _classify_instrument. Escalating on free text is safe (it can only add
+    # rows to needs_review); classifying a CONVEYANCE from it is not, and
+    # the v3.23 rule that Desc may escalate but never dismiss still holds.
+    significance = _instrument_significance(dt, row.get("doc_desc") or "")
 
     # v3.37 (item 18) — see _plymouth_classify_grantor_hit for the full
     # reasoning. Demote a post-acquisition conveyance out of needs_review
@@ -6605,7 +6728,8 @@ def _alis_finalize_grantor_check(result: dict, rows: list, base_name: str,
             )
         for r in rows:
             r["classification"] = _alis_classify_grantor_hit(
-                r, st_num, st_word, town_code, town_name, acq_date)
+                r, st_num, st_word, town_code, town_name, acq_date,
+                result.get("certificate_of_title") or "")
         rows.sort(key=_alis_grantor_sort_key)
     else:
         result["notes"].append(
@@ -6673,7 +6797,8 @@ def _alis_finalize_grantor_check(result: dict, rows: list, base_name: str,
             elif c["parcel"] == "subject":
                 # v3.38 — same elevation as the Plymouth dispatcher.
                 sig_note = _significance_note(
-                    _alis_row_id(r), r.get("doc_type"), r.get("date_received"), "")
+                    _alis_row_id(r), r.get("doc_type"), r.get("date_received"),
+                    "", r.get("doc_desc") or "")
                 result["notes"].append(sig_note or (
                     f"Grantor hit {_alis_row_id(r)} ({r['doc_type']} "
                     f"{r['date_received']}) affects the SUBJECT property but "
