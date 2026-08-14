@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "ma-registry",
   "displayName": "MA Registry Tools",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Finds the vesting deed for a Massachusetts property and extracts a paste-ready legal description from the county registry of deeds.",
   "author": {
     "name": "John McNulty",
@@ -27,8 +27,8 @@
     "extraction_mode": {
       "type": "string",
       "title": "Deed text extraction",
-      "description": "'claude-code' reads the deed PDF in this session (no API key, no extra cost) — the registry search, the wrong-parcel guard and the grantor check never need an API key in any mode. 'api' calls the Anthropic API directly for a faster single-shot run and requires ANTHROPIC_API_KEY. 'auto' uses the API when that key is present and otherwise behaves like 'claude-code'.",
-      "default": "claude-code"
+      "description": "'auto' (default) uses the Anthropic API when ANTHROPIC_API_KEY is present — a faster single-shot run — and otherwise falls back automatically to reading the deed PDF in this session, so no key is required to install or use the plugin. 'claude-code' never calls the API. 'api' forces it and fails with an actionable error if the key is missing. In EVERY mode the registry search, the wrong-parcel guard and the grantor check work without an API key — only the deed's own text extraction differs.",
+      "default": "auto"
     },
     "copy_to_clipboard": {
       "type": "boolean",

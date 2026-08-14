@@ -99,7 +99,7 @@ the only required one. From a terminal instead:
 claude plugin marketplace add john-mcnulty/ma-legal-description
 claude plugin install ma-registry@ma-registry \
   --config "output_dir=/path/to/your/closings" \
-  --config "extraction_mode=claude-code" \
+  --config "extraction_mode=auto" \
   --config "copy_to_clipboard=true" \
   --config "write_docx=false" \
   --config "show_timings=true"
@@ -140,7 +140,7 @@ Configured once when you enable the plugin:
 | Option | What it does |
 |---|---|
 | `output_dir` | Where reports, `.txt`/`.docx`, PDFs and the run JSON are written. Runs never write anywhere else. |
-| `extraction_mode` | `claude-code` (default, no key), `api`, or `auto`. |
+| `extraction_mode` | `auto` (default) — uses the Anthropic API if `ANTHROPIC_API_KEY` is set, otherwise reads the deed in-session. `claude-code` never calls the API; `api` forces it. |
 | `copy_to_clipboard` | Put the paste-ready description on the clipboard on success. |
 | `write_docx` | Also write a Word file. |
 | `show_timings` | Include the per-stage timing table in the report. |
