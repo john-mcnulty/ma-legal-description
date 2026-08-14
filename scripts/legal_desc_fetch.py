@@ -7039,7 +7039,9 @@ _NO_API_DEGRADES = (
     "the legal description and the deed's own field values — that is the "
     "one job the API was doing; (2) for any candidate or grantor hit whose "
     "registry abstract carried no address, Read its `sample_file` page-1 "
-    "PDF to answer the which-parcel question."
+    "PDF to answer the which-parcel question. To have this done "
+    "automatically in one API call instead, set ANTHROPIC_API_KEY and re-run "
+    "with the default --extraction auto."
 )
 
 
@@ -10654,11 +10656,15 @@ def _doctor_check_deps() -> list:
         "name": "anthropic SDK + credentials",
         "status": "ok" if client else "note",
         "detail": "" if client else (
-            f"{why}. This is NOT a problem. Without it the plugin runs in "
-            "claude-code extraction mode, where Claude reads the downloaded "
-            "deed PDFs in-session. The registry search, the wrong-parcel "
-            "guard and the grantor check never use the API in any mode."),
-        "blocks": "nothing — only single-shot API extraction (--extraction api)",
+            f"{why}. This is NOT a problem — the plugin is fully usable "
+            "without it. RECOMMENDED THOUGH: with a key the deed's legal "
+            "description and fields come back in ONE API call and the run "
+            "finishes on its own. Without it the plugin runs in claude-code "
+            "extraction mode, where Claude reads the downloaded deed PDFs "
+            "in-session — same results, but slower and with a few manual "
+            "steps per run. The registry search, the wrong-parcel guard and "
+            "the grantor check never use the API in any mode."),
+        "blocks": "nothing — the run is slower and needs manual PDF reading",
     })
 
     try:

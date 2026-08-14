@@ -85,6 +85,37 @@ you to add the code — it does not silently narrow the search.
 
 Requires **Python 3.9+** and [Claude Code](https://claude.com/claude-code).
 
+### Do I need an Anthropic API key?
+
+**No — but the plugin is faster and more hands-off with one, and setting it up
+is a single environment variable.**
+
+| | with `ANTHROPIC_API_KEY` | without |
+|---|---|---|
+| Finding the deed, wrong-parcel guard, grantor check | ✅ identical | ✅ identical |
+| Reading the deed's legal description and fields | one API call, automatic | you read the downloaded PDFs in-session |
+| Typical run | finishes on its own | same results, slower, a few manual steps |
+
+The safety-critical parts — confirming you have the *right* parcel and catching
+a deed out — never call the API in any mode. They read the registry's own
+index, so they behave the same either way. The key only changes who reads the
+deed text.
+
+To set it up, get a key from the [Anthropic Console](https://console.anthropic.com/)
+and set it in your environment before starting Claude Code:
+
+```bash
+# macOS / Linux
+export ANTHROPIC_API_KEY="sk-ant-..."
+# Windows (PowerShell)
+$env:ANTHROPIC_API_KEY = "sk-ant-..."
+```
+
+Then leave `extraction_mode` at its default, `auto` — it uses the key when it
+finds one and falls back automatically when it does not. Run
+`python scripts/legal_desc_fetch.py --doctor` at any time to see which mode you
+are in.
+
 **1. Install the plugin.** In Claude Code:
 
 ```
