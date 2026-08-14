@@ -1,7 +1,339 @@
 #!/usr/bin/env python3
 """
 legal_desc_fetch.py — fast-path for Legal Description Search Workflow
-Version: 3.30
+Version: 3.38
+
+v3.38 changes (item 10 — the grantor check, refocused on the question it
+actually answers, and made ~4x faster as a consequence):
+
+  SCOPE, set by the user 2026-08-14. The grantor check is not an
+  exhaustive title exam from the deed-in forward. It answers two things:
+  does the purported owner STILL OWN the parcel, and WHO are all the
+  current owners/signers. The second matters as much as the first,
+  because intake routinely arrives wrong — an Offer naming individuals
+  who actually hold as TRUSTEES, one seller named when there are two, a
+  spouse added to the deed, or a parcel deeded to adult children in
+  estate planning. Everything else (discharges, payoff, encumbrance
+  status) already belonged to /title-rundown and the discharge workflow.
+
+  1. THE DEED-OUT NET REPLACES THE SURNAME-ONLY PASS. Measured before
+     touching anything: the always-on full surname-only search returned
+     188 rows to keep 28 (154 to keep 24 on another case) and was
+     essentially the ENTIRE grantor-check runtime — 53s of a 94s run,
+     42s of a 57s run — while the named-seller and co-owner passes
+     returned 4-6 rows each. Both platforms PREFIX-match, so a full-name
+     search already reaches longer index spellings ("PENN" -> "PENNE");
+     what it cannot reach is an instrument indexed with an INITIAL
+     ("SMITH, J") or a misspelled first name. So the net is now
+     SURNAME + FIRST INITIAL, run PER KNOWN OWNER, restricted to the
+     deed group (`*DD`) server-side. Note this INCREASED coverage: the
+     old pass netted only the seller's surname, so a co-owner's initial
+     net (`QUINTERO, J*`, `WHITTAKER, M*`) never existed — and on the live
+     runs those contributed rows the old pass never returned.
+     True surname-only survives as a CONDITIONAL FALLBACK, fired only
+     when no owner first name was available (no abstract, extraction
+     failed, entity seller) — i.e. when the broad net is actually
+     load-bearing, since v3.28's abstract party lists normally enumerate
+     every owner by name. What NEITHER form rescues, and the note says
+     so: a misspelled SURNAME. That is the address search's job.
+  2. OWNERSHIP-BEARING INSTRUMENTS ARE ELEVATED, not filed as
+     encumbrances. A death certificate vests a survivor WITH NO DEED
+     EVER RECORDED; a trustee certificate/appointment/resignation
+     changes who signs; a taking divests; a decree or order can vest or
+     confirm. All were being reported as "assess as an encumbrance, not
+     a deed-out" — the exact wording that buries them. New
+     `_instrument_significance()` returns `ownership_change` | `burden`
+     | `''`, deliberately INDEPENDENT of `_classify_instrument` (a
+     DECREE is still `unknown` and still warns, AND is
+     ownership-relevant — the two answer different questions). Burdens
+     (easement, covenant, restriction — user-requested) get their own
+     note. `classification.significance` is in the JSON, and an
+     ownership-change instrument is never demoted out of needs_review.
+  3. THE LIEN SWEEP IS OPT-IN (`--lien-sweep`, default OFF). It asks a
+     different question — person-level liens that can reach
+     after-acquired property — and belongs to /title-rundown. When it
+     does not run the notes SAY so and name the flag, because a sweep
+     that silently did not run must never read as a sweep that found
+     nothing. Never applied to a net pair (deed-group by construction).
+  4. Named-seller and co-owner searches KEEP ALL INSTRUMENT TYPES (user
+     decision) — the subject-parcel mortgage/homestead picture is
+     unchanged. Only the net is type-restricted.
+  5. The prefetch now prefetches the deed-group net instead of the
+     retired surname-only pass. That prefetch is where the cost actually
+     sat: it ran on a worker thread during extraction, did not finish in
+     time because of its row count, and the grantor check then BLOCKED
+     on it. `_pair_key` now includes the document group, so a
+     deed-group set can never be served to an all-types pair and
+     silently narrow it.
+
+  CORRECTION TO THE BACKLOG: item 10 assumed the fix was concurrent
+  pagination because "the pager is WSSRPP/offset-driven, so page N+1
+  does not depend on page N". IT IS NOT. ALIS pagination is
+  postback-driven — each continuation page re-posts hidden fields
+  harvested from the PREVIOUS page's HTML — so pages cannot be fetched
+  independently. Restricting what is fetched, rather than parallelising
+  the fetching, is what actually worked.
+
+  MEASURED, live, same cases before and after:
+    Arroyo/Norfolk  56.9s -> 24.1s   (grantor check 41.7s -> 9.4s)
+    Whittaker/Norfolk  94.2s -> 57.2s   (grantor check 53.1s -> 12.5s)
+    KDM/Plymouth      29s -> 19s     (sweep no longer runs by default)
+  Whittaker's real deed-out CRITICAL still fires and still ranks first; its
+  needs_review went 47 -> 5 across v3.36-v3.38; the KDM counter-fixture
+  is unchanged at 12 with 0 demoted.
+
+v3.37 changes (item 18 — needs_review must shrink on NOISE without
+shrinking on MISSING INFORMATION):
+
+  A post-acquisition conveyance-type hit was promoted to `needs_review`
+  REGARDLESS of parcel. Right when nothing locates the hit; wrong when
+  something does — on a common surname the broad surname-only pass filled
+  the review set with other people's parcels (Whittaker: 47 of 48 rows,
+  against v3.21's stated goal of "5 rows instead of 93"). A short list
+  nobody can trust is read the same way as no list at all.
+
+  THE FIX IS CONSTRAINED BY A COUNTER-FIXTURE PAIR, and that pair is the
+  reason it is narrow:
+    * Whittaker — 23 other-parcel + 7 other-town rows, each POSITIVELY placed
+      somewhere else by an indexed address or town. Noise.
+    * KDM    — 8 rows tagged `parcel unknown — subject town`, because the
+      Plymouth index simply carries no address for them. A CORRECT flood.
+  A naive "shrink needs_review" change passes Whittaker and silently breaks
+  KDM. So demotion requires POSITIVE EVIDENCE, and deliberately only the
+  strongest kind:
+    (a) a TOWN mismatch, with a town actually indexed. Same-town rows
+        (`other_same_town`) are NOT demoted — same-town is exactly where
+        this workflow's documented wrong-parcel traps live (a seller with
+        two properties in one town; a street whose suffix the index
+        ignores). An address mismatch inside the subject town is not
+        strong enough evidence to stop looking.
+    (b) never on a tier name alone. `other_town` is reached BOTH by
+        "indexed in another town" AND — on ALIS, where a blank town cannot
+        match — by "no town cell at all". Keying on the tier would demote
+        the second, which is the v3.20 null-address mistake in a new place.
+    Subject / possible-subject / unknown-same-town are never demoted, and
+    an UNKNOWN instrument type is never less reviewable than a known
+    conveyance in the same position.
+
+  THE SHRINK IS AUDITABLE, because "needs_review is small" and "the
+  classifier lost rows" must not look identical: new
+  `classification.located_elsewhere`, new
+  `summary.demoted_located_elsewhere` count, and a summary note saying in
+  words how many were held back and why. NOTHING is dropped —
+  `grantor_check.deeds` still lists every hit with its parcel tag; this
+  changes ORDER OF ATTENTION, not the evidence.
+
+  Live: Whittaker needs_review 47 -> 10 (22 demoted, deed-out CRITICAL still
+  ranked first, deeds complete at 33); KDM 12 with 0 demoted — all 8
+  parcel-unknown rows intact. The asymmetry is the whole point.
+
+v3.36 changes (item 0a — the three-way instrument classifier, designed
+2026-08-13 and built here; resolves item 13 and improves item 18):
+
+  `_is_non_conveyance_instrument` was a BOOL whose unknown-type
+  fall-through returned "conveyance". That single default served 17 call
+  sites doing two OPPOSITE jobs, and it was wrong for both in different
+  directions:
+    - grantor-hit classification: an unrecognised type became a CRITICAL
+      deed-out. False alarm, and each one costs a Claude-in-Chrome
+      verification trip — which is what dominates run time (item 13: a
+      Sunnova solar `CONTN UC` UCC-continuation was flagged as a possible
+      deed-out of the subject parcel).
+    - row selection: an unrecognised type stayed a deed candidate AND
+      passed `selected_row_is_not_a_deed` silently, so it could be
+      reported as the vesting deed. Quiet, and far worse.
+  A pure allowlist ("only flag if it IS a Deed") fixes the first and makes
+  the second worse the other way: any conveyance whose label lacks the
+  literal string "DEED" — probate distribution, order of taking, a
+  registry indexing QCD/WD — would silently vanish from the deed-out
+  check. That is the same missing-information-as-a-negative-answer defect,
+  hiding a REAL deed-out instead of raising a false one.
+
+  So the classifier stops choosing: `_classify_instrument()` returns
+  'conveyance' | 'non_conveyance' | 'unknown', and each caller picks its
+  own safe default — finishing an idea the code already applied to BLANK
+  types, which were kept for the grantor check and treated as not-a-deed
+  for selection.
+    (a) GRANTOR CHECK: unknown is NOT a CRITICAL. It emits
+        "WARNING: … has UNRECOGNISED type '<TYPE>' at the SUBJECT
+        property — not classified", stays in `needs_review`, and surfaces
+        the raw type so the vocabulary can be extended. One line to read
+        instead of a browser session. New `classification.instrument_class`.
+        Unknown is NEVER dropped: the broad surname-only filter, the
+        abstract prefetch and the page-1 sampler all now exclude only
+        KNOWN non-conveyances.
+    (b) ROW SELECTION: the bool survives as a thin wrapper (unknown →
+        not-a-deed), so an unrecognised type now trips
+        `selected_row_is_not_a_deed` instead of being reported as the
+        vesting deed — a free bug fix. Plymouth's guard words the two
+        cases differently ("is a MORTGAGE, NOT a deed" vs "UNRECOGNISED
+        type — cannot confirm"), and ALIS gains the guard it never had at
+        all (`_alis_select_deed_row` falls back to unfiltered rows, so a
+        non-conveyance could be selected there with no warning whatsoever).
+        Middlesex names unrecognised types separately in its
+        deed_not_found note.
+    (c) VOCABULARY HARVEST — the half that makes 'unknown' rare. Loaded
+        the registry's OWN published table (titleview.org/plymouthdeeds
+        -> InstrAbbreviations.pdf, 61 codes). Two structural facts found
+        there, both of which caused item 13: the results grid TRUNCATES
+        codes to 8 chars (`CONTN UCC` displays as `CONTN UC`,
+        `DCLN HMSTD` as `DCLN HMS`), and compound codes only classify
+        when EVERY token is known. Both forms plus the compound halves are
+        now listed, and every concept is paired with its spelled-out ALIS
+        counterpart (the v3.29 BKCY/BANKRUPTCY rule, applied deliberately
+        instead of after a miss). DCRE (Decree) and ORDR (Order) are
+        DELIBERATELY omitted so they warn — both can affect title.
+    (d) TAKING CAVEAT (pre-existing, surfaced during the design): a
+        TAKING is classified non-conveyance so it never fires the deed-out
+        CRITICAL, but unlike a mortgage it CAN divest title. At the
+        subject parcel its encumbrance note now carries that caveat.
+
+  Live-validated on the two cases that define the change: Halloran
+  (`CONTN UC`) went from a CRITICAL false deed-out to a plain encumbrance
+  note — zero CRITICALs, correct deed still selected — and Whittaker kept its
+  REAL deed-out CRITICAL while an unrecognised `COVENANT` at the subject
+  parcel became a WARNING instead of a second false CRITICAL. Whittaker's
+  `needs_review` also fell 47 -> 33 (total 48 -> 34) purely from the
+  harvest recognising more noise, which is item 18 moving in the right
+  direction without touching its rule. The COVENANT was then added to the
+  vocabulary — that loop is the design working.
+
+v3.35 changes (item 14, from the 2026-08-13 Plymouth validation run —
+the NINTH-counted instance of MISSING INFORMATION READ AS A NEGATIVE
+ANSWER, fixed after the tenth):
+
+  HTTP-ONLY FLAGS ARE REFUSED, NEVER SILENTLY IGNORED. The Plymouth run's
+  own CRITICAL note says "Verify before closing"; the operator runs the
+  documented remediation, `--verify-grantor-hit BOOK/DOC`, and the flag
+  was silently ignored on `--registry plymouth`: full search, exit 0,
+  `grantor_hit_verification: null`, no note, no error — indistinguishable
+  from a clean verification, on the CRITICAL path. Three surfaces, three
+  fixes, one rule (the v3.27 pre-flight precedent — if the request is
+  knowably unsatisfiable, fail before any work):
+    (a) PRE-FLIGHT REFUSAL: `--verify-grantor-hit`, `--book`, `--page` on
+        any registry but Norfolk/Barnstable — or combined with an explicit
+        `--engine playwright` — exit 1 before anything is created, with an
+        error naming the flag and the fix. `--book/--page` are the same
+        defect class: a silently dropped pin reports the heuristic pick at
+        exit 0 as if the pin was honored.
+    (b) AUTO-FALLBACK HONESTY: the one unrefusable path (`--engine auto`
+        falls back to Playwright after an HTTP failure, unknowable
+        pre-flight) used to warn on STDERR only — a channel the skill does
+        not read; since v3.30 the result JSON is the record. The fallback
+        now writes `grantor_hit_verification: {status: "not_performed",
+        requested, reason}` — the FIELD carries the answer, null is never
+        the encoding for "did not run" — plus a WARNING note; a dropped
+        `--book` pin gets its own WARNING note.
+    (c) Plymouth-side implementation of the verification itself remains
+        OPEN (needs the Book&Page search form, undocumented) — but the
+        operator now finds out in 2 seconds instead of never.
+
+v3.34 changes (item 19, from the 2026-08-13 Norfolk validation run —
+the TENTH instance of MISSING INFORMATION READ AS A NEGATIVE ANSWER):
+
+  CO-OWNER NAME PARSER NO LONGER SWALLOWS MARITAL RECITALS — AND AN
+  UNDERIVABLE NAME WARNS INSTEAD OF VANISHING. A granting clause written
+  "Anna Marie Coyne being unmarried" (no comma) gave the v3.14 splitter
+  tokens ending in the recital, so it derived surname 'UNMARRIED' and the
+  grantor check searched "UNMARRIED, ANNA" — a party that does not exist —
+  then recorded `status: ok, 0 rows`, which the reading guide defines as
+  a CLEAN answer for that name. The run was rescued only by the v3.28
+  abstract-sourced co-owner pass finding the real party under her indexed
+  name, which is also why this fix keeps BOTH sources: they fail
+  independently. Two halves:
+    (a) `_NAME_RECITAL_PHRASE_RE` cuts status phrases ("being unmarried",
+        "a single person", "husband and wife", "individually") before
+        tokenising — anchored on the status words so a period-stripped
+        middle initial ("John A Smith") can never be truncated — and
+        `_NAME_RECITAL_TOKENS` strips trailing status words the same way
+        generational suffixes are stripped;
+    (b) an individual's entry that still yields no searchable pair — or a
+        derived surname landing ON a recital word — now appends a WARNING
+        naming the entry and saying that party's grantor search DID NOT
+        RUN from the deed's party list. Entity entries stay silent (their
+        skip is documented v3.14 behaviour). A rare real surname that
+        collides with a recital word ("Single") degrades to the WARNING
+        path — the safe direction: flagged for a hand search rather than
+        silently searched wrong or silently dropped.
+  Scope: ALIS extraction-side only (`_grantee_full_name_pair`). The
+  abstract/Plymouth/Middlesex co-owner sources parse INDEX-format names,
+  which carry no recitals — confirmed by the trust-seller validation run,
+  whose index-derived trustee names were clean.
+
+v3.33 changes (item 17 + 17b, found offline before the 2026-08-13
+Barnstable validation run and confirmed on Norfolk — the same family:
+MISSING INFORMATION MUST NOT READ AS A NEGATIVE ANSWER, here in the form
+of a FABRICATED answer):
+
+  ALIS TOWN RESOLVERS NO LONGER FABRICATE TOWN CODES. Both
+  `_barnstable_resolve_town` and `_norfolk_resolve_town` accepted ANY
+  code-shaped last word of an address (3-5 / 4-5 letters) verbatim as an
+  ALIS town code, silently: "10 Some Road Yarmouth Port - Smith" derived
+  town 'PORT' — a town that does not exist — and the search would return
+  zero rows and a FALSE deed_not_found at exit 2, the exact v3.17 failure
+  class, from the USPS-correct spelling a user would naturally type. The
+  passthrough now requires the token to be a KNOWN code (a value of the
+  town table), or to have been passed EXPLICITLY via --town — and an
+  explicit unknown code is still passed through (codes can be genuinely
+  missing from the table: the WEYB/WEYM history) but with a NOTE warning
+  that a wrong code produces a false deed_not_found. A token DERIVED from
+  the address is a town-name guess, never a code: unknown derived names
+  now fall to the existing guarded fallbacks (BARN + NOTE on Barnstable,
+  *ALL + NOTE on Norfolk).
+
+  17b: _BARNSTABLE_TOWN_CODES gains the OTHER towns' villages — v3.28
+  added only Barnstable's own, so "Yarmouthport" resolved to BARN, the
+  WRONG town (should be YARM), with only a NOTE in the way. Yarmouth,
+  Dennis, Harwich, Chatham, Falmouth, Sandwich, Bourne, Eastham, Orleans,
+  Truro, Wellfleet and Brewster villages now map to their towns; USPS
+  two-word forms included for explicit --town use. Two-word villages
+  whose LAST word is code-shaped ("Yarmouth Port" -> 'PORT', "Woods
+  Hole" -> 'HOLE') derive an unknown token by design and land on the
+  guarded fallback — the parser takes only the last word, and 'PORT'
+  is ambiguous between Yarmouth and Dennis anyway.
+
+v3.32 changes (item 21a, from the 2026-08-13 Middlesex South validation
+run — the same family again: MISSING INFORMATION MUST NOT READ AS A
+NEGATIVE ANSWER):
+
+  MIDDLESEX SOUTH GRANTOR CHECK: PER-SEARCH ACCOUNTING + ERROR ISOLATION
+  + FIRST-NAME PREFIX BROADENING. The co-owner loop existed (seller + all
+  deed grantees from the detail panel) but three defects made it
+  unverifiable and fragile:
+    (a) one try/except wrapped EVERY search, so a failure in search #1
+        silently cancelled the co-owner searches, appended a "non-fatal"
+        note, and the run still reported success — the v3.29 "errored
+        search reads as clean title" defect, on a third platform;
+    (b) no per-search record existed, so "searched, every row already
+        found" and "never searched" produced byte-identical output — the
+        item 11 defect, on a third platform (the validation run could not
+        tell whether the co-owner returned by the detail panel was ever
+        searched at all);
+    (c) the first-name field is a PREFIX match (proven live: querying
+        first-name 'ALAN' reached 'ALAN GEORGE'), so a co-owner queried
+        with a full multi-token first name (e.g. 'ANNA MARIE') could
+        never reach an instrument indexed under the bare first name — the
+        item 11b trap on the first-name axis.
+  Each search now runs in its own try/except and records
+  {name, label, rows_returned, rows_new, status} into
+  grantor_check.searches via the platform-generic recorder
+  (_plymouth_record_searches — Plymouth-named, nothing Plymouth-specific);
+  an errored search lands in grantor_check.incomplete_searches and the
+  closing note says the check is INCOMPLETE — never "no subsequent
+  instruments found" — while completed searches' rows are kept. Co-owner
+  first names are truncated to their first token (a strict superset under
+  prefix matching, the same move as Plymouth's middle-initial drop), and
+  co-owner labels gain "(co-owner from detail panel)" so the report reads
+  like the ALIS/Plymouth via-labels. Zero-row searches are trustworthy
+  here because STEP 4 only runs after the grantee search already returned
+  rows in the same browser session — the Incapsula "silently empty page"
+  failure mode cannot have started mid-session without also failing the
+  pagination reads, which now surface as ERROR statuses.
+
+  Header note: v3.31 (per-stage timings, doctor preflight, scrub-check
+  commit gate, README/packaging) shipped without this docstring being
+  bumped; the version line read 3.30 through that release. Its changes
+  are documented inline at the `timings` / `run_doctor` definitions.
 
 v3.30 changes (two open backlog items, both of the same family — MISSING
 INFORMATION MUST NOT READ AS A NEGATIVE ANSWER):
@@ -1080,6 +1412,54 @@ _BARNSTABLE_TOWN_CODES: dict[str, str] = {
     "MARSTONS MILLS":   "BARN",
     "WEST BARNSTABLE":  "BARN",
     "CUMMAQUID":        "BARN",
+    # v3.33 (item 17b) — the OTHER towns' villages, which v3.28 never added:
+    # only Barnstable's own villages were mapped, so "Yarmouthport" fell to
+    # BARN (the WRONG town — should be YARM) with only a NOTE standing
+    # between the run and a wrong-town search (2026-08-13 validation run).
+    # Single-word forms are what _parse_town_from_base_name can actually
+    # produce (it takes the LAST word, so "Yarmouth Port" derives "PORT" and
+    # is handled by the item 17 guard instead); the USPS two-word forms are
+    # for an explicit --town argument.
+    "YARMOUTHPORT":     "YARM",   # ✓ confirmed live 2026-08-13 (--town YARM)
+    "YARMOUTH PORT":    "YARM",
+    "SOUTH YARMOUTH":   "YARM",
+    "WEST YARMOUTH":    "YARM",
+    "BASS RIVER":       "YARM",
+    "DENNISPORT":       "DENN",
+    "DENNIS PORT":      "DENN",
+    "SOUTH DENNIS":     "DENN",
+    "WEST DENNIS":      "DENN",
+    "EAST DENNIS":      "DENN",
+    "HARWICHPORT":      "HARW",
+    "HARWICH PORT":     "HARW",
+    "EAST HARWICH":     "HARW",
+    "WEST HARWICH":     "HARW",
+    "SOUTH HARWICH":    "HARW",
+    "CHATHAMPORT":      "CHAT",
+    "SOUTH CHATHAM":    "CHAT",
+    "WEST CHATHAM":     "CHAT",
+    "NORTH CHATHAM":    "CHAT",
+    "EAST FALMOUTH":    "FALM",
+    "NORTH FALMOUTH":   "FALM",
+    "WEST FALMOUTH":    "FALM",
+    "WOODS HOLE":       "FALM",
+    "TEATICKET":        "FALM",
+    "WAQUOIT":          "FALM",
+    "EAST SANDWICH":    "SAND",
+    "FORESTDALE":       "SAND",
+    "SAGAMORE":         "BOUR",
+    "SAGAMORE BEACH":   "BOUR",
+    "BUZZARDS BAY":     "BOUR",
+    "MONUMENT BEACH":   "BOUR",
+    "POCASSET":         "BOUR",
+    "CATAUMET":         "BOUR",
+    "NORTH EASTHAM":    "EAST",
+    "EAST ORLEANS":     "ORLE",
+    "SOUTH ORLEANS":    "ORLE",
+    "NORTH TRURO":      "TRUR",
+    "SOUTH WELLFLEET":  "WELL",
+    "EAST BREWSTER":    "BREW",
+    "WEST BREWSTER":    "BREW",
 }
 
 
@@ -1103,7 +1483,23 @@ def _barnstable_resolve_town(town_arg: str, base_name: str) -> tuple[str, list[s
         return "BARN", notes
     if candidate in _BARNSTABLE_TOWN_CODES:
         return _BARNSTABLE_TOWN_CODES[candidate], notes
-    if 3 <= len(candidate) <= 5 and candidate.isalpha():
+    # v3.33 (item 17): a code-shaped token is only trusted when it is a KNOWN
+    # code, or when the user passed it EXPLICITLY. The old passthrough took
+    # ANY 3-5 letter last word of an address as a town code, silently — so
+    # "10 Some Road Yarmouth Port - Smith" derived town 'PORT', a town that
+    # does not exist, and the search would have returned zero rows and a
+    # FALSE deed_not_found at exit 2 (the v3.17 failure class). A derived
+    # token is a town-name GUESS, never a code.
+    if candidate in set(_BARNSTABLE_TOWN_CODES.values()):
+        return candidate, notes
+    if raw and 3 <= len(candidate) <= 5 and candidate.isalpha():
+        notes.append(
+            f"NOTE: '{candidate}' is not a known Barnstable town name or ALIS "
+            f"code — trusting it as a code ONLY because it was passed "
+            f"explicitly via --town. A wrong code returns ZERO rows and a "
+            f"false deed_not_found; if this run finds nothing, re-check the "
+            f"town before concluding no deed exists."
+        )
         return candidate, notes
     notes.append(
         f"NOTE: town '{candidate}' not in _BARNSTABLE_TOWN_CODES. "
@@ -1177,9 +1573,24 @@ def _norfolk_resolve_town(town_arg: str, base_name: str) -> tuple[str, list[str]
         return "*ALL", notes
     if candidate in _NORFOLK_TOWN_CODES:
         return _NORFOLK_TOWN_CODES[candidate], notes
-    if 4 <= len(candidate) <= 5 and candidate.isalpha():
-        # Trust as ALIS code (user passed it explicitly or it's a short town name
-        # that happens to match the code pattern).
+    # v3.33 (item 17): same guard as Barnstable — a code-shaped token is only
+    # trusted when it is a KNOWN code, or when the user passed it EXPLICITLY.
+    # The old passthrough took ANY 4-5 letter last word of an address as a
+    # town code, silently ("...Some Road Port - Smith" -> town 'PORT'),
+    # scoping the search to a nonexistent town: zero rows, false
+    # deed_not_found. A derived token is a town-name GUESS, never a code;
+    # unknown derived names belong on the *ALL fallback below, which is the
+    # safe direction (broader, never wrong).
+    if candidate in set(_NORFOLK_TOWN_CODES.values()):
+        return candidate, notes
+    if raw and 4 <= len(candidate) <= 5 and candidate.isalpha():
+        notes.append(
+            f"NOTE: '{candidate}' is not a known Norfolk town name or ALIS "
+            f"code — trusting it as a code ONLY because it was passed "
+            f"explicitly via --town. A wrong code returns ZERO rows and a "
+            f"false deed_not_found; if this run finds nothing, re-check the "
+            f"town (or use *ALL) before concluding no deed exists."
+        )
         return candidate, notes
     notes.append(
         f"NOTE: town '{candidate}' not in _NORFOLK_TOWN_CODES. "
@@ -1439,6 +1850,74 @@ _NON_CONVEYANCE_CODES = {
     "PLAN",        # Plan
     "AFFI",        # Affidavit
     "SUBORD",      # Subordination
+    # -------------------------------------------------------------------
+    # v3.36 (item 0a vocabulary harvest + item 13) — the FULL Plymouth
+    # instrument-code list, harvested from the registry's own published
+    # table: "Click here for abbreviations of document types" on
+    # titleview.org/plymouthdeeds/ -> InstrAbbreviations.pdf ("INSTRUMENT
+    # CODES WITH CORRESPONDING DESCRIPTIONS, effective November 3, 2003";
+    # 61 codes). Everything below is non-conveyance; the ONLY conveyance
+    # codes in that table are DEED and MDEED, both caught by the "DEED"
+    # allowlist.
+    #
+    # TWO STRUCTURAL FACTS learned here, both of which caused item 13:
+    #  1. The results grid TRUNCATES codes to 8 characters — the published
+    #     `CONTN UCC` displays as `CONTN UC`, `DCLN HMSTD` as `DCLN HMS`.
+    #     So the published spelling ALONE is not enough; the truncated form
+    #     is what the classifier actually sees. Both are listed.
+    #  2. Compound codes are TOKEN pairs, and `_classify_instrument` only
+    #     calls a compound non-conveyance when EVERY token is known — so
+    #     the individual halves (CONTN, UC, AMDT, DIS, REL, …) must be
+    #     present or the pair falls through to 'unknown'. That is precisely
+    #     how a Sunnova solar `CONTN UC` fixture-filing continuation fired
+    #     a false CRITICAL deed-out on the Halloran run.
+    # Same two-vocabulary lesson as v3.29's BKCY/BANKRUPTCY miss.
+    #
+    # DELIBERATELY OMITTED so they classify 'unknown' and WARN rather than
+    # being quietly filed as encumbrances: DCRE (Decree) and ORDR (Order).
+    # Both can affect or confirm title and deserve human eyes; the middle
+    # tier exists for exactly this.
+    # -------------------------------------------------------------------
+    # Compound halves / short tokens (make the pair rule work)
+    "CONTN", "CONT", "UC", "AMDT", "AMND", "SUBD", "DCLN", "CRTF", "ACPT",
+    "APPT", "RSGN", "EXTN", "MDFN", "AGRT", "TRUST", "HMSTD", "HMS", "TR",
+    "TAX", "CONTR", "LISPN", "OPTN", "ATT", "PR", "REL UCC", "REL TAX",
+    # Whole codes from the published table
+    "6D CRTF",      # 6D Certificate
+    "ACPT TR",      # Acceptance of a Trustee
+    "AFFT",         # Affidavit
+    "AFFT DIS",     # Discharge of an Affidavit
+    "AFFT TAX",     # Affidavit re Federal Tax Lien
+    "AGRT",         # Agreement
+    "AMDT MTG",     # Amendment of a Mortgage
+    "AMDT TRUST", "AMDT TRU",      # Amendment of a Trust (+8-char form)
+    "AMDT UCC", "AMDT UC",         # Amendment of a UCC Filing
+    "APPT ACPT TR", "APPT ACP",    # Appointment & Acceptance of a Trustee
+    "CONTN UCC", "CONTN UC",       # Continuation of a UCC Filing  <-- item 13
+    "CRTF ATT",     # Certificate of Judgment re Assignment/Execution
+    "CRTF ENTRY", "CRTF ENT",      # Certificate of Entry
+    "DCLN HMSTD",                  # Declaration of Homestead (DCLN HMS above)
+    "DCLN TRUST", "DCLN TRU",      # Declaration of Trust
+    "DEATH CRTF", "DEATH CR",      # Death Certificate
+    "DIS ATT",      # Discharge of an Attachment
+    "DIS EXON",     # Discharge of Execution
+    "DIS LISPN", "DIS LISP",       # Discharge of Lis Pendens
+    "EXON",         # Execution
+    "EXTN EXON", "EXTN EXO",       # Extension of an Execution
+    "JGMT",         # Judgment
+    "LSE",          # Lease
+    "MDFN AGRT", "MDFN AGR",       # Modification Agreement
+    "NOTC CONTR", "NOTC CON",      # Notice of Contract
+    "NOTC LSE",     # Notice of Lease
+    "NOTC OPTN", "NOTC OPT",       # Notice of an Option
+    "OPTN",         # Option
+    "OPTN AGRT", "OPTN AGR",       # Option Agreement
+    "POA",          # Power of Attorney
+    "REL",          # Release (already above; kept adjacent for the table)
+    "RSGN TR",      # Resignation of Trustee
+    "SUBD MTG",     # Subordination of Mortgage
+    "VOTE",         # Vote
+    "WAVR",         # Waiver
 }
 
 # Substrings that mark a non-conveyance instrument in ALIS full-word labels
@@ -1451,6 +1930,35 @@ _NON_CONVEYANCE_SUBSTR = (
     "MORTGAGE", "DISCHARGE", "ASSIGNMENT", "RELEASE", "ATTACHMENT",
     "EASEMENT", "LIEN", "NOTICE", "HOMESTEAD", "PLAN", "BANKRUPT",
     "AFFIDAVIT", "CERTIFICATE", "SUBORDINAT", "TERMINAT", "FINANCING",
+    # v3.36 — the spelled-out counterparts of the Plymouth code table
+    # (ALIS labels, and Plymouth's own 301xxx range). Every concept is
+    # paired across BOTH vocabularies here, which is the v3.29
+    # BKCY/BANKRUPTCY lesson applied deliberately rather than after a miss.
+    "CONTINUATION",     # CONTINUATION OF UCC  <-- item 13, spelled form
+    "AMENDMENT",
+    "LIS PENDENS",
+    "EXECUTION",
+    "JUDGMENT",
+    "ATTORNEY",         # POWER OF ATTORNEY
+    "AGREEMENT",
+    "OPTION",
+    "LEASE",            # also matches RELEASE, which is non-conveyance anyway
+    "WAIVER",
+    "VOTE",
+    "RESIGNATION",
+    "APPOINTMENT",
+    "ACCEPTANCE",
+    "TRUSTEE",          # TRUSTEE CERTIFICATE / RESIGNATION OF TRUSTEE
+    "DECLARATION",      # DECLARATION OF HOMESTEAD / OF TRUST
+    # Added 2026-08-13 by the loop this design exists to create: the
+    # Whittaker re-run WARNED on an unrecognised 'COVENANT' at the subject
+    # parcel (under the old fall-through it would have been a false
+    # CRITICAL deed-out). A covenant/restriction binds land, it does not
+    # convey it.
+    "COVENANT",
+    "RESTRICTION",
+    # NOT listed, deliberately, so they classify 'unknown' and WARN:
+    # "DECREE", "ORDER" — both can affect or confirm title.
 )
 
 # Terse codes / labels that DO convey title but do not contain the word "DEED".
@@ -1458,37 +1966,69 @@ _NON_CONVEYANCE_SUBSTR = (
 _CONVEYANCE_CODES = {"UNIT DEE"}
 
 
-def _is_non_conveyance_instrument(deed_type: str) -> bool:
+def _classify_instrument(deed_type: str) -> str:
     """
-    True for index document-types that do NOT convey title (tax-title
-    redemption, tax taking, municipal lien certificate, mortgage, discharge,
-    easement, etc.).
+    v3.36 (item 0a) — classify an index document-type three ways:
 
-    Shared across all fast-path registries.  It detects when a grantee name
-    search could only surface a non-deed instrument — which happens when the
-    actual vesting deed was misindexed under a misspelled grantee name.
-    Reference: 60 Aldergate St, Middleborough, where the vesting deed (Bk
-    51338/204) was misindexed "HANNIGAN" vs "HENNIGAN", so the only HENNIGAN
-    grantee hit was a Certificate of Redemption (type "CR").
+        'conveyance'     — contains "DEED" or is a known conveyance code
+        'non_conveyance' — matches the non-conveyance vocabulary
+        'unknown'        — neither; ALSO blank/None (missing information)
 
-    Vocabulary covers BOTH the terse Avenu/20-20 codes used by Plymouth/Suffolk
-    (e.g. "CR", "TT", "MLC") AND the spelled-out labels used by Browntech ALIS
-    on Norfolk/Barnstable (e.g. "MORTGAGE", "CERTIFICATE OF REDEMPTION").  Any
-    type containing "DEED" is treated as a conveyance and returns False.
+    This replaces the bool `_is_non_conveyance_instrument`'s fall-through,
+    which returned "conveyance" for anything unrecognised — safe for the
+    grantor check (over-flags: a `CONTN UC` solar-UCC continuation fired a
+    false CRITICAL deed-out, item 13, costing a browser verification trip)
+    but UNSAFE for row selection (an unknown type could be reported as the
+    vesting deed without tripping `selected_row_is_not_a_deed`). The two
+    roles need OPPOSITE defaults, so the classifier stops choosing one:
+    each caller decides what 'unknown' means on its own path. Blank types
+    were already handled this way (kept for the grantor check, not-a-deed
+    for selection) — 'unknown' finishes that idea for unrecognised types.
+
+    Vocabulary covers BOTH the terse Avenu/20-20 codes used by Plymouth/
+    Suffolk (e.g. "CR", "TT", "MLC") AND the spelled-out labels used by
+    Browntech ALIS on Norfolk/Barnstable. Compound terse codes ("DIS REL",
+    "CONTN UC") are non-conveyance only when EVERY token is itself a known
+    non-conveyance code — a compound with an unseen half stays 'unknown'.
+    Reference for the misindexed-name detection role: 60 Aldergate St,
+    Middleborough (vesting deed misindexed "HANNIGAN" vs "HENNIGAN"; the
+    only grantee hit was a Certificate of Redemption, type "CR").
     """
     t = (deed_type or "").upper().strip()
     if not t:
-        return True  # blank/unknown type — treat as non-deed so caller can verify
+        return "unknown"
     if "DEED" in t or t in _CONVEYANCE_CODES:
-        return False
+        return "conveyance"
     if any(s in t for s in _NON_CONVEYANCE_SUBSTR):
-        return True
+        return "non_conveyance"
     if t in _NON_CONVEYANCE_CODES:
-        return True
-    # Compound terse codes like "DIS REL" (discharge+release): non-conveyance
-    # when every whitespace token is itself a known non-conveyance code.
+        return "non_conveyance"
+    # Compound terse codes like "DIS REL" (discharge+release) or "CONTN UC"
+    # (continuation of UCC): non-conveyance when every whitespace token is
+    # itself a known non-conveyance code.
     tokens = t.split()
-    return len(tokens) > 1 and all(tok in _NON_CONVEYANCE_CODES for tok in tokens)
+    if len(tokens) > 1 and all(tok in _NON_CONVEYANCE_CODES for tok in tokens):
+        return "non_conveyance"
+    return "unknown"
+
+
+def _is_non_conveyance_instrument(deed_type: str) -> bool:
+    """
+    Selection-role wrapper over `_classify_instrument` (v3.36). True for
+    anything that is not a KNOWN conveyance — including 'unknown' types,
+    which now behave as not-a-deed on the selection paths so an unrecognised
+    type trips `selected_row_is_not_a_deed` instead of being silently
+    reported as the vesting deed (previously the fall-through kept it as a
+    deed candidate AND let it pass that guard). Every Plymouth filter that
+    uses this falls back to the unfiltered set when nothing survives, so
+    the flip can narrow a selection but never zero one out.
+
+    Grantor-check call sites must NOT use this wrapper — they call
+    `_classify_instrument` directly, because dropping or CRITICAL-flagging
+    an unknown type are both the wrong default there (the middle tier
+    exists precisely for them).
+    """
+    return _classify_instrument(deed_type) != "conveyance"
 
 
 async def _plymouth_address_fallback(
@@ -2536,20 +3076,166 @@ def _plymouth_classify_grantor_hit(row: dict, st_num: str, st_word: str,
     # A row whose date will not parse is treated as post-acquisition — the
     # safe direction for a deed-out check.
     pre_acq = bool(acq_date > (0, 0, 0) and (0, 0, 0) < row_date < acq_date)
-    conveyance = not _is_non_conveyance_instrument(row.get("deed_type") or "")
+    # v3.36 (item 0a): three-way. 'unknown' is a middle tier — the CRITICAL
+    # deed-out note keys on a KNOWN conveyance only; an unrecognised type
+    # gets its own WARNING in finalize and stays in needs_review (never a
+    # false CRITICAL — item 13 — and never dropped).
+    instrument_class = _classify_instrument(row.get("deed_type") or "")
+    conveyance = instrument_class == "conveyance"
+    significance = _instrument_significance(row.get("deed_type") or "")
 
+    # v3.37 (item 18) — a post-acquisition conveyance is promoted to
+    # needs_review REGARDLESS of parcel, which is right when nothing locates
+    # the hit and wrong when something does. On a common surname the
+    # broad pass fills the review set with other people's parcels (Whittaker:
+    # 33 of 34 rows, against v3.21's stated goal of "5 rows instead of 93").
+    #
+    # Demote ONLY on POSITIVE EVIDENCE that the hit is somewhere else.
+    # Keying on the tier name would be wrong: `other_town` is reached BOTH
+    # by "indexed in another town" AND by "no town cell at all" (a blank
+    # town cannot match, so it falls through to the same tier), and
+    # demoting the second is missing-information-read-as-a-non-match — the
+    # defect this whole codebase is built against. So require a locating
+    # signal to actually exist: a street (which by construction did not
+    # match the subject) or a town (which did not match either).
+    #
+    # The KDM counter-fixture is what constrains this: its 8
+    # `parcel unknown — subject town` rows are a CORRECT flood and must
+    # stay, because the Plymouth index simply carries no address for them.
+    # Demote ONLY on a TOWN mismatch, and only when a town was actually
+    # indexed. Two deliberate narrowings:
+    #  * `other_same_town` (same town, different street) is NOT demoted —
+    #    same-town is exactly where this workflow's documented wrong-parcel
+    #    traps live (a seller with two properties in one town; a street
+    #    whose suffix the index ignores, Chestnut St vs Chestnut Pl). An
+    #    address mismatch inside the subject town is not strong enough
+    #    evidence to stop looking.
+    #  * a BLANK town is not evidence of anything.
+    located_elsewhere = (
+        parcel in ("other_parcel", "other_town") and bool(town)
+    )
     needs_review = (
         parcel in ("subject", "possible_subject", "unknown_same_town")
-        or (conveyance and not pre_acq)
+        # unknown counts like a conveyance here: membership must not shrink
+        # for want of a recognised type.
+        or (instrument_class != "non_conveyance" and not pre_acq
+            and not located_elsewhere)
+        # v3.38 — an instrument that can change WHO OWNS or WHO SIGNS is
+        # never demoted for being a non-conveyance: a death certificate is
+        # how a survivor takes title with no deed recorded.
+        or (significance == "ownership_change" and not pre_acq
+            and not located_elsewhere)
     )
     tag = _PLYMOUTH_HIT_TAGS[parcel] + (" | pre-acquisition" if pre_acq else "")
     return {
         "parcel": parcel,
         "pre_acquisition": pre_acq,
         "conveyance": conveyance,
+        "instrument_class": instrument_class,
+        "significance": significance,             # v3.38 ownership_change|burden|''
+        "located_elsewhere": located_elsewhere,   # v3.37 (item 18) evidence
         "needs_review": needs_review,
         "tag": tag,
     }
+
+
+# v3.38 (item 10 scope work) — instruments that are NOT conveyances but
+# still bear on the two questions this workflow actually answers: does the
+# purported owner still own it, and WHO are all the current owners /
+# signers. Being filed under the generic "assess as an encumbrance, not a
+# deed-out" note buried exactly the things that cause bad intake:
+#   * a joint tenant or tenant-by-the-entirety DIES — the survivor owns the
+#     whole parcel and NO DEED IS EVER RECORDED;
+#   * a trust still owns it but a DIFFERENT TRUSTEE now signs (certificate,
+#     appointment, resignation);
+#   * a taking DIVESTS title with no deed from the owner at all;
+#   * a probate decree / court order vests or confirms title.
+# These are already returned by every full-name search (those are not
+# type-restricted), so this is a SURFACING fix, not a search fix.
+_OWNERSHIP_CHANGE_SUBSTR = (
+    "DEATH", "DECEASED", "PROBATE", "ESTATE OF", "ADMINISTRAT", "EXECUT",
+    "TAKING", "TRUSTEE", "GUARDIAN", "CONSERVATOR", "PARTITION",
+    "DECREE", "ORDER", "DIVORCE", "SURVIVORSHIP", "HEIR",
+)
+_OWNERSHIP_CHANGE_CODES = {
+    "TT", "TKG",                      # tax taking / taking
+    "DEATH CRTF", "DEATH CR",         # death certificate (+8-char grid form)
+    "TR CRTF",                        # trustee's certificate
+    "ACPT TR", "RSGN TR",             # acceptance / resignation of trustee
+    "APPT ACPT TR", "APPT ACP",       # appointment & acceptance of a trustee
+    "DCRE", "ORDR", "JGMT",           # decree / order / judgment
+}
+
+# Instruments that burden the parcel without changing who owns it. The user
+# asked for these alongside the ownership set (2026-08-14): a post-
+# acquisition easement or restriction granted BY the owner is a real title
+# matter to know about before closing, even though it conveys nothing.
+_BURDEN_SUBSTR = ("EASEMENT", "COVENANT", "RESTRICTION", "RSTN")
+_BURDEN_CODES = {"ESMT", "RSTNS"}
+
+
+def _instrument_significance(deed_type: str) -> str:
+    """
+    v3.38 — for an instrument that is NOT a conveyance, say WHY it might
+    still matter: 'ownership_change' | 'burden' | ''.
+
+    Deliberately independent of `_classify_instrument`: a DECREE is still
+    'unknown' (it is not in the conveyance/non-conveyance vocabulary and
+    must keep warning), and it is ALSO ownership-relevant. The two answer
+    different questions — "did this convey?" and "does this change who owns
+    or signs?" — and collapsing them is what buried the death certificate.
+    """
+    t = (deed_type or "").upper().strip()
+    if not t:
+        return ""
+    if t in _OWNERSHIP_CHANGE_CODES or any(s in t for s in _OWNERSHIP_CHANGE_SUBSTR):
+        return "ownership_change"
+    if t in _BURDEN_CODES or any(s in t for s in _BURDEN_SUBSTR):
+        return "burden"
+    return ""
+
+
+def _significance_note(rid: str, deed_type: str, date: str, where: str) -> str | None:
+    """v3.38 — the elevated note for a non-conveyance that still bears on
+    ownership or burdens the parcel. Returns None when neither applies, so
+    the caller falls through to the generic encumbrance wording."""
+    sig = _instrument_significance(deed_type)
+    if sig == "ownership_change":
+        return (
+            f"OWNERSHIP-RELEVANT: grantor hit {rid} ({deed_type} {date}) at "
+            f"the SUBJECT property{where} is not a conveyance, but this "
+            f"instrument type can change WHO OWNS the parcel or WHO MUST "
+            f"SIGN — a death certificate vests a survivor with no deed ever "
+            f"recorded; a trustee certificate/appointment/resignation changes "
+            f"the signer; a decree or order can vest or confirm title."
+            + _taking_caveat(deed_type)
+            + " Confirm the CURRENT owners and signatories before drafting."
+        )
+    if sig == "burden":
+        return (
+            f"BURDEN ON THE PARCEL: grantor hit {rid} ({deed_type} {date}) at "
+            f"the SUBJECT property{where} conveys nothing, but an easement, "
+            f"covenant or restriction granted after the seller acquired the "
+            f"parcel runs with the land — read it and disclose it."
+        )
+    return None
+
+
+def _taking_caveat(deed_type: str) -> str:
+    """
+    v3.36 (item 0a, pre-existing caveat surfaced during the design) — a
+    TAKING is classified non-conveyance so it never fires the deed-out
+    CRITICAL, but unlike a mortgage or homestead it CAN divest title (tax
+    taking, eminent domain). When one sits at the subject parcel, the
+    encumbrance note must not describe it as a mere encumbrance. Returns
+    the caveat sentence, or '' for non-taking types.
+    """
+    t = (deed_type or "").upper().strip()
+    if "TAKING" in t or t in ("TKG", "TT"):
+        return (" NOTE: a TAKING can divest title (tax taking / eminent "
+                "domain) — check redemption or disposition status; do not "
+                "treat as a mere encumbrance.")
+    return ""
 
 
 def _plymouth_grantor_sort_key(row: dict) -> tuple:
@@ -2695,6 +3381,17 @@ def _plymouth_finalize_grantor_check(result: dict, rows: list, st_num: str,
             "needs_review": len(review),
             "pre_acquisition": sum(
                 1 for r in rows if r["classification"]["pre_acquisition"]),
+            # v3.37 (item 18) — how many post-acquisition conveyance-type
+            # hits were kept OUT of needs_review because an address or town
+            # positively located them at another parcel. This is the
+            # evidence behind a short review set: without it, "needs_review
+            # is small" and "the classifier lost rows" look identical.
+            "demoted_located_elsewhere": sum(
+                1 for r in rows
+                if r["classification"].get("located_elsewhere")
+                and not r["classification"]["needs_review"]
+                and r["classification"]["instrument_class"] != "non_conveyance"
+                and not r["classification"]["pre_acquisition"]),
             **counts,
         }
         # A conveyance at the subject parcel recorded on/after the
@@ -2711,13 +3408,34 @@ def _plymouth_finalize_grantor_check(result: dict, rows: list, st_num: str,
                     "recorded on/after the acquisition — the seller may have deeded "
                     "the subject parcel out. Verify before closing."
                 )
-            else:
+            elif c.get("instrument_class") == "unknown":
+                # v3.36 (item 0a): the middle tier. Before this, an
+                # unrecognised type here fired the CRITICAL above — a false
+                # deed-out costing a browser verification trip (item 13,
+                # CONTN UC). One line to read instead of a browser session.
                 result["notes"].append(
+                    f"WARNING: grantor hit Bk{r['book']} Doc#{r['doc_number']} "
+                    f"has UNRECOGNISED type {r['deed_type']!r} at the SUBJECT "
+                    f"property ({r['street']}, {r['town']}) — not classified. "
+                    "Read the instrument (or its detail panel) to determine "
+                    "whether it conveys or encumbers, and add the type to the "
+                    "script vocabulary so future runs classify it."
+                )
+            else:
+                # v3.38 — elevate the non-conveyances that still bear on WHO
+                # OWNS / WHO SIGNS (death cert, trustee change, taking,
+                # decree) and the ones that burden the parcel (easement,
+                # covenant, restriction). Everything else keeps the generic
+                # encumbrance wording.
+                sig_note = _significance_note(
+                    f"Bk{r['book']} Doc#{r['doc_number']}", r.get("deed_type"),
+                    r.get("recorded_date"), f" ({r['street']}, {r['town']})")
+                result["notes"].append(sig_note or (
                     f"Grantor hit Bk{r['book']} Doc#{r['doc_number']} "
                     f"({r['deed_type']} {r['recorded_date']}) affects the SUBJECT "
                     "property but is not a conveyance — assess as an encumbrance "
                     "(homestead/lien/mortgage), not as a deed-out."
-                )
+                ))
 
     if not rows:
         result["notes"].append(
@@ -2730,11 +3448,18 @@ def _plymouth_finalize_grantor_check(result: dict, rows: list, st_num: str,
             f"need review (subject parcel: {s['subject']}, possible subject: "
             f"{s['possible_subject']}, unknown parcel in the subject town: "
             f"{s['unknown_same_town']}, plus any post-acquisition conveyance "
-            f"elsewhere). The other {s['total'] - s['needs_review']} are other "
-            "parcels/towns or pre-acquisition and are still listed in full in "
+            f"that could NOT be located elsewhere). The other "
+            f"{s['total'] - s['needs_review']} are other parcels/towns or "
+            "pre-acquisition and are still listed in full in "
             "grantor_check.deeds, ordered most-relevant first. READ "
             "grantor_check.needs_review FIRST. A 'parcel unknown' tag means the "
             "index carried no address — that row was NOT ruled out."
+            + (f" {s['demoted_located_elsewhere']} post-acquisition "
+               "conveyance-type hit(s) were kept OUT of the review set because "
+               "the index positively located them at a DIFFERENT parcel "
+               "(street or town) — they are still in grantor_check.deeds; a "
+               "row with no locating information at all is never demoted."
+               if s.get("demoted_located_elsewhere") else "")
         )
     else:
         result["notes"].append(
@@ -2757,6 +3482,7 @@ async def run_plymouth(
     street_number: str = "",
     street_name: str = "",
     force_address_search: bool = False,
+    lien_sweep: bool = False,
 ) -> dict:
     """
     Plymouth County Registry of Deeds — full workflow:
@@ -3250,13 +3976,22 @@ async def run_plymouth(
             # reported as the deed.
             if row is not None and _is_non_conveyance_instrument(row.get("deed_type", "")):
                 result["selected_row_is_not_a_deed"] = True
-                result["notes"].append(
-                    f"CRITICAL: the selected instrument is a {row.get('deed_type')!r}, NOT a "
-                    f"conveyance deed. No DEED-type row for this property was found in the "
-                    f"grantee name index or the property address index. DO NOT report this as "
-                    f"the vesting deed or extract a legal description from it. Check Plymouth "
-                    f"Registered Land (Land Court), and check for a misindexed grantee name."
-                )
+                # v3.36 (item 0a): an UNRECOGNISED type now trips this guard
+                # too — previously the bool's fall-through called it a
+                # conveyance, so an unknown type could be reported as the
+                # vesting deed and pass this check silently. Word the two
+                # cases differently: "not a deed" and "we could not tell"
+                # call for different follow-up.
+                if _classify_instrument(row.get("deed_type", "")) == "unknown":
+                    result["notes"].append(
+                        f"CRITICAL: the selected instrument has an UNRECOGNISED type "
+                        f"{row.get('deed_type')!r} — the script cannot confirm it is a "
+                        f"conveyance deed. DO NOT report it as the vesting deed or "
+                        f"extract a legal description from it until you have read it. "
+                        f"If it IS a conveyance, add the type to the script vocabulary; "
+                        f"if not, check Plymouth Registered Land (Land Court) and check "
+                        f"for a misindexed grantee name."
+                    )
             else:
                 result["selected_row_is_not_a_deed"] = False
 
@@ -3446,10 +4181,26 @@ async def run_plymouth(
             # that can reach after-acquired property. Skipped when no window
             # was applied, because the main pass then already covers all years.
             passes = [(n, l, g_window, None) for n, l in names_to_check.items()]
-            if g_window > (0, 0, 0):
+            # v3.38 — the lien sweep is OPT-IN (--lien-sweep). It answers a
+            # different question from this workflow's, and when it does not
+            # run the notes SAY so: a sweep that silently did not run must
+            # never read as a sweep that found nothing.
+            if g_window > (0, 0, 0) and lien_sweep:
                 passes += [(n, f"{l} [lien sweep, all years]", None,
                             _PLYMOUTH_LIEN_DOC_TYPES)
                            for n, l in names_to_check.items()]
+            elif g_window > (0, 0, 0):
+                result["grantor_check"]["lien_sweep"] = (
+                    "not run (--lien-sweep not passed)")
+                result["notes"].append(
+                    "Grantor check: the all-years LIEN SWEEP did NOT run (it "
+                    "is opt-in since v3.38 — pass --lien-sweep). This run "
+                    "therefore says nothing about tax liens, executions, "
+                    "attachments or bankruptcies against the owners "
+                    "personally; those can reach after-acquired property and "
+                    "belong to /title-rundown. The deed-out and current-owner "
+                    "questions are unaffected."
+                )
 
             # v3.30 (item 11) — per-search accounting. Hits are de-duplicated
             # by (book, doc#) and labelled with the FIRST search that found
@@ -3948,11 +4699,31 @@ async def run_middlesex_south(
                 )
             if not deed_rows:
                 result["status"] = "deed_not_found"
+                # v3.36 (item 0a): name the UNRECOGNISED types separately.
+                # An unknown type is no longer kept as a deed candidate (it
+                # would otherwise be reported as the vesting deed with no
+                # warning), but "we did not recognise these" is a different
+                # statement from "these are all non-conveyances" — and this
+                # registry has no selected_row_is_not_a_deed flag to carry it.
+                unknown_types = sorted({
+                    r["deed_type"] for r in all_rows
+                    if _classify_instrument(r.get("deed_type") or "") == "unknown"
+                    and (r.get("deed_type") or "").strip()
+                })
                 result["notes"].append(
                     "All result rows are non-conveyance instruments — the vesting "
                     "deed may be under a different name spelling or in Registered "
                     "Land (not searched by this fast path)."
                 )
+                if unknown_types:
+                    result["notes"].append(
+                        f"NOTE: {len(unknown_types)} of the excluded type(s) were "
+                        f"UNRECOGNISED rather than known non-conveyances: "
+                        f"{unknown_types}. They were NOT reported as the vesting "
+                        "deed (an unknown type must not be), but check them by "
+                        "hand before concluding no deed exists, and add any real "
+                        "conveyance type to the script vocabulary."
+                    )
                 await browser.close()
                 return result
 
@@ -4085,51 +4856,115 @@ async def run_middlesex_south(
 
             # -----------------------------------------------------------
             # STEP 4 — GRANTOR CHECK (seller + all deed grantees)
+            #
+            # v3.32 (item 21a): per-search error isolation + accounting.
+            # One try/except used to wrap every search, so a failure in
+            # search #1 silently cancelled the co-owner searches while the
+            # run still reported success; and with no per-search record,
+            # "searched, all rows duplicate" and "never searched" produced
+            # byte-identical output (the item 11 defect, third platform).
+            # An errored search now lands in incomplete_searches and the
+            # closing note says INCOMPLETE — never "no subsequent
+            # instruments found".
             # -----------------------------------------------------------
+            names_to_check: dict[tuple, str] = {}
+            seller_key = (seller_last.upper().strip(), seller_first.upper().strip())
+            names_to_check[seller_key] = f"named seller ({seller_last} {seller_first})".strip()
+            for grantee_display in result.get("grantees", []):
+                key = _msouth_split_name(grantee_display)
+                # v3.32 (item 11b, first-name axis): the first-name field is
+                # a PREFIX match (proven live: querying 'ALAN' reached
+                # 'ALAN GEORGE'), so a co-owner queried with a full
+                # multi-token first name ('ANNA MARIE') can never reach an
+                # instrument indexed under the bare 'ANNA'. Truncate to the
+                # first token — a strict superset under prefix matching,
+                # the same move as Plymouth's middle-initial drop.
+                first_tok = key[1].split()[0] if key[1] else ""
+                bkey = (key[0], first_tok)
+                if key[0] and bkey != seller_key and bkey not in names_to_check:
+                    names_to_check[bkey] = f"{grantee_display} (co-owner from detail panel)"
+
+            search_log: list[dict] = []
+            all_grantor_rows: list[dict] = []
+            seen: set[tuple] = set()
+            g_page = None
             try:
                 g_page = await context.new_page()
-                names_to_check: dict[tuple, str] = {}
-                seller_key = (seller_last.upper().strip(), seller_first.upper().strip())
-                names_to_check[seller_key] = f"named seller ({seller_last} {seller_first})".strip()
-                for grantee_display in result.get("grantees", []):
-                    key = _msouth_split_name(grantee_display)
-                    if key[0] and key != seller_key:
-                        names_to_check[key] = grantee_display
-
-                all_grantor_rows: list[dict] = []
-                seen: set[tuple] = set()
-                for (g_last, g_first), label in names_to_check.items():
-                    rows = await _msouth_grantor_check(
-                        g_page, g_last, g_first,
-                        result["book"] or "", result["page"] or "", label,
-                    )
-                    for r in rows:
-                        key = (r["book"], r["page"])
-                        if key not in seen:
-                            seen.add(key)
-                            all_grantor_rows.append(r)
-                            result["notes"].append(
-                                f"Grantor check hit [{label}]: Bk{r['book']}/Pg{r['page']} "
-                                f"{r['deed_type']} {r['recorded_date']} | {r['street']}"
-                            )
-                result["grantor_check"]["has_subsequent_deed"] = len(all_grantor_rows) > 0
-                result["grantor_check"]["deeds"] = [
-                    f"Bk{r['book']}/Pg{r['page']} {r['deed_type']} {r['recorded_date']} "
-                    f"| {r['street']} | [found via: {r['searched_name']}]"
-                    for r in all_grantor_rows
-                ]
-                if all_grantor_rows:
-                    result["notes"].append(
-                        f"Grantor check: {len(all_grantor_rows)} instrument(s) found — "
-                        "Claude must assess title flags. (No Reverse Party column on "
-                        "this registry: open the detail panel or deed image for the "
-                        "counterparty of any DEED-type hit.)"
-                    )
-                else:
-                    result["notes"].append("Grantor check: no subsequent instruments found.")
-                await g_page.close()
             except Exception as e:
-                result["notes"].append(f"Grantor check failed (non-fatal): {e}")
+                for label in names_to_check.values():
+                    search_log.append({
+                        "name": "", "label": label, "rows_returned": None,
+                        "rows_new": 0,
+                        "status": f"ERROR — could not open search page: {e}",
+                    })
+                    result["grantor_check"].setdefault(
+                        "incomplete_searches", []).append(label)
+            if g_page is not None:
+                for (g_last, g_first), label in names_to_check.items():
+                    disp = f"{g_last} {g_first}".strip()
+                    entry = {"name": disp, "label": label,
+                             "rows_returned": None, "rows_new": 0, "status": "ok"}
+                    try:
+                        rows = await _msouth_grantor_check(
+                            g_page, g_last, g_first,
+                            result["book"] or "", result["page"] or "", label,
+                        )
+                        entry["rows_returned"] = len(rows)
+                        for r in rows:
+                            rkey = (r["book"], r["page"])
+                            if rkey not in seen:
+                                seen.add(rkey)
+                                entry["rows_new"] += 1
+                                all_grantor_rows.append(r)
+                                result["notes"].append(
+                                    f"Grantor check hit [{label}]: Bk{r['book']}/Pg{r['page']} "
+                                    f"{r['deed_type']} {r['recorded_date']} | {r['street']}"
+                                )
+                    except Exception as e:
+                        # This name was NOT searched — an open question, not
+                        # a clean answer. Keep going: the remaining names'
+                        # searches are independent of this failure.
+                        entry["status"] = f"ERROR — {type(e).__name__}: {e}"
+                        result["grantor_check"].setdefault(
+                            "incomplete_searches", []).append(label)
+                    search_log.append(entry)
+                try:
+                    await g_page.close()
+                except Exception:
+                    pass
+
+            # Platform-generic recorder (Plymouth-named for historical
+            # reasons; nothing in it is Plymouth-specific).
+            _plymouth_record_searches(result, search_log)
+            result["grantor_check"]["has_subsequent_deed"] = len(all_grantor_rows) > 0
+            result["grantor_check"]["deeds"] = [
+                f"Bk{r['book']}/Pg{r['page']} {r['deed_type']} {r['recorded_date']} "
+                f"| {r['street']} | [found via: {r['searched_name']}]"
+                for r in all_grantor_rows
+            ]
+            errored = [s for s in search_log
+                       if str(s.get("status", "")).startswith("ERROR")]
+            if errored:
+                result["notes"].append(
+                    f"CRITICAL: grantor check is INCOMPLETE — {len(errored)} of "
+                    f"{len(search_log)} search(es) did not run "
+                    f"({', '.join(s['label'] for s in errored)}). The hits above "
+                    "are from the searches that completed. NEVER report clean "
+                    "title from this run; re-run the failed name(s) before "
+                    "concluding anything."
+                )
+            elif all_grantor_rows:
+                result["notes"].append(
+                    f"Grantor check: {len(all_grantor_rows)} instrument(s) found — "
+                    "Claude must assess title flags. (No Reverse Party column on "
+                    "this registry: open the detail panel or deed image for the "
+                    "counterparty of any DEED-type hit.)"
+                )
+            else:
+                result["notes"].append(
+                    f"Grantor check: no subsequent instruments found "
+                    f"(all {len(search_log)} search(es) completed)."
+                )
 
         except Exception as e:
             result["errors"].append(f"Main workflow failed: {e}")
@@ -4553,6 +5388,13 @@ _ALIS_HTTP_HEADERS = {
         "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
     ),
 }
+
+# v3.38 — ALIS document-group codes used to restrict a search SERVER-SIDE.
+# "*DD" is the deed group (the deed-out question) and "*LN" the lien group
+# (the opt-in person-level sweep). Filtering at the registry instead of in
+# Python is what makes the deed-out net cheap.
+_ALIS_DEED_GROUP = "*DD"
+_ALIS_LIEN_GROUP = "*LN"
 
 _ALIS_MAX_PAGES = 5  # pagination cap per search (30 rows/page → 150 rows)
 
@@ -5562,18 +6404,49 @@ def _alis_classify_grantor_hit(row: dict, st_num: str, st_word: str,
     # safe direction for a deed-out check.
     pre_acq = bool(acq_date > (0, 0, 0) and (0, 0, 0) < row_date < acq_date)
     dt = (row.get("doc_type") or "").strip()
-    # A blank/unparsed type is treated as a conveyance — the safe direction.
-    conveyance = not dt or not _is_non_conveyance_instrument(dt)
+    # v3.36 (item 0a): three-way. A blank type is 'unknown' — kept in
+    # needs_review with the unknown-tier WARNING, no longer promoted all the
+    # way to a CRITICAL deed-out. Same for unrecognised types (item 13).
+    instrument_class = _classify_instrument(dt)
+    conveyance = instrument_class == "conveyance"
+    significance = _instrument_significance(dt)
 
+    # v3.37 (item 18) — see _plymouth_classify_grantor_hit for the full
+    # reasoning. Demote a post-acquisition conveyance out of needs_review
+    # ONLY on positive evidence it sits elsewhere: an abstract address that
+    # did not match, or a town cell that did not match. A row with neither
+    # is NOT ruled out and stays — `other_town` is also where a row with a
+    # BLANK town lands, and demoting that would be the v3.20 null-address
+    # mistake in a new place.
+    # Same rule as Plymouth: demote only on a TOWN mismatch with a town
+    # actually indexed. `other_same_town` stays (same-town wrong-parcel
+    # traps), and a blank town is not evidence — on ALIS a blank town
+    # cannot match, so it lands in `other_town` alongside genuine
+    # different-town rows; keying on the tier alone would drop it.
+    located_elsewhere = (
+        parcel in ("other_parcel", "other_town")
+        and bool((row.get("town") or "").strip())
+    )
     needs_review = (
         parcel in ("subject", "possible_subject", "unknown_same_town")
-        or (conveyance and not pre_acq)
+        # unknown counts like a conveyance here: membership must not shrink
+        # for want of a recognised type.
+        or (instrument_class != "non_conveyance" and not pre_acq
+            and not located_elsewhere)
+        # v3.38 — an instrument that can change WHO OWNS or WHO SIGNS is
+        # never demoted for being a non-conveyance: a death certificate is
+        # how a survivor takes title with no deed recorded.
+        or (significance == "ownership_change" and not pre_acq
+            and not located_elsewhere)
     )
     tag = _PLYMOUTH_HIT_TAGS[parcel] + (" | pre-acquisition" if pre_acq else "")
     return {
         "parcel": parcel,
         "pre_acquisition": pre_acq,
         "conveyance": conveyance,
+        "instrument_class": instrument_class,
+        "significance": significance,             # v3.38 ownership_change|burden|''
+        "located_elsewhere": located_elsewhere,   # v3.37 (item 18) evidence
         "needs_review": needs_review,
         "tag": tag,
     }
@@ -5648,7 +6521,10 @@ def _alis_classify_fetch_abstracts(base_url: str, rows: list, acq_date: tuple,
         if "_abstract" in r:
             continue
         dt = (r.get("doc_type") or "").strip()
-        conv = not dt or not _is_non_conveyance_instrument(dt)
+        # v3.36 (item 0a): grantor role — an UNKNOWN type must still get an
+        # abstract fetched (it is the row most in need of an address, and
+        # the wrapper's selection-role default would skip it).
+        conv = _classify_instrument(dt) != "non_conveyance"
         rd = _parse_deed_date(r.get("date_received") or "")
         post = not (acq_date > (0, 0, 0) and (0, 0, 0) < rd < acq_date)
         if (conv and post) or _alis_hit_town_matches(r.get("town"), town_code,
@@ -5752,6 +6628,17 @@ def _alis_finalize_grantor_check(result: dict, rows: list, base_name: str,
             "needs_review": len(review),
             "pre_acquisition": sum(
                 1 for r in rows if r["classification"]["pre_acquisition"]),
+            # v3.37 (item 18) — how many post-acquisition conveyance-type
+            # hits were kept OUT of needs_review because an address or town
+            # positively located them at another parcel. This is the
+            # evidence behind a short review set: without it, "needs_review
+            # is small" and "the classifier lost rows" look identical.
+            "demoted_located_elsewhere": sum(
+                1 for r in rows
+                if r["classification"].get("located_elsewhere")
+                and not r["classification"]["needs_review"]
+                and r["classification"]["instrument_class"] != "non_conveyance"
+                and not r["classification"]["pre_acquisition"]),
             **counts,
         }
         # Subject / possible-subject notes — same wording as the sampler.
@@ -5769,13 +6656,30 @@ def _alis_finalize_grantor_check(result: dict, rows: list, base_name: str,
                 _alis_hit_address_note(result, r, matched, st_num, st_word,
                                        "registry abstract")
                 r["_class_noted"] = True
-            elif c["parcel"] == "subject":
+            elif c["parcel"] == "subject" and c.get("instrument_class") == "unknown":
+                # v3.36 (item 0a): the middle tier. Before this, an
+                # unrecognised type here fired the CRITICAL deed-out note —
+                # a false alarm costing a browser verification trip
+                # (item 13). One line to read instead of a browser session.
                 result["notes"].append(
+                    f"WARNING: grantor hit {_alis_row_id(r)} has UNRECOGNISED "
+                    f"type {r['doc_type']!r} ({r['date_received']}) at the "
+                    "SUBJECT property — not classified. Read the instrument "
+                    "(or its abstract) to determine whether it conveys or "
+                    "encumbers, and add the type to the script vocabulary so "
+                    "future runs classify it."
+                )
+                r["_class_noted"] = True
+            elif c["parcel"] == "subject":
+                # v3.38 — same elevation as the Plymouth dispatcher.
+                sig_note = _significance_note(
+                    _alis_row_id(r), r.get("doc_type"), r.get("date_received"), "")
+                result["notes"].append(sig_note or (
                     f"Grantor hit {_alis_row_id(r)} ({r['doc_type']} "
                     f"{r['date_received']}) affects the SUBJECT property but "
                     "is not a conveyance — assess as an encumbrance "
                     "(homestead/lien/mortgage), not as a deed-out."
-                )
+                ))
                 r["_class_noted"] = True
             elif c["parcel"] == "possible_subject" and c["conveyance"]:
                 addr = next(
@@ -5794,7 +6698,8 @@ def _alis_finalize_grantor_check(result: dict, rows: list, base_name: str,
             f"{s['needs_review']} need review (subject parcel: {s['subject']}, "
             f"possible subject: {s['possible_subject']}, unknown parcel in "
             f"the subject town: {s['unknown_same_town']}, plus any "
-            f"post-acquisition conveyance elsewhere). The other "
+            f"post-acquisition conveyance that could NOT be located "
+            f"elsewhere). The other "
             f"{s['total'] - s['needs_review']} are other parcels/towns or "
             "pre-acquisition and are still listed in full in "
             "grantor_check.deeds, ordered most-relevant first. READ "
@@ -5803,6 +6708,12 @@ def _alis_finalize_grantor_check(result: dict, rows: list, base_name: str,
             "was NOT ruled out. Rows 'via: ... (surname only)' may still be "
             "same-surname strangers — verify the grantor's first name before "
             "flagging one as the seller's."
+            + (f" {s['demoted_located_elsewhere']} post-acquisition "
+               "conveyance-type hit(s) were kept OUT of the review set because "
+               "the registry abstract or town cell positively located them at "
+               "a DIFFERENT parcel — they are still in grantor_check.deeds; a "
+               "row with no locating information at all is never demoted."
+               if s.get("demoted_located_elsewhere") else "")
         )
     else:
         gc["summary"] = None
@@ -6412,8 +7323,40 @@ _ENTITY_NAME_TOKENS = {
 
 _GENERATIONAL_SUFFIXES = {"JR", "SR", "II", "III", "IV", "V"}
 
+# v3.34 (item 19) — words that are marital-status / capacity RECITAL, never
+# part of a name. A deed's granting clause writes "Argos Castille being
+# unmarried" with no comma, and the v3.14 splitter took the LAST token as
+# the surname — so the grantor check searched "UNMARRIED, ARGOS", found
+# nothing (no such party exists), and reported the search as
+# `status: ok, 0 rows`, which the reading guide defines as CLEAN. A
+# nonexistent party rendering as a cleared owner is the tenth instance of
+# missing-information-read-as-a-negative-answer. Both halves of the fix
+# matter: strip the recital so the real name survives, AND treat a surname
+# that still lands on one of these words as UNDERIVABLE — never searched,
+# never silently skipped.
+_NAME_RECITAL_TOKENS = {
+    "BEING", "UNMARRIED", "MARRIED", "SINGLE", "WIDOWED", "WIDOW",
+    "WIDOWER", "DIVORCED", "INDIVIDUALLY", "DECEASED", "FORMERLY",
+    "KNOWN", "NOW",
+}
 
-def _grantee_full_name_pair(name: str) -> tuple:
+# Recital PHRASES cut before tokenising. Anchored on specific status words
+# so "John A Smith" (period-stripped initial 'A') can never be truncated:
+# "a"/"an" only cut when followed by a status word.
+_NAME_RECITAL_PHRASE_RE = re.compile(
+    r"\s+(?:"
+    r"being\s.*"                                            # "being unmarried", "being duly ..."
+    r"|(?:a|an)\s+(?:single|married|unmarried|widowed)\b.*"  # "a single person", "a married man"
+    r"|(?:a|an)\s+widow(?:er)?\b.*"                          # "a widow", "a widower"
+    r"|husband\s+and\s+wife\b.*"
+    r"|wife\s+and\s+husband\b.*"
+    r"|individually\b.*"
+    r")$",
+    re.IGNORECASE,
+)
+
+
+def _grantee_full_name_pair(name: str, notes: list = None) -> tuple:
     """
     v3.14 — parse a grantees_full entry (a name transcribed verbatim from
     the deed, natural order, possibly with capacity language) into an ALIS
@@ -6424,14 +7367,24 @@ def _grantee_full_name_pair(name: str) -> tuple:
        Trustee of the Smith Family Trust"      → ("SMITH", "JOHN")
       "Alan D. Whitfield-Barrow"               → ("WHITFIELD-BARROW", "ALAN")
       "Robert Fenwick Jr."                     → ("FENWICK", "ROBERT")
+      "Anna Marie Coyne being unmarried"       → ("COYNE", "ANNA")   [v3.34]
       "The Smith Family Trust"                 → ("", "")   [entity]
 
     Everything after the first comma is capacity language and is dropped;
-    " as Trustee ..." phrases without a comma are cut too. Last remaining
-    token = surname (hyphenated surnames survive intact), first token =
-    first name — ALIS's begins-with matching extends "MARTA" to
-    "MARTA LYNN"/"MARTA L" index variants. Returns ("", "") when the entry
-    is an entity/trust or doesn't parse to at least two name tokens.
+    " as Trustee ..." phrases without a comma are cut too, and v3.34 cuts
+    marital-status recitals ("being unmarried", "a single person") the
+    same way. Last remaining token = surname (hyphenated surnames survive
+    intact), first token = first name — ALIS's begins-with matching
+    extends "MARTA" to "MARTA LYNN"/"MARTA L" index variants.
+
+    Returns ("", "") when the entry is an entity/trust or doesn't parse to
+    at least two name tokens. v3.34: when the failure is NOT an entity —
+    an individual's entry that would not yield a searchable name, or a
+    derived surname landing on a recital word — a WARNING is appended to
+    `notes` naming the entry, because that party's grantor search DID NOT
+    RUN and silence here reads as a clean check (item 19; the abstract's
+    party list usually still covers the party, but that cannot be assumed
+    at this call site).
     """
     segments = [seg.strip() for seg in (name or "").split(",")]
     s = segments[0]
@@ -6444,13 +7397,28 @@ def _grantee_full_name_pair(name: str) -> tuple:
         if segments[1].split()[0].upper().rstrip(".") in _ENTITY_NAME_TOKENS:
             return ("", "")
     s = re.split(r"\s+(?:as|aka|a/k/a|f/k/a)\s+", s, maxsplit=1, flags=re.I)[0]
+    s = _NAME_RECITAL_PHRASE_RE.sub("", s)          # v3.34 (item 19)
     s = s.replace(".", " ").strip()
     tokens = s.split()
     if any(t.upper() in _ENTITY_NAME_TOKENS for t in tokens):
         return ("", "")
-    while tokens and tokens[-1].upper() in _GENERATIONAL_SUFFIXES:
+    while tokens and (tokens[-1].upper() in _GENERATIONAL_SUFFIXES
+                      or tokens[-1].upper() in _NAME_RECITAL_TOKENS):
         tokens.pop()
-    if len(tokens) < 2:
+    if len(tokens) < 2 or tokens[-1].upper() in _NAME_RECITAL_TOKENS:
+        # Not an entity (that returned above) — this is an individual's
+        # entry that did NOT yield a search name. Say so: silence here is
+        # how "UNMARRIED, <first name>: 0 rows, ok" read as a cleared
+        # co-owner.
+        if notes is not None and (name or "").strip():
+            notes.append(
+                f"WARNING: grantees_full entry '{name}' did not yield a "
+                f"co-owner search name — that party's grantor search DID "
+                f"NOT RUN from the deed's party list. Check the abstract "
+                f"co-owner searches in grantor_check.searches cover this "
+                f"party, or search the name by hand before reporting the "
+                f"co-owner clean."
+            )
         return ("", "")
     return (tokens[-1].upper(), tokens[0].upper())
 
@@ -6582,6 +7550,7 @@ def _alis_grantor_check_http(
     prefetched: dict = None,
     retry_town: str = None,
     check_meta: dict = None,
+    lien_sweep: bool = False,
 ) -> list:
     """
     v3.9 grantor check. Runs a PAGINATED grantor search for each
@@ -6666,7 +7635,26 @@ def _alis_grantor_check_http(
     acq_date = _parse_deed_date(acq_row.get("date_received") or "") if acq_row else (0, 0, 0)
 
     def _pair_key(pair):
-        return (pair[0], pair[1])
+        # v3.38 — the document group is PART OF THE IDENTITY of a search.
+        # Without it a prefetched deed-group set could be served to an
+        # all-types pair (or vice versa), silently narrowing a search that
+        # was supposed to see every instrument.
+        return (pair[0], pair[1], _pair_doc_type(pair))
+
+    def _pair_doc_type(pair):
+        """v3.38 — optional 4th element: the server-side document group for
+        THIS pair. The deed-out net runs restricted to the deed group so the
+        registry filters instead of Python (the broad pass fetched 150-190
+        rows to keep ~25, and was ~all of the grantor check's runtime)."""
+        return pair[3] if len(pair) > 3 and pair[3] else "*ALL"
+
+    def _pair_is_net(pair):
+        """v3.38 — is this pair a broad deed-out NET (strangers likely,
+        conveyances only) rather than a search for a known party? Defaults
+        to the pre-v3.38 rule: an empty first name marked the net."""
+        if len(pair) > 4:
+            return bool(pair[4])
+        return not pair[1]
 
     def _pair_label(pair):
         # v3.14 — a pair may carry an explicit via-label as a third element
@@ -6738,7 +7726,7 @@ def _alis_grantor_check_http(
         try:
             rows = _alis_search_http(
                 s, base_url, pair[0], pair[1], "R", town=town,
-                land_court=land_court, doc_type="*ALL",
+                land_court=land_court, doc_type=_pair_doc_type(pair),
                 date_from=window_param, notes=local_notes,
                 meta=meta,
             )
@@ -6874,9 +7862,27 @@ def _alis_grantor_check_http(
             return _pair_key(pair), {"rows": [], "meta": {},
                                      "notes": local_notes, "error": e}
 
-    # Only worth sweeping when a window was actually applied — with no
-    # window the main pass already covers all years and all types.
-    lien_pairs = [p for p in name_pairs if window_param and p[1]]
+    # v3.38 — the lien sweep is now OPT-IN (--lien-sweep). It answers a
+    # different question from this workflow's: person-level liens that can
+    # reach after-acquired property, not "who owns the parcel". Default OFF
+    # keeps the grantor check focused; when off, the notes SAY so, because a
+    # sweep that silently did not run must never read as a sweep that found
+    # nothing.
+    # Still only worth sweeping when a window was actually applied — with no
+    # window the main pass already covers all years and all types. And never
+    # sweep a deed-out NET pair: it is deed-group restricted by construction.
+    lien_pairs = [p for p in name_pairs
+                  if lien_sweep and window_param and p[1] and not _pair_is_net(p)]
+    if not lien_sweep and window_param and check_meta is not None:
+        check_meta["lien_sweep"] = "not run (--lien-sweep not passed)"
+        notes.append(
+            "Grantor check: the all-years LIEN SWEEP did NOT run (it is "
+            "opt-in since v3.38 — pass --lien-sweep). This run therefore says "
+            "nothing about tax liens, executions, attachments or bankruptcies "
+            "against the owners personally; those can reach after-acquired "
+            "property and belong to /title-rundown. The deed-out and "
+            "current-owner questions are unaffected."
+        )
     lien_results = {}
     if lien_pairs:
         with ThreadPoolExecutor(max_workers=min(4, len(lien_pairs))) as pool:
@@ -6886,7 +7892,8 @@ def _alis_grantor_check_http(
     # Phase C — serial merge + filter, in pair order.
     found, seen = [], set()
     for pair in name_pairs:
-        last, first = pair[0], pair[1]   # first == "" marks the broad search
+        last, first = pair[0], pair[1]
+        is_net = _pair_is_net(pair)   # v3.38 — was: first == "" marked the net
         label = _pair_label(pair)
         entry = searched.get(_pair_key(pair))
         if entry is None:
@@ -6975,7 +7982,7 @@ def _alis_grantor_check_http(
                             f"(non-fatal): {dd['error']}"
                         )
                     elif not dd["meta"].get("truncated"):
-                        if not first:
+                        if is_net:
                             # The broad surname-only search is filtered to
                             # conveyance types anyway (filter (a) below), so a
                             # complete deed-group pass IS a complete broad
@@ -7064,13 +8071,17 @@ def _alis_grantor_check_http(
             inst = _alis_instrument_id(r)
             if acq_id and inst == acq_id:
                 continue
-            if not first:
-                # A blank/unparsed type is KEPT: _is_non_conveyance_instrument
-                # treats blank as non-deed, but dropping an unknown row is the
-                # dangerous direction for a deed-out check — surface it and let
-                # Claude assess.
+            if is_net:
+                # v3.36 (item 0a): only a KNOWN non-conveyance is dropped
+                # from the broad surname-only pass. Blank AND unrecognised
+                # types are KEPT — dropping an unknown row is the dangerous
+                # direction for a deed-out check (a conveyance whose label
+                # lacks the literal string "DEED" — probate distribution,
+                # order of taking, a registry indexing QCD/WD — would vanish
+                # silently). Surface it and let Claude assess. This is why
+                # the design refused a pure allowlist.
                 dt = (r.get("doc_type") or "").strip()
-                if dt and _is_non_conveyance_instrument(dt):
+                if _classify_instrument(dt) == "non_conveyance":
                     non_conv += 1
                     continue
                 if acq_date > (0, 0, 0):
@@ -7790,6 +8801,7 @@ def run_alis_http(
     extraction_mode: str = "api",
     verify_grantor_hit: str = "",
     show_timings: bool = True,
+    lien_sweep: bool = False,
 ) -> dict:
     """
     Shared pure-HTTP runner for the Browntech ALIS registries (Norfolk,
@@ -7983,6 +8995,36 @@ def run_alis_http(
         + f" | Grantee: {row['name']} | Desc: {row['doc_desc']}"
     )
 
+    # v3.36 (item 0a) — the ALIS analogue of Plymouth's
+    # `selected_row_is_not_a_deed` guard, which this path never had.
+    # `_alis_select_deed_row` falls back to the unfiltered rows when every
+    # row is excluded, so a non-conveyance — or, before v3.36, an
+    # UNRECOGNISED type silently treated as a conveyance — could be
+    # reported as the vesting deed with no warning at all.
+    _sel_class = _classify_instrument(row.get("doc_type") or "")
+    if _sel_class != "conveyance":
+        result["selected_row_is_not_a_deed"] = True
+        if _sel_class == "unknown":
+            result["notes"].append(
+                f"CRITICAL: the selected instrument has an UNRECOGNISED type "
+                f"{row.get('doc_type')!r} — the script cannot confirm it is a "
+                f"conveyance deed. DO NOT report it as the vesting deed or "
+                f"extract a legal description from it until you have read it. "
+                f"If it IS a conveyance, add the type to the script vocabulary; "
+                f"if not, check the other section (Recorded vs Registered Land) "
+                f"and check for a misindexed grantee name."
+            )
+        else:
+            result["notes"].append(
+                f"CRITICAL: the selected instrument is a {row.get('doc_type')!r}, "
+                f"NOT a conveyance deed — no deed-type row was found for this "
+                f"party. DO NOT report it as the vesting deed or extract a legal "
+                f"description from it. Check the other section (Recorded vs "
+                f"Registered Land) and check for a misindexed grantee name."
+            )
+    else:
+        result["selected_row_is_not_a_deed"] = False
+
     _alis_apply_row_fields(result, row)
 
     _tm.mark("STEP 2.5 - document abstract")
@@ -8141,9 +9183,16 @@ def run_alis_http(
 
     def _prefetch_grantor_searches():
         psession = requests.Session()
-        pairs = [(seller_last.upper(), seller_first.upper())]
-        if not result["land_court"]:
-            pairs.append((seller_last.upper(), ""))
+        # v3.38 — prefetch the named seller (all types) and the SELLER'S
+        # deed-out net (surname + first initial, deed group). The retired
+        # surname-only pass used to be prefetched here, and because it
+        # returned 150-190 rows it did not finish during extraction — the
+        # grantor check then blocked on it, which is where 53s of a 94s run
+        # actually went. Co-owner nets are searched live; they are cheap.
+        pairs = [(seller_last.upper(), seller_first.upper(), "*ALL")]
+        if not result["land_court"] and seller_first.strip():
+            pairs.append((seller_last.upper(), seller_first.upper()[0],
+                          _ALIS_DEED_GROUP))
         # v3.29 — window from the row selected SO FAR. A later auto-retarget
         # can move to an earlier deed, which would make this window too late;
         # the window rides along in the entry and _alis_grantor_check_http
@@ -8151,7 +9200,7 @@ def run_alis_http(
         pf_window = _grantor_window_start(
             _parse_deed_date(result.get("recorded_date") or ""))
         pf_param = _alis_date_param(pf_window)
-        for last, first in pairs:
+        for last, first, pf_doc_type in pairs:
             try:
                 # v3.20 — the truncation flag rides along so the grantor
                 # check can trigger its town-scoped retry on capped
@@ -8159,10 +9208,10 @@ def run_alis_http(
                 meta = {}
                 rows = _alis_search_http(
                     psession, base_url, last, first, "R", town=grantor_town,
-                    land_court=result["land_court"], doc_type="*ALL",
+                    land_court=result["land_court"], doc_type=pf_doc_type,
                     date_from=pf_param, notes=prefetch_notes, meta=meta,
                 )
-                prefetched[(last, first)] = {
+                prefetched[(last, first, pf_doc_type)] = {
                     "rows": rows,
                     "truncated": meta.get("truncated", False),
                     "window": pf_window,
@@ -8551,7 +9600,10 @@ def run_alis_http(
                 co_pairs.append((co_last, co_first, label))
 
         for g in result.get("grantees_full") or []:
-            co_last, co_first = _grantee_full_name_pair(g)
+            # v3.34 (item 19): pass notes so an individual's entry that
+            # yields no search name WARNS instead of vanishing — a garbage
+            # or unparseable name must never render as a clean search.
+            co_last, co_first = _grantee_full_name_pair(g, result["notes"])
             _add_co_pair(co_last, co_first,
                          f"{co_last}, {co_first} (co-owner from deed)")
 
@@ -8576,9 +9628,82 @@ def run_alis_http(
             # Broad surname search — catches same-surname joint owners.
             # Skipped on Land Court (Kowalczyk: namesake noise buries the
             # seller's real instruments).
-            broad = (seller_last.upper(), "")
-            if broad not in name_pairs:
-                name_pairs.append(broad)
+            # -----------------------------------------------------------
+            # THE DEED-OUT NET (v3.38, replacing the always-on full
+            # surname-only pass). Skipped on Land Court either way
+            # (namesake noise buries the seller's real instruments).
+            #
+            # WHY IT CHANGED. Measured: the surname-only pass returned
+            # 188 rows to keep 28 (and 154 to keep 24 on another run) and
+            # was essentially the ENTIRE grantor-check runtime — 53s of a
+            # 94s run, 42s of a 57s run — while the named-seller and
+            # co-owner passes returned 4-6 rows each.
+            #
+            # WHAT IT UNIQUELY CAUGHT, and what replaces it. Both
+            # platforms PREFIX-match, so a full-name search already
+            # reaches longer index spellings ("PENN" finds "PENNE").
+            # Prefix matching runs one way only, so a full-name search
+            # genuinely misses an instrument indexed with an INITIAL
+            # ("SMITH, J") or a misspelled first name. Surname + first
+            # INITIAL catches both — "SMITH, J" reaches "J", "JOHN",
+            # "JON" — at a fraction of the rows. Restricted to the deed
+            # group server-side, because a deed-out net has no business
+            # fetching mortgages. (Note what NEITHER form rescues: a
+            # misspelled SURNAME. That is the address search's job.)
+            #
+            # The one thing surname-only still had: an UNKNOWN
+            # same-surname co-owner. Since v3.28 the registry abstract
+            # enumerates every party on both sides, so we normally know
+            # the owners by name — which is why the full pass is now a
+            # FALLBACK, fired only when that enumeration failed and the
+            # net is actually load-bearing.
+            # -----------------------------------------------------------
+            known_owners = [(seller_last.upper(), seller_first.upper())]
+            known_owners += [(p[0], p[1]) for p in co_pairs]
+            net_pairs = []
+            for o_last, o_first in known_owners:
+                if not (o_last and o_first):
+                    continue
+                init = (o_last, o_first[0])
+                if init in {(p[0], p[1]) for p in name_pairs + net_pairs}:
+                    continue
+                net_pairs.append((
+                    o_last, init[1],
+                    f"{o_last}, {init[1]}* (deed-out net, deed group)",
+                    _ALIS_DEED_GROUP, True,
+                ))
+
+            # Fallback: no owner name yielded an initial — the party list
+            # could not be enumerated at all (no abstract, extraction
+            # failed, entity seller). THIS is when the broad net earns its
+            # keep, so fire the full surname-only pass and say why.
+            if not net_pairs:
+                net_pairs.append((
+                    seller_last.upper(), "",
+                    f"{seller_last.upper()} (surname only — FALLBACK: owner "
+                    f"names could not be enumerated)",
+                    _ALIS_DEED_GROUP, True,
+                ))
+                result["notes"].append(
+                    "Grantor check: no owner first name was available, so the "
+                    "deed-out net fell back to a FULL surname-only search "
+                    "(deed group). This is the broad pass — its hits may be "
+                    "same-surname strangers; verify the grantor's first name "
+                    "before flagging one."
+                )
+            else:
+                result["notes"].append(
+                    "Grantor check deed-out net (v3.38): searched "
+                    + "; ".join(f"{p[0]}, {p[1]}*" for p in net_pairs)
+                    + " restricted to the deed group. Surname+initial is a "
+                    "PREFIX match, so it reaches initial-only and "
+                    "misspelled-first-name index entries; it does NOT reach "
+                    "a misspelled SURNAME (use the address search) or an "
+                    "unknown same-surname co-owner with a different initial."
+                )
+            for np_ in net_pairs:
+                if (np_[0], np_[1]) not in {(p[0], p[1]) for p in name_pairs}:
+                    name_pairs.append(np_)
 
         grantor_rows = _alis_grantor_check_http(
             session, base_url, name_pairs, town=grantor_town,
@@ -8587,6 +9712,7 @@ def run_alis_http(
             # v3.20 — subject town code for the capped-search retry, and
             # the grantor_check dict so truncation state lands in the JSON.
             retry_town=town, check_meta=result["grantor_check"],
+            lien_sweep=lien_sweep,
         )
         result["grantor_check"]["has_subsequent_deed"] = len(grantor_rows) > 0
         if grantor_rows:
@@ -8698,7 +9824,10 @@ def run_alis_http(
         conveyance_hits = []
         for r in grantor_rows:
             dt = (r.get("doc_type") or "").strip()
-            if not dt or _is_non_conveyance_instrument(dt):
+            # v3.36 (item 0a): grantor role — sample UNKNOWN types too. They
+            # are exactly the rows whose parcel question is still open; the
+            # wrapper's selection-role default would skip them.
+            if _classify_instrument(dt) == "non_conveyance":
                 continue
             if (target_hit is not None
                     and _alis_instrument_id(r) == _alis_instrument_id(target_hit)):
@@ -9738,6 +10867,15 @@ def main() -> None:
                              "the grantor check's results. Result lands in the "
                              "grantor_hit_verification JSON field. Combine with "
                              "--book/--page to keep the main deed selection pinned.")
+    parser.add_argument("--lien-sweep", action="store_true", default=False,
+                        help="v3.38: also run the all-years, type-restricted "
+                             "LIEN SWEEP for each owner (tax liens, "
+                             "executions, attachments, bankruptcies against "
+                             "the person). OFF by default — it answers a "
+                             "different question from this workflow's "
+                             "(who owns the parcel / who signs), and it is "
+                             "the slowest remaining part of the grantor "
+                             "check. When it does not run, the notes say so.")
     parser.add_argument("--no-timings", dest="timings", action="store_false",
                         default=True,
                         help="v3.31: omit the per-stage timing footer from the "
@@ -9819,6 +10957,44 @@ def main() -> None:
         }, indent=2))
         sys.exit(1)
 
+    # v3.35 (item 14) — flags only the ALIS HTTP engine implements must be
+    # REFUSED, never silently ignored. `--verify-grantor-hit` on
+    # `--registry plymouth` used to run the whole search and return
+    # `grantor_hit_verification: null` at exit 0 with no note and no error —
+    # indistinguishable from a clean verification, on the exact path the
+    # run's own CRITICAL note sends the operator down ("Verify before
+    # closing"). Same family as the v3.27 `--extraction api` pre-flight:
+    # if the request is knowably unsatisfiable, fail before any work.
+    # `--book/--page` are the same class (silently ignored → the heuristic
+    # pick reports at exit 0 as if the pin was honored).
+    _http_only = [f for f, v in (
+        ("--verify-grantor-hit", args.verify_grantor_hit),
+        ("--book", args.book),
+        ("--page", args.page),
+    ) if v]
+    if _http_only and (args.registry not in ("norfolk", "barnstable")
+                       or args.engine == "playwright"):
+        _why = (f"--registry {args.registry}"
+                if args.registry not in ("norfolk", "barnstable")
+                else "--engine playwright")
+        _fix = ("Re-run with --engine auto (or http)."
+                if args.registry in ("norfolk", "barnstable")
+                else "Re-run without the flag(s); verify a grantor hit on "
+                     "this registry by opening the instrument's images via "
+                     "the registry UI or the detail panel.")
+        print(json.dumps({
+            "status": "error",
+            "notes": [],
+            "errors": [
+                f"{_why} does not implement {', '.join(_http_only)} — these "
+                f"are ALIS HTTP-engine features (Norfolk/Barnstable). No "
+                f"search was performed: running anyway would silently ignore "
+                f"the flag(s) and exit 0 with a result that LOOKS like the "
+                f"request was honored. " + _fix
+            ],
+        }, indent=2))
+        sys.exit(1)
+
     output_folder = Path(args.output)
     output_folder.mkdir(parents=True, exist_ok=True)
 
@@ -9860,6 +11036,7 @@ def main() -> None:
                     extract_pdf=extract_pdf, extraction_mode=extraction_mode,
                     verify_grantor_hit=args.verify_grantor_hit,
                     show_timings=args.timings,
+                    lien_sweep=args.lien_sweep,
                 )
                 if _mode_note:
                     result.setdefault("notes", []).insert(0, _mode_note)
@@ -9902,6 +11079,34 @@ def main() -> None:
             args.headless, town=town,
         ))
         pw_result["engine"] = "playwright"
+        # v3.35 (item 14): the stderr warnings above never reached the result
+        # JSON — the channel the skill reads since v3.30 — so an auto-fallback
+        # run that dropped --verify-grantor-hit returned
+        # grantor_hit_verification: null at exit 0, indistinguishable from a
+        # clean verification. (The pre-flight guard refuses an EXPLICIT
+        # --engine playwright with these flags; this path is only reachable
+        # via --engine auto after an HTTP failure, which cannot be known
+        # pre-flight.) Say it in the result: in the field itself, not just a
+        # note — null must never be the encoding for "did not run".
+        if args.verify_grantor_hit:
+            pw_result["grantor_hit_verification"] = {
+                "status": "not_performed",
+                "requested": args.verify_grantor_hit,
+                "reason": "run fell back to the Playwright engine, which does "
+                          "not implement --verify-grantor-hit",
+            }
+            pw_result.setdefault("notes", []).insert(0,
+                f"WARNING: --verify-grantor-hit {args.verify_grantor_hit} was "
+                f"NOT performed — the run fell back to the Playwright engine, "
+                f"which does not implement it. The verification DID NOT RUN; "
+                f"re-run when the HTTP engine is available before relying on "
+                f"the hit's status.")
+        if args.book:
+            pw_result.setdefault("notes", []).insert(0,
+                f"WARNING: --book/--page targeting was NOT applied — the run "
+                f"fell back to the Playwright engine, which uses the "
+                f"most-recent heuristic. Verify the selected instrument is "
+                f"the intended one before relying on this result.")
         if http_errors:
             pw_result.setdefault("notes", []).insert(
                 0, f"HTTP engine failed ({http_errors}) — fell back to Playwright.")
@@ -9930,6 +11135,7 @@ def main() -> None:
                 args.headless, town=resolved_town,
                 street_number=sn, street_name=st,
                 force_address_search=args.force_address_search,
+                lien_sweep=args.lien_sweep,
             )
         )
     elif args.registry == "barnstable":
