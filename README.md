@@ -277,6 +277,16 @@ machine it additionally delegates to a private name-identity verifier that
 never enters this repository. If that verifier is configured but missing, the
 gate **blocks**; it does not quietly fall back to the weaker half.
 
+The same structural half runs in CI on every push and pull request
+([`.github/workflows/scrub-gate.yml`](.github/workflows/scrub-gate.yml)),
+because the local gate is a `.git/hooks` hook and hooks do not clone. CI also
+walks **every commit**, not just the tip — a file added in one commit and
+removed in the next is still in history forever.
+
+**Found a real name, address, or deed reference in here?** Please report it
+privately rather than in a public issue — see [SECURITY.md](SECURITY.md). A
+public issue would republish the thing being reported to a larger audience.
+
 ---
 
 ## License

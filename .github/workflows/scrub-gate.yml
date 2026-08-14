@@ -1,0 +1,82 @@
+name: scrub-gate
+
+# The local gate is a pre-commit hook in .git/hooks, and .git/hooks does not
+# clone. So the moment this repo is public — or the moment the author works
+# from a second machine — the only thing standing between a client's name and
+# a permanent public commit is a hook that is not there. This workflow runs
+# the same gate on the server, where it cannot be skipped, forgotten, or
+# lost with a fresh checkout.
+#
+# It runs the STRUCTURAL half only. That half was deliberately written to
+# need no list of real names (see the header of scripts/scrub_check.py): it
+# looks for client data by SHAPE — recorded instruments, deed images, run
+# logs, absolute home paths, credentials. The name-identity half needs the
+# private verifier, which is not in this repo and never will be, so it stays
+# a local pre-push responsibility for the maintainer.
+#
+# What this means for a contributor: CI passing does NOT prove your patch is
+# free of client identifiers. It proves it carries no client-data-shaped
+# file. See SECURITY.md before adding a worked example to the docs.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scrub-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: the gate's value is that a private->public flip
+          # exposes every commit, not just the tip.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Structural scrub gate (working tree)
+        run: python scripts/scrub_check.py
+
+      - name: Scan every commit on this branch, not just the tip
+        shell: bash
+        run: |
+          # A patch that adds a deed PDF in commit 1 and removes it in
+          # commit 2 leaves the file in history forever. Checking only the
+          # tip would call that clean.
+          set -euo pipefail
+          fail=0
+          while read -r sha; do
+            files=$(git ls-tree -r --name-only "$sha")
+            bad=$(printf '%s\n' "$files" | grep -Ei \
+              '\.(pdf|jpe?g|png|docx)$|result\.json$|run_log|namemap|apply_scrub|verify_scrub|registry_profile\.json$' \
+              || true)
+            if [ -n "$bad" ]; then
+              echo "::error::commit $sha carries client-data-shaped file(s):"
+              printf '  %s\n' $bad
+              fail=1
+            fi
+          done < <(git rev-list HEAD)
+          if [ "$fail" -eq 0 ]; then
+            echo "history clean — no client-data-shaped file in any commit"
+          fi
+          exit "$fail"
+
+      - name: Plugin manifest stays valid JSON
+        run: |
+          python -c "import json;[json.load(open(p)) for p in ['.claude-plugin/plugin.json','.claude-plugin/marketplace.json','scripts/rule_allow.json']];print('manifests parse')"
+
+      - name: Script imports and --doctor runs with no API key
+        env:
+          ANTHROPIC_API_KEY: ""
+        run: |
+          # The keyless path is the one a stranger hits first. If it ever
+          # hard-fails, the plugin is broken for everyone without a key.
+          pip install --quiet requests beautifulsoup4
+          python scripts/legal_desc_fetch.py --doctor --no-network
