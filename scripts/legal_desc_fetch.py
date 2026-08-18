@@ -1,7 +1,34 @@
 #!/usr/bin/env python3
 """
 legal_desc_fetch.py — fast-path for Legal Description Search Workflow
-Version: 3.39
+Version: 3.40
+
+v3.40 changes (a PORT DIVERGENCE, not a design change — the public copy had
+silently lost half of the v3.36 guard):
+
+  Plymouth's non-conveyance guard sets `selected_row_is_not_a_deed` on two
+  distinct cases and is supposed to word them differently, because they call
+  for different follow-up: an UNRECOGNISED instrument type ("we could not
+  tell what this is") and a RECOGNISED non-conveyance one ("this is an
+  ASSIGNMENT, not a deed"). Only the first branch survived the move into this
+  repo. The second set the flag and appended NOTHING.
+
+  So a public run that selected a recognised non-conveyance instrument — the
+  18 Kestrel Ave / Hingham case this guard exists for, where the address
+  index held only MTG/DISCHARGE/ASSIGNMENT rows — produced a bare boolean and
+  no CRITICAL note anywhere in the output or the report draft. The flag alone
+  is not the warning; the note is. A reader scanning notes for problems saw a
+  clean run.
+
+  This is the missing-information-read-as-a-negative-answer family again,
+  arriving by a new route: not a logic error, but a copy that drifted. The
+  branch is restored verbatim from the maintained lineage.
+
+  LESSON, recorded because it will recur until the two copies are collapsed:
+  the divergence was invisible to every gate. `verify_scrub.py` checks for
+  leaked identifiers, `rule_inventory.py verify` counts rules, and the test
+  suite lives outside this repo — none of them compares the two lineages.
+  A dropped `else:` is not detectable by any of them.
 
 v3.39 changes (item 22 — ownership that changes with NO deed was being
 hidden, on the exact case v3.38 was written for):
@@ -4049,6 +4076,14 @@ async def run_plymouth(
                         f"If it IS a conveyance, add the type to the script vocabulary; "
                         f"if not, check Plymouth Registered Land (Land Court) and check "
                         f"for a misindexed grantee name."
+                    )
+                else:
+                    result["notes"].append(
+                        f"CRITICAL: the selected instrument is a {row.get('deed_type')!r}, NOT a "
+                        f"conveyance deed. No DEED-type row for this property was found in the "
+                        f"grantee name index or the property address index. DO NOT report this as "
+                        f"the vesting deed or extract a legal description from it. Check Plymouth "
+                        f"Registered Land (Land Court), and check for a misindexed grantee name."
                     )
             else:
                 result["selected_row_is_not_a_deed"] = False
