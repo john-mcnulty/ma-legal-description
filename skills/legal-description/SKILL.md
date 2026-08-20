@@ -138,7 +138,7 @@ Determine the correct Massachusetts Registry of Deeds from the property address.
 | Plymouth County | All Plymouth County municipalities | https://titleview.org/plymouthdeeds/ | Avenu/20-20 (ASP.NET) | ✅ Ready |
 | Norfolk County | See municipality list below | https://www.norfolkresearch.org/ALIS/WW400R.HTM?WSIQTP=LR01D&WSKYCD=N | Browntech ALIS | ✅ Ready |
 | Barnstable County | See municipality list below | https://search.barnstabledeeds.org/ALIS/WW400R.HTM?WSIQTP=LR01D&WSKYCD=N | Browntech ALIS | ✅ Ready |
-| Suffolk County | Boston, Chelsea, Revere, Winthrop | https://www.masslandrecords.com/suffolk/D/Default.aspx | Avenu/20-20 (ASP.NET) | ✅ Ready (v3.40 fast path — **both** Recorded Land and Registered Land/Land Court) |
+| Suffolk County | Boston, Chelsea, Revere, Winthrop | https://www.masslandrecords.com/suffolk/D/Default.aspx | Avenu/20-20 (ASP.NET) | ✅ Ready (v3.41 fast path — **both** Recorded Land and Registered Land/Land Court; consumes the registry's 1,000-record cap and 0-hit messages) |
 | Middlesex South | Cambridge, Newton, Framingham, and most southern Middlesex municipalities (Lowell area = Middlesex North, separate registry) | https://www.masslandrecords.com/MiddlesexSouth/D/Default.aspx | Avenu/20-20 (masslandrecords, Incapsula WAF) | 🔶 Ready (new) |
 | *(All other counties)* | | | | ⬜ Low priority |
 
