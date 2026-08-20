@@ -2266,7 +2266,8 @@ async def _sort_results_by_date_desc(page: Page) -> bool:
     return await _is_descending()
 
 
-async def _read_all_result_rows(page: Page, cols: dict = None) -> list:
+async def _read_all_result_rows(page: Page, cols: dict = None,
+                                anchor: str = "Book") -> list:
     """
     Read all result rows (ctl02–ctl11) from the Grantee search results grid.
     Returns a list of row dicts, ordered as the registry returns them.
@@ -2292,6 +2293,14 @@ async def _read_all_result_rows(page: Page, cols: dict = None) -> list:
     whose grids use different column names (Middlesex South: 'File Date'
     instead of 'Rec Date', 'Type Desc' for the spelled-out type, no Town /
     Doc # / Reverse Party columns — unmatched columns read as '').
+
+    v3.40: optional `anchor` names the column whose presence marks "this ctl
+    row exists"; the loop stops at the first row missing it.  It defaulted to
+    'Book' hard-coded, which silently returned ZERO rows on any grid without a
+    Book column — exactly the shape of Suffolk's Registered Land (Land Court)
+    grid, which is document-number based (Type | Name/Corporation | Doc. # |
+    Type Desc. | File Date | Street # | Property Descr).  Land Court callers
+    pass anchor='Type Desc'.
     """
     _COLS = cols or {
         "book": "Book", "page": "Page", "doc_number": "Doc",
@@ -2302,7 +2311,8 @@ async def _read_all_result_rows(page: Page, cols: dict = None) -> list:
 
     async def _snapshot() -> list:
         return await page.evaluate(
-            """(cols) => {
+            """(args) => {
+                const cols = args.cols, anchor = args.anchor;
                 const rows = [];
                 // v3.13: scan to ctl102 — the grid is switched to 100 rows/page
                 // (_plymouth_set_page_size_100), so the old ctl51 cap would have
@@ -2314,14 +2324,14 @@ async def _read_all_result_rows(page: Page, cols: dict = None) -> list:
                             `a[href*="GridView_Document$ctl${ctl}$ButtonRow_${col}"]`);
                         return el ? el.innerText.trim() : '';
                     };
-                    if (!cell('Book')) break;
+                    if (!cell(anchor)) break;
                     const row = { ctl: ctl };
                     for (const [key, col] of Object.entries(cols)) row[key] = cell(col);
                     rows.push(row);
                 }
                 return rows;
             }""",
-            _COLS,
+            {"cols": _COLS, "anchor": anchor},
         )
 
     prev = await _snapshot()
@@ -2471,6 +2481,7 @@ async def _read_all_result_rows_paginated(
     flags: dict = None,
     cols: dict = None,
     notes: list = None,
+    anchor: str = "Book",
 ) -> list:
     """
     Read result rows across ALL pager pages (v3.13 — real pager, was dead code).
@@ -2519,7 +2530,7 @@ async def _read_all_result_rows_paginated(
     banner = ""
 
     for page_num in range(1, max_pages + 1):
-        page_rows = await _read_all_result_rows(page, cols=cols)
+        page_rows = await _read_all_result_rows(page, cols=cols, anchor=anchor)
         if not page_rows:
             break
 
@@ -2606,6 +2617,7 @@ async def _plymouth_ensure_row_visible(
     target: dict,
     research,
     cols: dict = None,
+    anchor: str = "Book",
 ) -> str:
     """
     Make sure `target`'s row is on the CURRENTLY DISPLAYED pager page, and return
@@ -2631,14 +2643,14 @@ async def _plymouth_ensure_row_visible(
 
     Returns the live ctl, or "" if the row could not be brought back.
     """
-    for r in await _read_all_result_rows(page, cols=cols):
+    for r in await _read_all_result_rows(page, cols=cols, anchor=anchor):
         if _same_instrument(r, target):
             return r["ctl"]
 
     await research()
     await _avenu_set_page_size_100(page)
     for _ in range(_AVENU_MAX_PAGES):
-        for r in await _read_all_result_rows(page, cols=cols):
+        for r in await _read_all_result_rows(page, cols=cols, anchor=anchor):
             if _same_instrument(r, target):
                 return r["ctl"]
         if not await _avenu_click_next_page(page):
@@ -2766,15 +2778,24 @@ def _select_best_row(
         return rows[0]
 
 
-async def _open_detail_panel(page: Page, ctl: str = "02", expected_book: str = "") -> bool:
+async def _open_detail_panel(page: Page, ctl: str = "02", expected_book: str = "",
+                             anchor_col: str = "Book") -> bool:
     """
-    Click the Book link for the given ctl row to open the detail panel.
+    Click a cell link for the given ctl row to open the detail panel.
     If expected_book is provided, waits until the panel's Book/Page header
     contains that book number — prevents reading stale panel data left over
     from a previous row click (e.g., after a sort re-render).
+
+    v3.40: `anchor_col` names the column whose link is clicked.  Any
+    ButtonRow_ link in the row opens the same panel, but the default 'Book'
+    does not EXIST on a Land Court grid (no Book column), so the click threw
+    and the panel silently never opened — parties, consideration and the
+    certificate reference all came back empty at exit 0.  Land Court callers
+    pass anchor_col='Type Desc'.
     """
     try:
-        await page.click(f'a[href*="GridView_Document$ctl{ctl}$ButtonRow_Book"]')
+        await page.click(
+            f'a[href*="GridView_Document$ctl{ctl}$ButtonRow_{anchor_col}"]')
         await page.wait_for_selector('a[href*="TabController1"]', timeout=10000)
         if expected_book:
             # Wait up to 5s for the panel to show the correct book number
@@ -4370,9 +4391,7 @@ async def run_plymouth(
     return result
 
 
-# ---------------------------------------------------------------------------
-# Suffolk — stub (Norfolk is implemented below)
-# ---------------------------------------------------------------------------
+# (Suffolk County is implemented after Middlesex South, below.)
 
 # ---------------------------------------------------------------------------
 # Middlesex South District — masslandrecords.com (Avenu/20-20, Incapsula WAF)
@@ -5074,6 +5093,1628 @@ async def run_middlesex_south(
                 pass
 
     result["status"] = "success" if result["files"] else "error"
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Suffolk County — masslandrecords.com/suffolk (Avenu/20-20, Incapsula WAF)
+# ---------------------------------------------------------------------------
+#
+# Probed live 2026-08-18. Suffolk runs the SAME Avenu/20-20 build as Middlesex
+# South — identical form IDs (SearchFormEx1_ACSTextBox_LastName1 /
+# _FirstName1, PartyType1 as a select with ''/D/I, btnSearch), the same
+# Incapsula WAF (a plain HTTP GET returns a 212-byte block page, so there is
+# no pure-HTTP engine here: headful real Chrome only), the same
+# ImageViewerEx.aspx viewer and the same ACSResource.axd hi-res rewrite.
+#
+# What is NOT like Middlesex South, and is the reason this is its own runner:
+#
+#   * TWO OFFICES on one page. A single Office dropdown
+#     (SearchCriteriaOffice1_DDL_OfficeName, postback on change) switches
+#     between "Recorded Land" and "Registered Land (Land Court)". Suffolk has
+#     a great deal of Registered Land, and a Land Court parcel's vesting deed
+#     is INVISIBLE to a Recorded Land search — searching only the default
+#     office would report deed_not_found on a parcel whose deed is right
+#     there under the other option. The default here searches BOTH and
+#     selects across the combined candidates.
+#
+#   * The Land Court grid has NO Book/Page columns. Its columns are
+#     Type | Name/Corporation | Doc. # | Type Desc. | File Date | Street # |
+#     Property Descr. The shared row reader anchored on 'Book' and therefore
+#     returned ZERO rows against it (and _open_detail_panel clicked a Book
+#     link that does not exist, so the panel never opened) — both now take an
+#     anchor parameter, and the Land Court paths pass 'Type Desc'.
+#
+#   * Land Court instruments are cited by Document No. + Certificate of
+#     Title, never by Book/Page. The panel's Book/Page cell on a Land Court
+#     document is the Land Court REGISTRATION book/page, which is not a
+#     Recorded Land citation and must never be emitted as one.
+#
+# Cover sheets track ELECTRONIC RECORDING, not the office: a 2026 Land Court
+# deed (Doc 812445) opens with "Suffolk County Registry of Deeds /
+# Electronically Recorded Document / This is the first page of the document",
+# while a 2001 Land Court deed (Doc 604118) begins with the deed itself.
+# Nothing may assume page 1 is — or is not — a cover sheet; the legal
+# description is found by reading, not by page number.
+#
+# Image resolution: the old manual note ("~217x281 px, some text illegible")
+# described the on-page render. The scripted path rewrites the ACSResource.axd
+# request to CNTHEIGHT=2000 and gets a 1542x2000 JPEG (measured live
+# 2026-08-18) — fully legible. Do not repeat the low-resolution warning.
+# ---------------------------------------------------------------------------
+
+SUFFOLK_SEARCH = "https://www.masslandrecords.com/suffolk/D/Default.aspx"
+SUFFOLK_VIEWER = "https://www.masslandrecords.com/suffolk/D/ImageViewerEx.aspx"
+
+_SUFFOLK_OFFICE_SELECT     = "#SearchCriteriaOffice1_DDL_OfficeName"
+_SUFFOLK_OFFICE_RECORDED   = "Recorded Land"
+_SUFFOLK_OFFICE_REGISTERED = "Registered Land (Land Court)"
+
+# Recorded Land grid: Type | Name/ Corporation | Book | Page | Type Desc. |
+# File Date | Street # | Property Descr  (no Town, Doc #, or Reverse Party —
+# unmatched columns read as ''), i.e. Middlesex South's layout exactly.
+_SUFFOLK_RL_COLS = {
+    # "Type_" not "Type": the row reader matches the column name as a
+    # SUBSTRING of the cell link's href, and bare "Type" also matches
+    # "ButtonRow_Type Desc._N" (the document type). The trailing underscore
+    # is the row-index separator, so "Type_" hits the role column only.
+    "party_role": "Type_",
+    "book": "Book", "page": "Page", "doc_number": "Doc",
+    "deed_type": "Type Desc", "recorded_date": "File Date",
+    "street": "Street", "town": "Town",
+    "reverse_party": "Reverse Party", "name": "Name",
+    "descr": "Property Descr",
+}
+
+# Land Court grid: no Book/Page. Keys are OMITTED rather than mapped to '' —
+# an empty column name would make the reader's href*="...ButtonRow_" selector
+# match the row's FIRST link, silently filling `book` with the Type code.
+_SUFFOLK_LC_COLS = {
+    "party_role": "Type_",
+    "doc_number": "Doc. #",
+    "deed_type": "Type Desc", "recorded_date": "File Date",
+    "street": "Street #", "name": "Name", "descr": "Property Descr",
+}
+
+# NO TOWN FILTER, AND NO DATE WINDOW — both were built, both were measured
+# doing the wrong thing live on 2026-08-18, and both are deliberately gone.
+#
+#   Towns: the multi-select offers BOSTON/CHELSEA/REVERE/WINTHROP with option
+#   values (100001, ...) read off the RECORDED LAND form. Those values do not
+#   carry across an Office switch, so a Registered Land search submitted with
+#   town=BOSTON returned ZERO ROWS for a party with 17 indexed Land Court
+#   instruments — a silent, total suppression that reads exactly like
+#   "this seller has no Land Court records". Boston also swallows every one
+#   of its neighbourhoods, so the filter never bought much anyway.
+#
+#   Recorded Date From/To: the boxes exist on the basic form but are only
+#   honoured through the Advanced panel. Filling DateFrom on the basic form
+#   was ignored on one search (a 1/1/2020 window returned 1987 rows) and
+#   appeared to zero another — nondeterministic either way, and a date filter
+#   that silently does not apply is worse than no date filter at all.
+#
+# Both are the Plymouth municipality-cap failure mode: a narrowing control
+# that hides rows without saying so. The grantor check therefore searches
+# every year, which on this registry is fast (1-3s per search).
+
+
+def _suffolk_office_cols(office: str) -> tuple:
+    """(column map, row-anchor column) for an Office selection."""
+    if office == _SUFFOLK_OFFICE_REGISTERED:
+        return _SUFFOLK_LC_COLS, "Type Desc"
+    return _SUFFOLK_RL_COLS, "Book"
+
+
+def _suffolk_normalize_row(row: dict, office: str) -> dict:
+    """
+    Give every row the full key set regardless of which office produced it,
+    so downstream selection and reporting never branch on a missing key.
+    Land Court rows carry land_court=True and empty book/page.
+    """
+    is_lc = office == _SUFFOLK_OFFICE_REGISTERED
+    return {
+        "ctl":           row.get("ctl", ""),
+        "party_role":    (row.get("party_role", "") or "").strip().upper(),
+        "book":          row.get("book", "") or "",
+        "page":          row.get("page", "") or "",
+        "doc_number":    row.get("doc_number", "") or "",
+        "deed_type":     row.get("deed_type", "") or "",
+        "recorded_date": row.get("recorded_date", "") or "",
+        "street":        row.get("street", "") or "",
+        "descr":         row.get("descr", "") or "",
+        "name":          row.get("name", "") or "",
+        "town":          row.get("town", "") or "",
+        "reverse_party": row.get("reverse_party", "") or "",
+        "land_court":    is_lc,
+        "office":        office,
+        "_pager_page":   row.get("_pager_page", 1),
+    }
+
+
+def _suffolk_row_id(row: dict) -> str:
+    """Human-readable instrument id, correct for the row's own office."""
+    if row.get("land_court"):
+        return f"Doc {row.get('doc_number') or '?'} (Land Court)"
+    return f"Bk{row.get('book') or '?'}/Pg{row.get('page') or '?'}"
+
+
+def _suffolk_row_key(row: dict) -> tuple:
+    """Identity of an instrument, used to skip the vesting deed on re-find."""
+    if row.get("land_court"):
+        return ("LC", row.get("doc_number") or "")
+    return ("RL", row.get("book") or "", row.get("page") or "")
+
+
+# Certificate of Title numbers as they appear in Suffolk's index description
+# and detail panel: "CERT 3915", "CERTIFICATE OF TITLE NO. 119850", "CTF 81744".
+_SUFFOLK_CERT_RE = re.compile(
+    r"\b(?:CERTIFICATE\s+OF\s+TITLE|CERT(?:IFICATE)?|CTF)\b[\s.]*"
+    r"(?:NO\.?|NUMBER|#)?[\s.]*(\d{3,7})\b",
+    re.IGNORECASE,
+)
+
+
+def _suffolk_parse_certificates(*texts) -> list:
+    """
+    Certificate-of-Title numbers mentioned in the given index/panel text, in
+    order of first appearance and de-duplicated.
+
+    These are the certificate numbers appearing in the INDEX DESCRIPTION, and
+    they are NOT the operative certificate for the deed. Confirmed against the
+    images 2026-08-18: the description's number is the certificate the land is
+    described on — the one being transferred OUT of, often the original
+    registration certificate for the plan lot — while the certificate the deed
+    is actually noted on is the detail panel's Certificate/Encumbrance
+    reference.
+
+      Doc 812445 (2026): description "PL 19472-A CERT 64188"; panel reference
+      198332; the deed's own cover sheet reads "Noted on Certificate: 198332".
+      Doc 604118 (2001): description "CERT 3915"; panel reference 121904; the
+      deed recites the grantor's title as Certificate No. 119850.
+
+    So the caller uses the panel reference as certificate_of_title and keeps
+    these as a secondary, clearly-labelled field.
+    """
+    found: list = []
+    for t in texts:
+        for m in _SUFFOLK_CERT_RE.finditer(t or ""):
+            n = m.group(1).lstrip("0") or m.group(1)
+            if n not in found:
+                found.append(n)
+    return found
+
+
+def _suffolk_prefix_name_warning(indexed: str, want_first: str) -> str:
+    """
+    v3.40 — the warning for a row whose indexed first name merely STARTS WITH
+    the requested one.
+
+    Suffolk's First Name box is a prefix match, so a search for JULIAN also
+    returns JULIANA, JULIANNE and JULIANO. Live 2026-08-18 that is exactly how
+    a run for 'Julian Hollister' at 15 Larkspur Road selected HOLLISTER JULIANA's
+    2020 deed for 52 Bayard St — a different person and a different parcel,
+    and nothing in the output said so.
+
+    Returns '' when the indexed first name equals the requested one (or when
+    either is unavailable, which is not evidence of a mismatch).
+    """
+    want = (want_first or "").upper().strip().split()
+    toks = _clean_registry_name(indexed or "").upper().split()
+    if not want or len(toks) < 2:
+        return ""
+    got_first, want_first_tok = toks[1], want[0]
+    if got_first == want_first_tok or not got_first.startswith(want_first_tok):
+        return ""
+    return (f"NEEDS REVIEW: the selected row is indexed to {indexed!r}, whose "
+            f"first name {got_first!r} only STARTS WITH the requested "
+            f"{want_first_tok!r} — Suffolk's First Name box is a prefix match, "
+            f"so this may be a DIFFERENT PERSON. Confirm the grantee on the "
+            f"deed image before relying on this instrument.")
+
+
+# The Search Type dropdown is rendered by the SERVER as "<office> Name
+# Search", so it reflects the office the server will actually search. The
+# Office dropdown is NOT a safe signal: select_option sets its value in the
+# DOM instantly, ~0.5s before the __doPostBack it triggers comes back.
+_SUFFOLK_SEARCHNAME_SELECT = "#SearchCriteriaName1_DDL_SearchName"
+
+
+async def _suffolk_select_office(page: Page, office: str) -> bool:
+    """
+    Switch the Office dropdown and wait for its postback to actually land.
+
+    Returns False when the select is missing or the switch does not take —
+    never True on a guess.
+
+    v3.40, and the reason this function is careful: the obvious check —
+    re-read the Office dropdown until it equals the requested office —
+    passes INSTANTLY and proves nothing, because select_option already set
+    that value client-side. Measured live 2026-08-18: at t=0 the Office
+    select read "Registered Land (Land Court)" while the server still had
+    "Recorded Land Name Search" loaded; the switch only landed at ~0.5s.
+
+    The consequence was not a slow search but a WRONG one. A run that
+    searched Recorded Land first and then "Registered Land" got the RECORDED
+    LAND grid back both times and reported those rows as Land Court results —
+    and because the Land Court column map finds no "Doc. #" column on a
+    Recorded Land grid, they arrived as documentless rows that still looked
+    like ordinary Land Court hits. The parcel's real Land Court deed was
+    never seen. So the wait is on the server-rendered Search Type value.
+    """
+    try:
+        read = ("(sel) => { const s = document.querySelector(sel);"
+                " return s ? s.value : null; }")
+        cur = await page.evaluate(read, _SUFFOLK_OFFICE_SELECT)
+        if cur is None:
+            return False
+        # Even when the Office select already reads the target, confirm the
+        # SERVER agrees before returning True.
+        if cur != office:
+            await page.select_option(_SUFFOLK_OFFICE_SELECT, office)
+            await page.wait_for_selector(
+                "#SearchFormEx1_ACSTextBox_LastName1", timeout=30000)
+        for _ in range(60):  # up to 15s
+            name = await page.evaluate(read, _SUFFOLK_SEARCHNAME_SELECT)
+            if name and name.startswith(office):
+                return True
+            await page.wait_for_timeout(250)
+        return False
+    except Exception:
+        return False
+
+
+# Search Type is per-office: the dropdown's values are "<office> <kind>", and
+# switching Office resets it to "<office> Name Search". Both offices offer a
+# Property (address) search over Street Number + Street Name, reached from the
+# Search Criteria menu; Registered Land additionally offers a Certificate
+# Search, which this workflow does not yet use.
+_SUFFOLK_KIND_NAME     = "Name Search"
+_SUFFOLK_KIND_PROPERTY = "Property Search"
+
+
+# The PROPERTY search grid is a different shape from the name grid, and is
+# the SAME in both offices: Street Name | File Date | Book/Page | Type Desc. |
+# # of Pgs. Note what is missing — no Name/Corporation, and no Doc. # even on
+# Land Court, so an address hit carries no party name and no document number
+# until its detail panel is opened.
+_SUFFOLK_PROP_COLS = {
+    "street":        "Street Name",
+    "recorded_date": "File Date",
+    "book_page":     "Book/Page",
+    "deed_type":     "Type Desc",
+    "num_pages":     "# of Pgs",
+}
+
+
+def _suffolk_normalize_prop_row(row: dict, office: str) -> dict:
+    """
+    Normalise a PROPERTY-search row into the same shape as a name-search row.
+
+    The grid's combined "Book/Page" cell means different things per office and
+    is split accordingly: on Recorded Land it is the real Book/Page citation;
+    on Land Court it is the LAND COURT REGISTRATION book/page, which is not a
+    citation at all and is kept out of `book`/`page` so nothing downstream can
+    print it as one. The document number is simply not available here — it
+    comes from the detail panel.
+    """
+    is_lc = office == _SUFFOLK_OFFICE_REGISTERED
+    bp = (row.get("book_page") or "").strip()
+    book = page_ = ""
+    if bp and not is_lc:
+        parts = bp.split("/", 1)
+        book = parts[0].strip()
+        page_ = parts[1].strip() if len(parts) > 1 else ""
+    return {
+        "ctl":           row.get("ctl", ""),
+        "book":          book,
+        "page":          page_,
+        "doc_number":    "",
+        "deed_type":     row.get("deed_type", "") or "",
+        "recorded_date": row.get("recorded_date", "") or "",
+        "street":        row.get("street", "") or "",
+        "descr":         "",
+        "name":          "",
+        "town":          "",
+        "reverse_party": "",
+        "land_court":    is_lc,
+        "office":        office,
+        "via_address":   True,
+        "lc_book_page":  bp if is_lc else "",
+        "_pager_page":   row.get("_pager_page", 1),
+    }
+
+
+def _suffolk_prop_row_key(row: dict) -> tuple:
+    """
+    Identity of a property-search row. Book/Page + date + type, because the
+    property grid gives no document number and no party name to key on.
+    """
+    return (row.get("office", ""),
+            row.get("lc_book_page") or f"{row.get('book','')}/{row.get('page','')}",
+            row.get("recorded_date", ""),
+            (row.get("deed_type") or "").upper())
+
+
+async def _suffolk_select_search_type(page: Page, office: str, kind: str) -> bool:
+    """
+    Switch the Search Type dropdown within the current office.
+
+    Same postback race as the Office dropdown, and the same rule: the value is
+    server-rendered, so wait for it rather than trusting the select. Returns
+    False if the switch does not take — the caller must not read the grid,
+    because a Property Search that silently stayed on Name Search submits an
+    EMPTY name and returns the whole index.
+    """
+    want = f"{office} {kind}"
+    read = ("(sel) => { const s = document.querySelector(sel);"
+            " return s ? s.value : null; }")
+    try:
+        if await page.evaluate(read, _SUFFOLK_SEARCHNAME_SELECT) == want:
+            return True
+        await page.select_option(_SUFFOLK_SEARCHNAME_SELECT, want)
+        for _ in range(60):  # up to 15s
+            if await page.evaluate(read, _SUFFOLK_SEARCHNAME_SELECT) == want:
+                return True
+            await page.wait_for_timeout(250)
+        return False
+    except Exception:
+        return False
+
+
+async def _suffolk_open(page: Page, office: str, kind: str) -> bool:
+    """Load the search page and put it on the requested office + search type."""
+    await page.goto(SUFFOLK_SEARCH, wait_until="domcontentloaded", timeout=45000)
+    await page.wait_for_selector(
+        "#SearchFormEx1_ACSTextBox_LastName1, #SearchFormEx1_ACSTextBox_StreetName",
+        timeout=30000)
+    if not await _suffolk_select_office(page, office):
+        return False
+    return await _suffolk_select_search_type(page, office, kind)
+
+
+async def _suffolk_address_search(
+    page: Page, office: str, street_number: str, street_name: str,
+) -> bool:
+    """
+    Property (address) search in the given office. Returns False if the office
+    or search-type switch failed.
+
+    Street Name is the only required field. The number is passed when known and
+    narrows server-side; it is NOT relied on for correctness, because the
+    registry's own Street # cell is free text ("15", "15-17", "" on older
+    filings) and an over-narrow number can hide the parcel.
+    """
+    if not await _suffolk_open(page, office, _SUFFOLK_KIND_PROPERTY):
+        return False
+    await page.fill("#SearchFormEx1_ACSTextBox_StreetName", street_name.upper().strip())
+    if street_number:
+        await page.fill("#SearchFormEx1_ACSTextBox_StreetNumber",
+                        street_number.upper().strip())
+    await page.click("#SearchFormEx1_btnSearch")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# The 1,000-record cap (v3.41)
+# ---------------------------------------------------------------------------
+#
+# An over-broad search is answered with a modal — "Your search results have
+# been limited to the first 1,000 records. Please narrow your search criteria
+# by clicking on the 'Advanced' button" — and the grid behind it renders ZERO
+# rows. Measured live 2026-08-20 on a common surname, Recorded Land: Grantee
+# alone 20+ rows, Grantor alone 20+ rows, Both 0 rows + this dialog.
+#
+# Read by code that waits for a grid link, that is indistinguishable from "this
+# party has nothing indexed". In a GRANTOR check the two answers are "no deed
+# out" and "we never looked" — this is the Plymouth v3.18 municipality-cap
+# failure on a registry that actually TELLS you, so the message is consumed
+# rather than thrown away. A capped search is never clean.
+#
+# Note the shape differs from Plymouth's: Plymouth returns the oldest 1,000
+# rows (sorted after the cap, so the newest are missing but rows exist here);
+# Suffolk returns NOTHING. That makes it more dangerous to miss and easier to
+# detect.
+_SUFFOLK_CAP_LABEL = "#MessageBoxCtrl1_ErrorLabel1"
+_SUFFOLK_CAP_OK    = "#MessageBoxCtrl1_buttonmbatCLIENTOK"
+_SUFFOLK_CAP_RE    = re.compile(
+    r"limited to the first\s+([\d,]+)\s+record", re.IGNORECASE)
+
+
+# The registry ALSO announces an empty result in the same dialog: "Search
+# criteria resulted in 0 hits. Please verify the search criteria and try
+# again." Nothing consumed that either, so every genuinely-empty search sat
+# out the full grid timeout before being called empty by exhaustion.
+#
+# That was the real cost of this registry, not the search itself. Measured
+# 2026-08-20 on a seller with no Land Court records: 28 s per search averaged
+# over four searches, of which the two empty Land Court passes were ~45 s
+# each — the registry had said "0 hits" about one second in, both times.
+_SUFFOLK_ZERO_RE = re.compile(r"resulted in\s+0\s+hits", re.IGNORECASE)
+
+
+async def _suffolk_dialog_text(page: Page) -> str:
+    """Text of the registry's message dialog if one is up, else ''."""
+    try:
+        el = await page.query_selector(_SUFFOLK_CAP_LABEL)
+        if not el or not await el.is_visible():
+            return ""
+        return (await el.inner_text()).strip()
+    except Exception:
+        return ""
+
+
+async def _suffolk_cap_message(page: Page) -> str:
+    """The dialog's text if it is the 1,000-record cap, else ''."""
+    text = await _suffolk_dialog_text(page)
+    return text if _SUFFOLK_CAP_RE.search(text) else ""
+
+
+async def _suffolk_dismiss_dialog(page: Page) -> None:
+    """Click Ok so the form is usable for whatever runs next."""
+    try:
+        btn = await page.query_selector(_SUFFOLK_CAP_OK)
+        if btn and await btn.is_visible():
+            await btn.click()
+            await page.wait_for_timeout(400)
+    except Exception:
+        pass
+
+
+async def _suffolk_search_outcome(page: Page, timeout_ms: int = 45000) -> str:
+    """
+    Resolve a submitted search: 'rows' | 'capped' | 'empty' | 'dialog: <text>'.
+
+    Races the results grid against the registry's own message dialog rather
+    than waiting for the grid alone. Waiting for the grid could only ever end
+    in a timeout for the two cases the registry states outright — the 1,000
+    record cap and a 0-hit search — and it then reported BOTH as "nothing
+    indexed", which for a capped grantor search is the false clean this
+    module most needs to avoid.
+
+    An UNRECOGNISED dialog is returned as-is instead of being folded into
+    'empty': a message this code does not understand is missing information,
+    never evidence that a party has nothing on record.
+    """
+    waited = 0
+    while waited < timeout_ms:
+        if await page.query_selector(
+                'a[href*="GridView_Document$ctl02$ButtonRow"]'):
+            return "rows"
+        text = await _suffolk_dialog_text(page)
+        if text:
+            if _SUFFOLK_CAP_RE.search(text):
+                return "capped"
+            if _SUFFOLK_ZERO_RE.search(text):
+                return "empty"
+            return f"dialog: {text[:200]}"
+        await page.wait_for_timeout(250)
+        waited += 250
+    return "empty"
+
+
+async def _suffolk_read_grid(page: Page, office: str, result: dict,
+                            kind: str = _SUFFOLK_KIND_NAME) -> tuple:
+    """
+    Read the grid now on screen as `office`'s, for the given search kind.
+    Shared by the name and address paths so neither can skip the check that
+    the rows really belong to the office they are about to be filed under.
+
+    The check is the SERVER-rendered Search Type ("<office> <kind>"), not the
+    grid shape. Shape works for name searches — Recorded Land has a Book
+    column and Land Court does not — but the PROPERTY grids of the two offices
+    are identical, and their combined "Book/Page" column contains the
+    substring "Book", so a shape test both fails to discriminate and misfires.
+    """
+    outcome = await _suffolk_search_outcome(page, timeout_ms=45000)
+    if outcome == "capped":
+        msg = await _suffolk_cap_message(page)
+        await _suffolk_dismiss_dialog(page)
+        if result is not None:
+            result.setdefault("notes", []).append(
+                f"{office}: the registry CAPPED this search and returned no "
+                f"rows at all — {msg!r}. This is NOT 'nothing indexed'.")
+        return [], "capped"
+    if outcome.startswith("dialog:"):
+        await _suffolk_dismiss_dialog(page)
+        if result is not None:
+            result.setdefault("notes", []).append(
+                f"CRITICAL: {office}: the registry answered this search with a "
+                f"message this script does not recognise — {outcome[8:]!r}. The "
+                "search was NOT completed and its rows, if any, were not read. "
+                "This is not 'nothing indexed'; read the message and re-run.")
+        return [], "unknown_dialog"
+    if outcome == "empty":
+        await _suffolk_dismiss_dialog(page)
+        return [], "no_results"
+    stype = await page.evaluate(
+        "(sel) => { const s = document.querySelector(sel);"
+        " return s ? s.value : null; }", _SUFFOLK_SEARCHNAME_SELECT)
+    if stype != f"{office} {kind}":
+        return [], "office_mismatch"
+    if kind == _SUFFOLK_KIND_PROPERTY:
+        raw = await _read_all_result_rows_paginated(
+            page, flags=result, cols=_SUFFOLK_PROP_COLS,
+            notes=result.get("notes"), anchor="Type Desc")
+        return [_suffolk_normalize_prop_row(r, office) for r in raw], "ok"
+    # Name grid: keep the shape assertion too — it is what caught the
+    # Office-switch race, and it is independent of the dropdown.
+    has_book = await page.query_selector(
+        'a[href*="GridView_Document$ctl02$ButtonRow_Book"]') is not None
+    if has_book != (office == _SUFFOLK_OFFICE_RECORDED):
+        return [], "office_mismatch"
+    cols, anchor = _suffolk_office_cols(office)
+    raw = await _read_all_result_rows_paginated(
+        page, flags=result, cols=cols, notes=result.get("notes"), anchor=anchor)
+    return [_suffolk_normalize_row(r, office) for r in raw], "ok"
+
+
+async def _suffolk_relocate_prop_row(
+    page: Page, office: str, result: dict, target: dict,
+    street_number: str, street_name: str,
+) -> str:
+    """
+    Replay the address search and return the live ctl of `target`.
+
+    The name-search relocation cannot be reused here: it matches on
+    (book, doc_number, name), and a property-grid row has no party name and no
+    document number at all. Matching is on the property key instead —
+    office + book/page + date + type.
+    """
+    if not await _suffolk_address_search(page, office, street_number, street_name):
+        return ""
+    if not await _has_results(page, timeout_ms=40000):
+        return ""
+    want = _suffolk_prop_row_key(target)
+    await _avenu_set_page_size_100(page)
+    for _ in range(_AVENU_MAX_PAGES):
+        for r in await _read_all_result_rows(
+                page, cols=_SUFFOLK_PROP_COLS, anchor="Type Desc"):
+            if _suffolk_prop_row_key(
+                    _suffolk_normalize_prop_row(r, office)) == want:
+                return r["ctl"]
+        if not await _avenu_click_next_page(page):
+            break
+    return ""
+
+
+async def _suffolk_office_rows_by_address(
+    page: Page, office: str, result: dict, street_number: str, street_name: str,
+) -> tuple:
+    """One office's rows for an address search. Same contract as the name path."""
+    if not await _suffolk_address_search(page, office, street_number, street_name):
+        return [], "office_switch_failed"
+    return await _suffolk_read_grid(page, office, result,
+                                    kind=_SUFFOLK_KIND_PROPERTY)
+
+
+async def _suffolk_search(
+    page: Page, last: str, first: str, party_type: str, office: str) -> bool:
+    """
+    Run a name search in the given Office. Returns False if the office or
+    search-type switch failed — the caller must NOT read the grid then.
+
+    Deliberately submits NO town and NO date narrowing; see the module note.
+    """
+    if not await _suffolk_open(page, office, _SUFFOLK_KIND_NAME):
+        return False
+    await page.select_option(
+        "#SearchFormEx1_ACSRadioButtonList_PartyType1", party_type)
+    await page.fill("#SearchFormEx1_ACSTextBox_LastName1", last.upper().strip())
+    await page.fill("#SearchFormEx1_ACSTextBox_FirstName1", first.upper().strip())
+    await page.click("#SearchFormEx1_btnSearch")
+    return True
+
+
+async def _suffolk_read_detail(page: Page) -> dict:
+    """
+    Structurally parse the Suffolk detail panel.
+
+    Header table (both offices): Doc. # | File Date | Rec Time | Type Desc. |
+    # of Pgs. | Book/Page | Consideration | Doc. Status. It MUST be read
+    structurally, not by regex over the panel text: the generic consideration
+    pattern matches the Rec Time value ('13:38:00.000') and a trailing
+    '00.00' first — live 2026-08-18 it read a $412,500.00 deed as '00.00'.
+
+    Also returns the property block (Street # / Street Name / Description
+    lines, where a Land Court row's 'CERT 3915 LOT B-24' lives) and the
+    'Certificate/Encumbrance references' list.
+    """
+    data = await page.evaluate(
+        """() => {
+            const panel = document.querySelector('[id*="DocDetails1"]');
+            if (!panel) return null;
+            let hdr = null;
+            // Innermost matching table wins — outer wrapper tables report the
+            // whole header block as one cell and misalign every value.
+            for (const tbl of panel.querySelectorAll('table')) {
+                const rows = tbl.querySelectorAll(':scope > tbody > tr, :scope > tr');
+                if (rows.length < 2) continue;
+                const h = Array.from(rows[0].querySelectorAll(':scope > th, :scope > td'))
+                    .map(c => c.innerText.trim());
+                if (h.length < 4) continue;
+                if (!h.some(x => x === 'Doc. #' || x.startsWith('Doc. #'))) continue;
+                const v = Array.from(rows[1].querySelectorAll(':scope > td'))
+                    .map(c => c.innerText.trim());
+                hdr = {};
+                h.forEach((k, i) => { hdr[k] = v[i] !== undefined ? v[i] : ''; });
+            }
+            return {header: hdr, text: panel.innerText};
+        }"""
+    )
+    empty = {"doc_number": "", "num_pages": "", "consideration": "",
+             "book_page": "", "doc_status": "", "property_lines": [],
+             "certificate_refs": [], "references": []}
+    if not data:
+        return empty
+    hdr = data.get("header") or {}
+    full = data.get("text") or ""
+
+    def _get(*keys):
+        for k in keys:
+            for h, v in hdr.items():
+                if k in h:
+                    return v
+        return ""
+
+    lines = [ln.strip() for ln in full.splitlines()]
+
+    def _section(marker: str, stop_markers: tuple) -> list:
+        """Non-empty lines after `marker`, up to the next section heading."""
+        out = []
+        started = False
+        for ln in lines:
+            if not started:
+                if marker.lower() in ln.lower():
+                    started = True
+                continue
+            if any(s.lower() in ln.lower() for s in stop_markers):
+                break
+            # Empty cells come back as U+FFFD; drop cell-padding noise.
+            cleaned = ln.replace("�", "").strip()
+            if cleaned:
+                out.append(cleaned)
+        return out
+
+    prop = _section("Description",
+                    ("Certificate/Encumbrance", "Grantor/Grantee", "References"))
+    cert_refs = [t for t in _section("Certificate/Encumbrance references",
+                                     ("Grantor/Grantee", "References"))
+                 if re.fullmatch(r"\d{3,8}", t)]
+
+    references = []
+    ridx = full.find("References")
+    if ridx >= 0:
+        references = [s.strip() for s in
+                      full[ridx:ridx + 400].splitlines() if s.strip()]
+
+    return {
+        "doc_number":       _get("Doc. #"),
+        "num_pages":        _get("# of Pgs"),
+        "consideration":    _get("Consideration"),
+        "book_page":        _get("Book/Page"),
+        "doc_status":       _get("Doc. Status"),
+        "property_lines":   prop,
+        "certificate_refs": cert_refs,
+        "references":       references,
+    }
+
+
+async def _suffolk_office_rows(
+    page: Page, last: str, first: str, party_type: str, office: str,
+    result: dict,
+) -> tuple:
+    """
+    One office's rows for one name. Returns (rows, status) where status is
+    'ok' | 'office_switch_failed' | 'no_results'.
+
+    An office that could not be selected returns 'office_switch_failed', NOT
+    an empty row list — "we could not look" and "we looked and found nothing"
+    must never collapse into the same value.
+    """
+    if not await _suffolk_search(page, last, first, party_type, office):
+        return [], "office_switch_failed"
+    return await _suffolk_read_grid(page, office, result)
+
+
+_SUFFOLK_ROLE_GRANTEE = "GT"
+_SUFFOLK_ROLE_GRANTOR  = "GR"
+
+
+async def _suffolk_office_rows_both(
+    page: Page, last: str, first: str, office: str, result: dict,
+) -> tuple:
+    """
+    One office, ONE search, BOTH party roles. Returns (rows, status).
+
+    PartyType '' ("Both") returns the party's grantee rows and grantor rows in
+    a single postback, each tagged in the grid's leading Type column
+    (GT = grantee, GR = grantor). Verified live 2026-08-20 against separate I
+    and D searches on the same name: Both was EXACTLY their union, and the
+    role tags matched the searches that produced them.
+
+    Why it matters: the vesting-deed question and the deed-out question are
+    the same index lookup asked twice. Every search here costs a full page
+    navigation plus the Office-switch race, so folding them halves the
+    scaffolding — on the common case (an ordinary seller, a handful of rows)
+    that is most of the run's registry time.
+
+    THE CAP IS THE CATCH. Both returns the union, so it reaches the 1,000-
+    record cap sooner than either half — and a capped Suffolk search returns
+    NOTHING (see the cap note above). The fallback is therefore the split
+    itself: I and D run separately, which is a real narrowing axis (each is
+    roughly half the rows) and is exactly the pre-v3.41 behaviour, so the
+    worst case degrades to what this registry did before, never to silence.
+
+    A half that STILL caps is reported as 'capped' with whatever the other
+    half returned. Rows are never dropped and a cap is never smoothed over
+    into 'no_results'.
+    """
+    rows, st = await _suffolk_office_rows(page, last, first, "", office, result)
+    if st != "capped":
+        # A grid with no role column at all cannot be split by role, and
+        # guessing would risk reporting a deed OUT as the vesting deed.
+        if st == "ok" and rows and not any(r.get("party_role") for r in rows):
+            result.setdefault("notes", []).append(
+                f"{office}: the Both search returned rows with NO party-role "
+                "column — the grid layout changed. Falling back to separate "
+                "Grantee and Grantor searches, which do not need it.")
+        else:
+            return rows, st
+    else:
+        result.setdefault("notes", []).append(
+            f"{office}: the combined (Both) search hit the registry's "
+            "1,000-record cap, which returns zero rows. Retrying as separate "
+            "Grantee and Grantor searches — each is about half the result "
+            "set, so the split is itself the narrowing step.")
+
+    merged: list = []
+    halves: list = []
+    capped_halves: list = []
+    for party, role, label in (("I", _SUFFOLK_ROLE_GRANTEE, "Grantee"),
+                               ("D", _SUFFOLK_ROLE_GRANTOR, "Grantor")):
+        # The cap has TWO shapes on this registry and only one of them is the
+        # dialog. A search landing exactly ON the limit returns 1,000 rows and
+        # says nothing; the shared reader detects that by row count and sets
+        # results_truncated_at_cap. Measured 2026-08-20 on a common
+        # surname, Recorded Land: Both -> dialog + 0 rows, then the Grantor
+        # half -> 1,000 rows silently truncated. Watching only the dialog
+        # would have called that half complete.
+        _trunc_before = bool(result.get("results_truncated_at_cap"))
+        got, st_h = await _suffolk_office_rows(page, last, first, party,
+                                               office, result)
+        truncated = (not _trunc_before
+                     and bool(result.get("results_truncated_at_cap")))
+        halves.append(
+            f"{label}={st_h}({len(got)}{' TRUNCATED' if truncated else ''})")
+        if st_h in ("office_switch_failed", "office_mismatch",
+                    "unknown_dialog"):
+            return merged, st_h
+        # Rows are kept whether or not the half was capped — a truncated set
+        # is incomplete, not wrong, and throwing away 1,000 real instruments
+        # to signal "incomplete" would lose the very hits being looked for.
+        for r in got:
+            if not r.get("party_role"):
+                r["party_role"] = role
+        merged.extend(got)
+        if st_h == "capped" or truncated:
+            how = ("returned nothing" if st_h == "capped"
+                   else "returned exactly %d rows, truncated" % len(got))
+            capped_halves.append("%s (%s)" % (label, how))
+    result.setdefault("notes", []).append(
+        f"{office}: split search — {', '.join(halves)}.")
+    if capped_halves:
+        result.setdefault("notes", []).append(
+            f"CRITICAL: {office}: after splitting by party type, the "
+            f"{' and '.join(capped_halves)} search STILL hit the registry's "
+            "1,000-record cap, so this name is NOT fully searched in "
+            f"{office} and the rows below are a PARTIAL set. Never read this "
+            "as a clean deed-out check. Narrow it by hand before relying on "
+            "it — the Advanced panel offers a recorded-date range "
+            "(ACSTextBox_DateFrom/_DateTo) and a 78-entry document-type "
+            "list, either of which splits the set further.")
+        return merged, "capped"
+    return merged, ("ok" if merged else "no_results")
+
+
+async def _suffolk_grantor_check(
+    g_page: Page,
+    last: str,
+    first: str,
+    selected_key: tuple,
+    searched_label: str,
+    offices: list,
+    result: dict,
+    prefetched: dict = None,
+) -> tuple:
+    """
+    Grantor search for one name across the given offices.
+
+    `prefetched` maps office -> grantor-role rows already obtained for this
+    name by the combined (Both) name search, which are used instead of
+    re-searching that office.
+
+    Returns (rows, per_office_status). Both offices are searched regardless of
+    which one the vesting deed came from: a seller can hold a second parcel in
+    the other system, and the question this check answers — "does the
+    purported owner still own it, and who are ALL the current owners" — is not
+    answered by looking in one index only.
+
+    Neither grid has a Reverse Party column, so `grantee` is '' on every hit
+    and the counterparty must be read from the detail panel or the image.
+    """
+    rows: list = []
+    status: dict = {}
+    prefetched = prefetched or {}
+    for office in offices:
+        if office in prefetched:
+            # v3.41: the seller's grantor rows already came back from the
+            # combined (Both) name search in this office. Re-running the D
+            # search would ask the registry a question it has already
+            # answered — and would be a second chance to hit the cap.
+            got, st = prefetched[office], "ok (from combined name search)"
+        else:
+            try:
+                got, st = await _suffolk_office_rows(
+                    g_page, last, first, "D", office, result)
+            except Exception as e:
+                status[office] = f"ERROR — {type(e).__name__}: {e}"
+                continue
+        status[office] = st
+        if not st.startswith("ok"):
+            continue
+        for r in got:
+            if _suffolk_row_key(r) == selected_key:
+                continue  # the vesting deed itself, indexed under both parties
+            r = dict(r)
+            r["searched_name"] = searched_label
+            rows.append(r)
+    return rows, status
+
+
+async def run_suffolk(
+    seller_last: str,
+    seller_first: str,
+    base_name: str,
+    output_folder: Path,
+    headless: bool,
+    town: str = "",
+    street_number: str = "",
+    street_name: str = "",
+    office: str = "auto",
+    force_address_search: bool = False,
+    lien_sweep: bool = False,
+) -> dict:
+    """
+    Suffolk County Registry of Deeds (masslandrecords.com/suffolk) — fast path
+    over BOTH offices:
+      1. Grantee name search in Recorded Land AND Registered Land (Land Court)
+      2. Non-conveyance filter + street-aware selection + Python date sort
+      3. Detail panel → Doc #, pages, consideration, parties, certificate refs
+      4. View Images → ImageViewerEx.aspx → hi-res download of all pages
+      5. Grantor check (seller + all deed grantees) across both offices
+
+    Unlike every other fast path, Registered Land is NOT skipped here — see
+    the module comment above. `office` is 'auto' (both), 'recorded', or
+    'registered'.
+    """
+    offices = {
+        "auto":       [_SUFFOLK_OFFICE_RECORDED, _SUFFOLK_OFFICE_REGISTERED],
+        "recorded":   [_SUFFOLK_OFFICE_RECORDED],
+        "registered": [_SUFFOLK_OFFICE_REGISTERED],
+    }.get((office or "auto").lower(), [_SUFFOLK_OFFICE_RECORDED,
+                                       _SUFFOLK_OFFICE_REGISTERED])
+
+    result = {
+        "status": "error",
+        "registry": "Suffolk County",
+        "registry_url": SUFFOLK_SEARCH,
+        "registry_system": "Avenu/20-20 (ASP.NET, masslandrecords.com)",
+        "offices_searched": [],
+        "office_of_record": None,
+        "land_court": False,
+        "book": None,
+        "page": None,
+        "document_number": None,
+        "certificate_of_title": None,
+        "certificate_in_index_description": None,
+        "certificate_references": [],
+        "land_court_registration_book_page": None,
+        "recorded_date": None,
+        "deed_type": None,
+        "consideration": None,
+        "grantors": [],
+        "grantees": [],
+        "deed_property_address": None,
+        "grantor_check": {"has_subsequent_deed": False, "deeds": [],
+                          "needs_review": [], "summary": None, "searches": []},
+        "detail_references": [],
+        "cross_references": [],
+        "files": [],
+        "total_pages_in_viewer": None,
+        "found_via_address_search": False,
+        "found_via_compound_surname": False,
+        "selected_row_is_not_a_deed": False,
+        "results_truncated_at_cap": False,
+        "street_match": "not_checked",
+        "wrong_parcel_risk": False,
+        "needs_review": [],
+        "notes": [],
+        "errors": [],
+    }
+
+    if town:
+        result["notes"].append(
+            f"NOTE: --town {town!r} was IGNORED. Suffolk's Towns filter is not "
+            "applied by this path — its option values do not survive an Office "
+            "switch and silently returned zero rows on Registered Land (see "
+            "module note). The search covers all four municipalities.")
+
+    street_token = (street_name or "").upper().strip()
+
+    async with async_playwright() as p:
+        browser = await _msouth_launch(p, headless, result)
+        context = await browser.new_context(accept_downloads=True)
+        page = await context.new_page()
+
+        try:
+            # -----------------------------------------------------------
+            # STEP 1 — GRANTEE SEARCH, EVERY REQUESTED OFFICE
+            #
+            # Each office is recorded with its own outcome. An office that
+            # could not be switched to is an OPEN QUESTION, never a quiet
+            # zero: on a Land Court parcel, a failed Registered Land switch
+            # plus an empty Recorded Land result would otherwise read as a
+            # confident "no deed exists".
+            # -----------------------------------------------------------
+            all_rows: list = []
+            failed_offices: list = []
+            if force_address_search:
+                result["notes"].append(
+                    "--force-address-search: skipping the name search entirely; "
+                    f"searching by address for {street_number or '(no number)'} "
+                    f"{street_token or '(no street)'}.")
+                offices_to_name_search: list = []
+            else:
+                offices_to_name_search = offices
+            # v3.41: ONE search per office covers both roles. The grantee rows
+            # answer "which deed vested title"; the grantor rows are the
+            # seller's own half of the deed-out check and are handed to it
+            # below instead of being searched for a second time.
+            seller_grantor_rows: dict = {}
+            capped_offices: list = []
+            for off in offices_to_name_search:
+                both_rows, st = await _suffolk_office_rows_both(
+                    page, seller_last, seller_first, off, result)
+                # Only GT rows may be considered for the vesting deed. A GR
+                # DEED row is a conveyance OUT — selecting one as the vesting
+                # deed would report the seller's own sale as their title.
+                rows = [r for r in both_rows
+                        if r.get("party_role") != _SUFFOLK_ROLE_GRANTOR]
+                # Hand the grantor half to the deed-out check ONLY for an
+                # office that was actually and completely searched. Recording
+                # an empty list for an office that failed or capped would tell
+                # the check "covered, nothing found" — the precise false
+                # clean this whole change is meant to prevent.
+                if st in ("ok", "no_results"):
+                    seller_grantor_rows[off] = [
+                        r for r in both_rows
+                        if r.get("party_role") == _SUFFOLK_ROLE_GRANTOR]
+                result["offices_searched"].append(
+                    {"office": off, "status": st, "rows": len(rows),
+                     "mode": "name (Both)",
+                     "grantor_rows": len(seller_grantor_rows.get(off, []))})
+                if st == "capped":
+                    capped_offices.append(off)
+                    result["needs_review"].append(
+                        f"{off}: the seller's own name could not be fully "
+                        "searched — result set exceeded the registry cap")
+                if st in ("office_switch_failed", "office_mismatch",
+                          "unknown_dialog"):
+                    failed_offices.append(off)
+                    result["notes"].append(
+                        f"CRITICAL: {off!r} was NOT searched "
+                        + ("(the Office dropdown never switched)."
+                           if st == "office_switch_failed" else
+                           "(the registry returned an unrecognised message "
+                           "instead of results)."
+                           if st == "unknown_dialog" else
+                           "(the results grid came back with the OTHER "
+                           "office's column layout, so its rows were "
+                           "discarded rather than reported as this office's).")
+                        + " Any conclusion below covers only the offices that "
+                          "were searched.")
+                    continue
+                if st == "no_results":
+                    result["notes"].append(
+                        f"{off}: no results for last={seller_last!r} "
+                        f"first={seller_first!r} as EITHER party (combined "
+                        f"Grantor+Grantee search). NOTE: Incapsula 403s "
+                        "render as empty pages — if this repeats, verify the "
+                        "browser passed the WAF (see launch note).")
+                    continue
+                result["notes"].append(
+                    f"{off}: grantee search returned {len(rows)} row(s). "
+                    + " | ".join(
+                        f"[{r['ctl']}] {_suffolk_row_id(r)} {r['deed_type']} "
+                        f"{r['recorded_date']} street={r['street']!r}"
+                        for r in rows[:25]))
+                all_rows.extend(rows)
+
+            if failed_offices and len(failed_offices) == len(offices):
+                result["errors"].append(
+                    "No office could be searched — the Office dropdown never "
+                    "took. Nothing was looked at; this is not deed_not_found.")
+                await browser.close()
+                return result
+
+            if not all_rows and not street_token:
+                # Nothing found and no street to fall back on — this is the
+                # end of the road. With a street, the address pass below still
+                # gets its turn, so do NOT conclude deed_not_found here.
+                result["status"] = "deed_not_found"
+                result["notes"].append(
+                    "No grantee rows in "
+                    f"{' or '.join(o for o in offices if o not in failed_offices)}"
+                    ", and no --street to fall back on for an address search."
+                    + (" Offices NOT searched: " + ", ".join(failed_offices)
+                       if failed_offices else ""))
+                await browser.close()
+                return result
+            if not all_rows and not force_address_search:
+                result["notes"].append(
+                    "Name search returned no rows in "
+                    f"{' or '.join(o for o in offices if o not in failed_offices)}"
+                    " — continuing to the address search.")
+
+            # -----------------------------------------------------------
+            # STEP 2 — NON-CONVEYANCE FILTER
+            # -----------------------------------------------------------
+            deed_rows = [r for r in all_rows
+                         if not _is_non_conveyance_instrument(r["deed_type"])]
+            if len(deed_rows) < len(all_rows):
+                result["notes"].append(
+                    f"Filtered {len(all_rows) - len(deed_rows)} non-deed row(s): "
+                    f"{sorted({r['deed_type'] for r in all_rows if r not in deed_rows})}.")
+            if not deed_rows:
+                unknown_types = sorted({
+                    r["deed_type"] for r in all_rows
+                    if _classify_instrument(r.get("deed_type") or "") == "unknown"
+                    and (r.get("deed_type") or "").strip()})
+                result["notes"].append(
+                    "Name search: all result rows are non-conveyance instruments "
+                    "— the vesting deed may be under a different name spelling.")
+                if unknown_types:
+                    result["notes"].append(
+                        f"NOTE: {len(unknown_types)} of the excluded type(s) were "
+                        f"UNRECOGNISED rather than known non-conveyances: "
+                        f"{unknown_types}. They were NOT reported as the vesting "
+                        "deed, but check them by hand before concluding no deed "
+                        "exists, and add any real conveyance type to the script "
+                        "vocabulary.")
+
+            # -----------------------------------------------------------
+            # STEP 3 — STREET-AWARE SELECTION ACROSS BOTH OFFICES
+            # -----------------------------------------------------------
+            def _filter_by_street(rows: list) -> tuple:
+                """
+                (candidates, matched) — the street filter, factored out so the
+                address pass is judged by exactly the same test as the name
+                pass. `matched` is None when there is no street to test.
+                """
+                if not street_token:
+                    return rows, None
+                hit = [r for r in rows
+                       if street_token in (r["street"] or "").upper()]
+                if not hit:
+                    return rows, False
+                if street_number:
+                    numbered = [
+                        r for r in hit
+                        if (r["street"] or "").upper().startswith(
+                            street_number.upper())]
+                    if numbered:
+                        hit = numbered
+                return hit, True
+
+            candidates, street_ok = _filter_by_street(deed_rows)
+
+            # ADDRESS FALLBACK. A name search finding nothing for this parcel
+            # is not the end of the search: Suffolk offers a Property search
+            # (Street Number + Street Name) in BOTH offices, reached from the
+            # Search Criteria menu. It answers the two ways a name search
+            # misses — the seller indexed under a different spelling, and the
+            # prefix-match trap that returned another person's parcel on the
+            # live 2026-08-18 run.
+            if street_token and street_ok is not True:
+                result["notes"].append(
+                    "Name search produced no deed row on "
+                    f"{street_token!r} — falling back to an ADDRESS (Property) "
+                    f"search for {street_number or '(no number)'} "
+                    f"{street_token} across {', '.join(offices)}.")
+                addr_rows: list = []
+                for off in offices:
+                    try:
+                        got, st_a = await _suffolk_office_rows_by_address(
+                            page, off, result, street_number, street_token)
+                    except Exception as e:
+                        result["notes"].append(
+                            f"Address search on {off!r} failed (non-fatal): "
+                            f"{type(e).__name__}: {e}")
+                        continue
+                    result["offices_searched"].append(
+                        {"office": off, "status": st_a, "rows": len(got),
+                         "mode": "address"})
+                    if st_a == "ok":
+                        addr_rows.extend(got)
+                    elif st_a in ("office_switch_failed", "office_mismatch"):
+                        result["notes"].append(
+                            f"CRITICAL: the address search could not be run on "
+                            f"{off!r} ({st_a}) — that index was NOT covered by "
+                            "the fallback either.")
+                addr_deeds = [r for r in addr_rows
+                              if not _is_non_conveyance_instrument(r["deed_type"])]
+                addr_cands, addr_ok = _filter_by_street(addr_deeds)
+                if addr_ok:
+                    result["found_via_address_search"] = True
+                    result["notes"].append(
+                        f"Address search returned {len(addr_rows)} row(s), "
+                        f"{len(addr_deeds)} conveyance(s), {len(addr_cands)} on "
+                        "the subject street. Selecting from these instead of the "
+                        "name-search rows. VERIFY the grantee on the deed image "
+                        "matches the seller — an address search is not "
+                        "name-verified.")
+                    deed_rows, candidates, street_ok = addr_deeds, addr_cands, True
+                else:
+                    result["notes"].append(
+                        "Address search found no conveyance on the subject street "
+                        "either" + (" (it returned rows, but none were deeds on "
+                                    "that street)." if addr_rows else " (no rows)."))
+
+            if not deed_rows:
+                result["status"] = "deed_not_found"
+                result["notes"].append(
+                    "No conveyance found by name or by address in "
+                    f"{', '.join(offices)}. Registered Land also offers a "
+                    "Certificate Search this workflow does not yet use; for an "
+                    "older parcel the vesting deed may predate the electronic "
+                    "index entirely.")
+                await browser.close()
+                return result
+
+            if street_token and street_ok:
+                result["street_match"] = "matched"
+            elif street_token:
+                # No row mentions the subject street, and the address search
+                # did not rescue it. Selecting "the most recent anyway" is how
+                # a run for 15 Larkspur Road came back with a 52 Bayard St deed
+                # at exit 0 (live 2026-08-18). The deed images are still
+                # fetched — they are evidence — but the run is marked as
+                # carrying wrong-parcel risk and must not be read as an answer.
+                result["street_match"] = "no_match"
+                result["wrong_parcel_risk"] = True
+                result["needs_review"].append(
+                    f"No deed row's Street # matched {street_token!r}")
+                result["notes"].append(
+                    f"CRITICAL: NO deed row's street matched {street_token!r}, "
+                    "by name search OR by address search. The rows found were: "
+                    + " | ".join(
+                        f"{_suffolk_row_id(r)} {r['deed_type']} "
+                        f"{r['recorded_date']} {r['street']!r}"
+                        for r in deed_rows[:15])
+                    + ". The most recent row was selected so its images could "
+                    "be captured, but there is NO evidence it is the subject "
+                    "parcel — treat this as wrong-parcel risk, not as the "
+                    "vesting deed. Common causes: the seller is indexed under "
+                    "a different name spelling, the street is spelled "
+                    "differently in the index, or the deed predates the "
+                    "indexed street data.")
+
+            # A parcel lives in ONE system. Street-matching candidates in both
+            # offices means the street filter is not discriminating (a common
+            # street name, or two parcels) — say so rather than pick silently.
+            hit_offices = {r["office"] for r in candidates}
+            if len(hit_offices) > 1:
+                result["notes"].append(
+                    "NEEDS REVIEW: candidate deeds matched in BOTH Recorded Land "
+                    "and Registered Land. A parcel is registered in one system or "
+                    "the other, so at most one of these is the subject parcel's "
+                    "vesting deed. Candidates: "
+                    + " | ".join(f"{_suffolk_row_id(r)} [{r['office']}] "
+                                 f"{r['deed_type']} {r['recorded_date']} "
+                                 f"{r['street']!r}" for r in candidates))
+
+            candidates = sorted(
+                candidates,
+                key=lambda r: _parse_deed_date(r["recorded_date"]),
+                reverse=True)
+            row = candidates[0]
+            sel_office = row["office"]
+            sel_cols, sel_anchor = _suffolk_office_cols(sel_office)
+            is_lc = row["land_court"]
+
+            result["office_of_record"] = sel_office
+            result["land_court"] = is_lc
+            result["book"] = (row["book"] or None) if not is_lc else None
+            result["page"] = (row["page"] or None) if not is_lc else None
+            result["document_number"] = row["doc_number"] or None
+            result["recorded_date"] = row["recorded_date"]
+            result["deed_type"] = row["deed_type"]
+            result["deed_property_address"] = row["street"]
+            result["notes"].append(
+                f"Selected row: {row['deed_type']} {_suffolk_row_id(row)} "
+                f"[{sel_office}] {row['recorded_date']} | Name: {row['name']} | "
+                f"Street: {row['street']} | Descr: {row['descr']}")
+
+            if row.get("via_address"):
+                result["needs_review"].append(
+                    "Selected by ADDRESS search — grantee not verified against "
+                    f"the seller name {seller_last} {seller_first}".strip())
+                result["notes"].append(
+                    "NOTE: this instrument was selected by ADDRESS, because the "
+                    "name search found no deed on this street. The address "
+                    "index does not carry a party name, so nothing here "
+                    "confirms the grantee is the named seller — check the "
+                    "grantees below (read off the detail panel) and the deed "
+                    "image before relying on it.")
+
+            pfx = _suffolk_prefix_name_warning(row["name"], seller_first)
+            if pfx:
+                result["wrong_parcel_risk"] = True
+                result["needs_review"].append(
+                    f"Indexed name {row['name']!r} is a prefix match only")
+                result["notes"].append(pfx)
+
+            if result["results_truncated_at_cap"]:
+                result["notes"].append(
+                    "CRITICAL: a result set hit the 1000-row server-side cap, "
+                    "which is applied BEFORE the date sort — the selected deed "
+                    "may not be the most recent. Narrow the search before "
+                    "relying on this result.")
+
+            # -----------------------------------------------------------
+            # STEP 4 — DETAIL PANEL
+            #
+            # The grid on screen belongs to the LAST office searched and is
+            # parked on the last pager page, so the row is relocated by
+            # instrument identity before its link is clicked. Clicking the
+            # stale ctl would open a different deed.
+            # -----------------------------------------------------------
+            async def _research():
+                await _suffolk_search(page, seller_last, seller_first, "I",
+                                      sel_office)
+                await _has_results(page, timeout_ms=40000)
+
+            # The relocation target must have the SAME KEY SHAPE as the raw
+            # rows the reader produces for this office. _same_instrument
+            # compares with .get(), and a normalised row carries book='' while
+            # a raw Land Court row has no 'book' key at all — None != '', so
+            # every Land Court relocation failed and the run reported the
+            # right deed with no panel and no images.
+            if row.get("via_address"):
+                # Found by address: replay the ADDRESS search and match on the
+                # property key. Replaying the name search here would look for
+                # a row that search never returned — which is the whole reason
+                # the address fallback ran.
+                panel_anchor = "Type Desc"
+                live_ctl = await _suffolk_relocate_prop_row(
+                    page, sel_office, result, row, street_number, street_token)
+            else:
+                # The relocation target must have the SAME KEY SHAPE as the raw
+                # rows the reader produces for this office. _same_instrument
+                # compares with .get(), and a normalised row carries book=''
+                # while a raw Land Court row has no 'book' key at all —
+                # None != '', so every Land Court relocation failed and the run
+                # reported the right deed with no panel and no images.
+                panel_anchor = sel_anchor
+                reloc_target = {k: row.get(k, "") for k in sel_cols}
+                reloc_target["name"] = row["name"]
+                await _research()
+                live_ctl = await _plymouth_ensure_row_visible(
+                    page, reloc_target, _research, cols=sel_cols,
+                    anchor=sel_anchor)
+            detail_pages = ""
+            if not live_ctl:
+                result["notes"].append(
+                    "WARNING: the selected row could not be relocated in the "
+                    "replayed grid — detail panel and images were NOT opened for "
+                    "a confirmed row. Verify by hand.")
+            else:
+                panel_opened = await _open_detail_panel(
+                    page, ctl=live_ctl,
+                    expected_book="" if is_lc else (row["book"] or ""),
+                    anchor_col=panel_anchor)
+                if panel_opened:
+                    parties = await _read_detail_panel(page)   # parties only
+                    det = await _suffolk_read_detail(page)     # header + blocks
+                    result["grantors"] = parties["grantors"]
+                    result["grantees"] = parties["grantees"]
+                    result["document_number"] = (det["doc_number"]
+                                                 or result["document_number"])
+                    result["consideration"] = det["consideration"] or None
+                    detail_pages = det["num_pages"]
+                    result["detail_references"] = det["references"]
+                    result["notes"].append(
+                        f"Detail panel: Doc#{det['doc_number']} "
+                        f"pages={det['num_pages']} "
+                        f"consideration={det['consideration']} "
+                        f"status={det['doc_status']} | "
+                        f"Grantors: {parties['grantors']} | "
+                        f"Grantees: {parties['grantees']}")
+                    if det["property_lines"]:
+                        result["notes"].append(
+                            "Detail panel property block: "
+                            + " | ".join(det["property_lines"][:6]))
+
+                    if is_lc:
+                        # Land Court citation. The panel's Book/Page is the
+                        # LAND COURT REGISTRATION book/page — kept in its own
+                        # field so nothing can emit it as a Recorded Land
+                        # Book/Page citation.
+                        result["land_court_registration_book_page"] = (
+                            det["book_page"] or None)
+                        certs = _suffolk_parse_certificates(
+                            row["descr"], " ".join(det["property_lines"]))
+                        result["certificate_references"] = det["certificate_refs"]
+                        result["certificate_in_index_description"] = (
+                            certs[0] if certs else None)
+                        # The certificate the deed is NOTED ON — the one a
+                        # derivation clause must cite. Verified against the
+                        # cover sheet's "Noted on Certificate" line.
+                        result["certificate_of_title"] = (
+                            det["certificate_refs"][0]
+                            if det["certificate_refs"] else None)
+                        result["notes"].append(
+                            "REGISTERED LAND (Land Court): cite this deed as "
+                            f"Document No. {result['document_number'] or '___'}, "
+                            "noted on Certificate of Title No. "
+                            f"{result['certificate_of_title'] or '___'} "
+                            "(from the detail panel's Certificate/Encumbrance "
+                            "reference, which matches the cover sheet's 'Noted "
+                            "on Certificate' line). The index description also "
+                            f"names certificate {certs[0] if certs else 'NONE'} "
+                            "— that is the certificate the land is DESCRIBED "
+                            "on (the one conveyed out of), not this deed's "
+                            "certificate; do not cite it as the seller's. The "
+                            f"panel's Book/Page ({det['book_page'] or 'n/a'}) "
+                            "is the Land Court registration book/page, NOT a "
+                            "Recorded Land citation. Confirm both against the "
+                            "deed image before use.")
+                    if det["references"]:
+                        result["cross_references"] = _normalize_cross_references(
+                            det["references"], "Suffolk detail panel")
+                        xnote = _cross_reference_note(result["cross_references"])
+                        if xnote:
+                            result["notes"].append(xnote)
+                else:
+                    result["grantees"] = [row["name"]] if row["name"] else []
+                    result["notes"].append(
+                        "Detail panel did not open — party/doc#/consideration "
+                        "data limited to the results row.")
+
+            # -----------------------------------------------------------
+            # STEP 5 — VIEW IMAGES → hi-res download of every page
+            # -----------------------------------------------------------
+            if live_ctl:
+                try:
+                    vi_tab = await page.query_selector(
+                        'a[href*="TabController1$ImageViewertabitem"]')
+                    if vi_tab:
+                        await vi_tab.click()
+                        await page.wait_for_timeout(1500)
+                except Exception as e:
+                    result["notes"].append(
+                        f"View Images tab click error (non-fatal): {e}")
+
+                await page.goto(SUFFOLK_VIEWER, wait_until="domcontentloaded",
+                                timeout=30000)
+                try:
+                    await page.wait_for_function(_MSOUTH_IMG_READY_JS, timeout=45000)
+                except Exception:
+                    result["errors"].append(
+                        "Image viewer did not load a document image.")
+                    await browser.close()
+                    return result
+
+                total_pages = await _parse_page_count(page)
+                result["total_pages_in_viewer"] = total_pages
+                if detail_pages and str(total_pages) != str(detail_pages).strip():
+                    result["notes"].append(
+                        f"NOTE: viewer page count ({total_pages}) differs from "
+                        f"detail panel # of Pgs. ({detail_pages}) — verify all "
+                        "pages captured.")
+
+                for page_num in range(1, total_pages + 1):
+                    if page_num > 1:
+                        prev_src = await page.evaluate(
+                            "() => document.querySelector('#ImageViewer1_docImage').src")
+                        try:
+                            await page.click("#ImageViewer1_BtnNext")
+                            await page.wait_for_function(
+                                "(prev) => { const i = document.querySelector("
+                                "'#ImageViewer1_docImage');"
+                                " return !!(i && i.src && i.src !== prev &&"
+                                " !i.src.includes('loading') && i.naturalWidth > 100); }",
+                                arg=prev_src, timeout=45000)
+                        except Exception as e:
+                            result["notes"].append(
+                                f"Page {page_num} navigation error (stopping): {e}")
+                            break
+                    p_path = output_folder / f"{base_name} - deed_p{page_num}.jpg"
+                    method = await _msouth_download_viewer_image(page, p_path)
+                    if method != "failed":
+                        result["files"].append(str(p_path))
+                        result["notes"].append(
+                            f"Page {page_num} saved ({method}): {p_path.name}")
+                    else:
+                        result["errors"].append(
+                            f"Page {page_num} download failed.")
+
+            # -----------------------------------------------------------
+            # STEP 6 — GRANTOR CHECK (seller + all deed grantees, both offices)
+            #
+            # Windowed from the acquisition date less a small lookback, the
+            # same narrowing the ALIS/Plymouth paths use. An unknown
+            # acquisition date yields NO window (search all years) rather than
+            # a window starting at zero.
+            # -----------------------------------------------------------
+            result["notes"].append(
+                "Grantor check is NOT date-windowed on Suffolk: the basic "
+                "form's Recorded Date boxes are not honoured (see module note), "
+                "so every year is searched. Every hit below is therefore "
+                "reported regardless of date — including instruments that "
+                "predate the seller's acquisition.")
+
+            selected_key = _suffolk_row_key(row)
+            names_to_check: dict = {}
+            seller_key = (seller_last.upper().strip(), seller_first.upper().strip())
+            names_to_check[seller_key] = (
+                f"named seller ({seller_last} {seller_first})".strip())
+            for grantee_display in result.get("grantees", []):
+                key = _msouth_split_name(grantee_display)
+                # The first-name box is a PREFIX match, so a co-owner queried
+                # with a full multi-token first name ('ANNA MARIE') can never
+                # reach an instrument indexed under the bare 'ANNA'. Truncate
+                # to the first token — a strict superset under prefix matching.
+                first_tok = key[1].split()[0] if key[1] else ""
+                bkey = (key[0], first_tok)
+                if key[0] and bkey != seller_key and bkey not in names_to_check:
+                    names_to_check[bkey] = (
+                        f"{grantee_display} (co-owner from detail panel)")
+
+            search_log: list = []
+            all_grantor_rows: list = []
+            seen: set = set()
+            g_page = None
+            try:
+                g_page = await context.new_page()
+            except Exception as e:
+                for label in names_to_check.values():
+                    search_log.append({
+                        "name": "", "label": label, "rows_returned": None,
+                        "rows_new": 0,
+                        "status": f"ERROR — could not open search page: {e}"})
+                    result["grantor_check"].setdefault(
+                        "incomplete_searches", []).append(label)
+            if g_page is not None:
+                for (g_last, g_first), label in names_to_check.items():
+                    disp = f"{g_last} {g_first}".strip()
+                    entry = {"name": disp, "label": label, "rows_returned": None,
+                             "rows_new": 0, "status": "ok"}
+                    try:
+                        rows_g, off_status = await _suffolk_grantor_check(
+                            g_page, g_last, g_first, selected_key, label,
+                            offices, result,
+                            prefetched=(seller_grantor_rows
+                                        if (g_last, g_first) == seller_key
+                                        else None))
+                        entry["offices"] = off_status
+                        bad = [o for o, s in off_status.items()
+                               if not (str(s).startswith("ok")
+                                       or s == "no_results")]
+                        entry["rows_returned"] = len(rows_g)
+                        if bad:
+                            entry["status"] = (
+                                "ERROR — office(s) not searched: "
+                                + "; ".join(f"{o}: {off_status[o]}" for o in bad))
+                            result["grantor_check"].setdefault(
+                                "incomplete_searches", []).append(
+                                    f"{label} [{', '.join(bad)}]")
+                        for r in rows_g:
+                            rkey = _suffolk_row_key(r)
+                            if rkey in seen:
+                                continue
+                            seen.add(rkey)
+                            entry["rows_new"] += 1
+                            all_grantor_rows.append(r)
+                            note = _significance_note(
+                                _suffolk_row_id(r), r["deed_type"],
+                                r["recorded_date"], r["office"], r["descr"])
+                            result["notes"].append(
+                                f"Grantor check hit [{label}]: "
+                                f"{_suffolk_row_id(r)} [{r['office']}] "
+                                f"{r['deed_type']} {r['recorded_date']} | "
+                                f"{r['street']} {r['descr']}".rstrip())
+                            if note:
+                                result["notes"].append(note)
+                                result["grantor_check"]["needs_review"].append(
+                                    f"{_suffolk_row_id(r)} [{r['office']}] "
+                                    f"{r['deed_type']} {r['recorded_date']}")
+                    except Exception as e:
+                        entry["status"] = f"ERROR — {type(e).__name__}: {e}"
+                        result["grantor_check"].setdefault(
+                            "incomplete_searches", []).append(label)
+                    search_log.append(entry)
+                try:
+                    await g_page.close()
+                except Exception:
+                    pass
+
+            _plymouth_record_searches(result, search_log)
+            result["grantor_check"]["has_subsequent_deed"] = bool(all_grantor_rows)
+            result["grantor_check"]["deeds"] = [
+                f"{_suffolk_row_id(r)} [{r['office']}] {r['deed_type']} "
+                f"{r['recorded_date']} | {r['street']} {r['descr']} "
+                f"| [found via: {r['searched_name']}]".replace("  ", " ")
+                for r in all_grantor_rows]
+            errored = [s for s in search_log
+                       if str(s.get("status", "")).startswith("ERROR")]
+            if errored:
+                result["grantor_check"]["summary"] = "incomplete"
+                result["notes"].append(
+                    f"CRITICAL: grantor check is INCOMPLETE — {len(errored)} of "
+                    f"{len(search_log)} search(es) did not fully run "
+                    f"({', '.join(s['label'] for s in errored)}). The hits above "
+                    "are from the searches that completed. NEVER report clean "
+                    "title from this run; re-run the failed name(s) before "
+                    "concluding anything.")
+            elif all_grantor_rows:
+                result["grantor_check"]["summary"] = "hits_found"
+                result["notes"].append(
+                    f"Grantor check: {len(all_grantor_rows)} instrument(s) found "
+                    "— Claude must assess title flags. (Neither Suffolk grid has "
+                    "a Reverse Party column: open the detail panel or the image "
+                    "for the counterparty of any DEED-type hit.)")
+            else:
+                result["grantor_check"]["summary"] = "no_hits"
+                result["notes"].append(
+                    f"Grantor check: no subsequent instruments found (all "
+                    f"{len(search_log)} search(es) completed across "
+                    f"{', '.join(offices)}).")
+
+        except Exception as e:
+            result["errors"].append(f"Main workflow failed: {e}")
+            await browser.close()
+            return result
+        finally:
+            try:
+                await page.close()
+            except Exception:
+                pass
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
+    result["status"] = "success" if result["files"] else "error"
+    if not result["files"] and not result["errors"]:
+        result["errors"].append("No deed images downloaded.")
+
+    # A run can download three perfectly good images OF THE WRONG PARCEL and
+    # still be status=success at exit 0 — the recurring failure in this
+    # project's history. The status is left alone (files really were fetched,
+    # and the caller's exit-code contract is shared with every other
+    # registry), but the warning is lifted to notes[0] so it cannot be read
+    # past. Verified live: a search for last='X' first='Y' prefix-matched
+    # 'XIANG YANQIAO' and returned a Broadway unit deed at exit 0.
+    if result.get("wrong_parcel_risk"):
+        result["notes"].insert(0, (
+            "*** DO NOT REPORT THIS AS THE VESTING DEED WITHOUT CHECKING IT. "
+            "wrong_parcel_risk is set: "
+            + "; ".join(result.get("needs_review") or ["unspecified"])
+            + f". The instrument selected was {result.get('deed_type')} "
+            f"at {result.get('deed_property_address') or 'an unstated address'}"
+            ", chosen so its images could be captured — not because it was "
+            "matched to the subject property. ***"))
     return result
 
 
@@ -10928,7 +12569,12 @@ def run_doctor(output_dir: str = "", probe_network: bool = True) -> int:
         print("\nRegistries (live probe)")
         for label, url in (("Norfolk (norfolkresearch.org)", NORFOLK_BASE),
                            ("Barnstable (search.barnstabledeeds.org)", BARNSTABLE_BASE),
-                           ("Plymouth (titleview.org)", PLYMOUTH_SEARCH)):
+                           ("Plymouth (titleview.org)", PLYMOUTH_SEARCH),
+                           # Suffolk sits behind Incapsula, which answers a
+                           # scripted GET with a block page. The probe reports
+                           # reachability only — a browser-driven run still
+                           # works when this line looks unhappy.
+                           ("Suffolk (masslandrecords.com)", SUFFOLK_SEARCH)):
             p = _doctor_probe_registry(label, url)
             print(f"[{_DOCTOR_ICON[p['status']]}] {p['name']} — {p['detail']}")
             if p["status"] == "down":
@@ -10947,6 +12593,88 @@ def run_doctor(output_dir: str = "", probe_network: bool = True) -> int:
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
+def _finish_run(result: dict, args, output_folder: Path) -> None:
+    """
+    STEP 7 delivery + result.json + stdout + exit code.
+
+    v3.41: factored out of main() so the delivery-only re-entry path and the
+    ordinary end-of-run path cannot drift apart — the whole point of the
+    re-entry is that it produces byte-identical delivery output without the
+    search, which is only true if it runs the same code. Never returns.
+    """
+    if getattr(args, "deliver_text_file", ""):
+        try:
+            _supplied = Path(args.deliver_text_file).read_text(encoding="utf-8").strip()
+            if not _supplied:
+                result.setdefault("notes", []).append(
+                    f"--deliver-text-file {args.deliver_text_file!r} is empty "
+                    "— nothing delivered.")
+            else:
+                result["legal_description"] = _supplied
+                # Delivery is gated on status == "success"; a claude-code run
+                # that found and downloaded its deed qualifies.
+                if result.get("status") != "success" and result.get("files"):
+                    result["status"] = "success"
+                result.setdefault("notes", []).append(
+                    f"Legal description supplied via --deliver-text-file "
+                    f"({len(_supplied)} chars, read from "
+                    f"{Path(args.deliver_text_file).name}) — delivering the "
+                    "paste-ready forms from it. NOTE: this text was NOT read "
+                    "off the deed by this script; whoever supplied it owns "
+                    "its accuracy against the recorded instrument."
+                )
+        except Exception as e:
+            result.setdefault("notes", []).append(
+                f"--deliver-text-file could not be read (non-fatal): {e}")
+    try:
+        _deliver_legal_description(
+            result, args.base_name, output_folder,
+            copy_to_clipboard=args.copy, write_docx=args.docx,
+        )
+    except Exception as e:
+        result.setdefault("notes", []).append(
+            f"Legal-description delivery failed (non-fatal): {e}")
+
+    # v3.30 (item 9b) — write the result beside the PDFs BEFORE printing, so
+    # an unredirected run (or one whose stdout tail is truncated by the
+    # caller) no longer loses needs_review/book/page to the terminal.
+    _write_result_json(result, args.base_name, output_folder)
+    print(json.dumps(result, indent=2))
+
+    status = result.get("status")
+    sys.exit(0 if status == "success" else 2 if status == "deed_not_found" else 1)
+
+
+# Notes produced BY a delivery pass. On a delivery-only re-entry the prior
+# run's copies are stale — regenerating them without dropping these would
+# print "copied to clipboard" twice and read like two deliveries happened.
+_DELIVERY_NOTE_PREFIXES = (
+    "Legal-description .txt written",
+    "Legal-description .docx written",
+    "Paste-ready legal description copied to clipboard",
+    "Paste-ready legal description could not be copied",
+    "Legal description supplied via --deliver-text-file",
+    "Legal-description delivery failed",
+    "DELIVERY-ONLY RE-ENTRY",
+)
+
+
+def _deliver_only(prior: dict, args, output_folder: Path,
+                  prior_path: Path) -> None:
+    """Delivery-only re-entry (v3.41): no search, same delivery. Never returns."""
+    prior["notes"] = [
+        n for n in (prior.get("notes") or [])
+        if not str(n).startswith(_DELIVERY_NOTE_PREFIXES)
+    ]
+    prior["delivery_only_reentry"] = True
+    prior["notes"].append(
+        f"DELIVERY-ONLY RE-ENTRY (v3.41): no search was run. Every registry "
+        f"field below was read from {prior_path.name} as recorded by the "
+        "earlier run; only the legal-description delivery is new. Re-run "
+        "without --deliver-text-file to refresh the registry data itself.")
+    _finish_run(prior, args, output_folder)
+
 
 def main() -> None:
     # Declared up front: --model-main/--model-light rebind these below, and
@@ -11007,8 +12735,16 @@ def main() -> None:
                         help="Property street name (first word recommended) for Plymouth "
                              "address-search fallback (auto-parsed from --base-name second "
                              "token if omitted)")
+    parser.add_argument("--office", choices=["auto", "recorded", "registered"],
+                        default="auto",
+                        help="Suffolk only: which masslandrecords Office to search. "
+                             "'auto' (default) searches BOTH Recorded Land and "
+                             "Registered Land (Land Court) and selects across the "
+                             "combined candidates — a Land Court parcel's vesting "
+                             "deed is invisible to a Recorded Land search. Use "
+                             "'recorded' or 'registered' to pin one index.")
     parser.add_argument("--force-address-search", action="store_true",
-                        help="Plymouth only: skip grantee name search entirely and go "
+                        help="Plymouth and Suffolk: skip grantee name search entirely and go "
                              "directly to property address search. Requires --street-number "
                              "and --street (or a parseable --base-name).")
     parser.add_argument("--engine", choices=["auto", "http", "playwright"],
@@ -11278,6 +13014,47 @@ def main() -> None:
                 0, f"HTTP engine failed ({http_errors}) — fell back to Playwright.")
         return pw_result
 
+    # -----------------------------------------------------------
+    # DELIVERY-ONLY RE-ENTRY (v3.41)
+    #
+    # --deliver-text-file exists so a run whose deed text this script could
+    # not extract (claude-code mode, or a registry with no inline extraction
+    # at all, i.e. Suffolk and Middlesex South) can come back and get the
+    # standard three-form paste-out instead of it being hand-assembled.
+    #
+    # Its help text has always promised "Nothing else is re-fetched", and
+    # that was false: delivery runs AFTER the dispatch below, so coming back
+    # for a text file re-ran the ENTIRE registry search — a second headful
+    # browser launch, a second pass over every office, a second grantor
+    # check. Measured on a live Suffolk run (2026-08-20):
+    # ~60 s of the 6.2-minute total, spent re-deriving a result already
+    # sitting on disk, and a needless second hit on the registry.
+    #
+    # The run's own result.json IS the record (v3.30), so delivery reads it
+    # and skips the search. A missing or unreadable file falls through to a
+    # normal run rather than failing — the file is an optimisation, not a
+    # dependency.
+    # -----------------------------------------------------------
+    if args.deliver_text_file:
+        _prior_path = Path(output_folder) / f"{args.base_name} - result.json"
+        try:
+            _prior = json.loads(_prior_path.read_text(encoding="utf-8"))
+        except Exception as _e:
+            _prior = None
+            _prior_err = f"{type(_e).__name__}: {_e}"
+        if isinstance(_prior, dict) and _prior.get("status") == "success":
+            _deliver_only(_prior, args, output_folder, _prior_path)  # exits
+        else:
+            print(json.dumps({
+                "status": "info",
+                "message": (
+                    f"--deliver-text-file: no successful prior run found at "
+                    f"{_prior_path} ("
+                    + ("unreadable: " + _prior_err if _prior is None else
+                       "status=" + str(_prior.get('status')))
+                    + ") — running the full search first, then delivering."),
+            }), file=sys.stderr)
+
     if args.registry in ("plymouth", "middlesex-south", "middlesex_south",
                          "middlesexsouth", "suffolk") and not _PLAYWRIGHT_AVAILABLE:
         print(json.dumps({"status": "error",
@@ -11342,6 +13119,31 @@ def main() -> None:
                 args.headless, street_number=sn, street_name=st,
             )
         )
+    elif args.registry == "suffolk":
+        # Suffolk is browser-only: masslandrecords sits behind Incapsula, which
+        # answers a scripted request with a block page (verified 2026-08-18 —
+        # a plain GET returns 212 bytes of WAF HTML). Saying so beats letting
+        # an --engine http run look like it chose a faster path.
+        if args.engine == "http":
+            print("WARNING: --engine http is not available on Suffolk "
+                  "(Incapsula WAF blocks non-browser requests); running the "
+                  "browser engine instead.", file=sys.stderr)
+        sn = args.street_number
+        st = args.street
+        if not sn or not st:
+            sn_auto, st_auto = _parse_street_from_base_name(args.base_name)
+            sn = sn or sn_auto
+            st = st or st_auto
+        result = asyncio.run(
+            run_suffolk(
+                args.last, args.first, args.base_name, output_folder,
+                args.headless, town=args.town,
+                street_number=sn, street_name=st,
+                office=args.office,
+                force_address_search=args.force_address_search,
+                lien_sweep=args.lien_sweep,
+            )
+        )
     else:
         result = asyncio.run(run_stub(args.registry))
 
@@ -11352,47 +13154,7 @@ def main() -> None:
     # populated legal_description, so without this a no-API run would have
     # to hand-assemble the three paste forms.
     # -----------------------------------------------------------
-    if args.deliver_text_file:
-        try:
-            _supplied = Path(args.deliver_text_file).read_text(encoding="utf-8").strip()
-            if not _supplied:
-                result.setdefault("notes", []).append(
-                    f"--deliver-text-file {args.deliver_text_file!r} is empty "
-                    "— nothing delivered.")
-            else:
-                result["legal_description"] = _supplied
-                # Delivery is gated on status == "success"; a claude-code run
-                # that found and downloaded its deed qualifies.
-                if result.get("status") != "success" and result.get("files"):
-                    result["status"] = "success"
-                result.setdefault("notes", []).append(
-                    f"Legal description supplied via --deliver-text-file "
-                    f"({len(_supplied)} chars, read from "
-                    f"{Path(args.deliver_text_file).name}) — delivering the "
-                    "paste-ready forms from it. NOTE: this text was NOT read "
-                    "off the deed by this script; whoever supplied it owns "
-                    "its accuracy against the recorded instrument."
-                )
-        except Exception as e:
-            result.setdefault("notes", []).append(
-                f"--deliver-text-file could not be read (non-fatal): {e}")
-    try:
-        _deliver_legal_description(
-            result, args.base_name, output_folder,
-            copy_to_clipboard=args.copy, write_docx=args.docx,
-        )
-    except Exception as e:
-        result.setdefault("notes", []).append(
-            f"Legal-description delivery failed (non-fatal): {e}")
-
-    # v3.30 (item 9b) — write the result beside the PDFs BEFORE printing, so
-    # an unredirected run (or one whose stdout tail is truncated by the
-    # caller) no longer loses needs_review/book/page to the terminal.
-    _write_result_json(result, args.base_name, output_folder)
-    print(json.dumps(result, indent=2))
-
-    status = result.get("status")
-    sys.exit(0 if status == "success" else 2 if status == "deed_not_found" else 1)
+    _finish_run(result, args, output_folder)
 
 
 if __name__ == "__main__":
