@@ -68,7 +68,7 @@ support tracks the platform, not the county line.
 | **1** | **Norfolk**, **Barnstable** | Pure HTTP (`requests` + `beautifulsoup4`). No browser at all. Recorded Land *and* Land Court. | 10–65 s |
 | **2** | **Plymouth** | Headless browser (Playwright/Chromium) against an ASP.NET WebForms site. | 1–3 min |
 | **3** | **Middlesex South** | Browser, **headful required** — the site is behind Incapsula bot protection that 403s headless browsers on the search POST. A real Chrome window opens. | 2–4 min |
-| — | Suffolk | Stub. Recognized, not implemented. | — |
+| **3** | **Suffolk** | Browser, **headful required** (Incapsula, as above). The only tier that searches **both** Recorded Land and Registered Land (Land Court), because a Land Court parcel's vesting deed is invisible to a Recorded Land search. | 15–30 s |
 | — | Everything else | **Refuses**, by design. A registry this tool has not been tested against is a wrong-parcel risk, not a feature request. | — |
 
 Several counties have multiple registry districts (see

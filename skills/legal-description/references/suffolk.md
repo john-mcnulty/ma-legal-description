@@ -5,7 +5,7 @@ Split out of SKILL.md; the workflow steps and every reporting rule live there, n
 
 **System:** Avenu/20-20 Perfect Vision Land Records I2 (ASP.NET) — the same build as Middlesex South, with identical form field IDs.
 
-**Fast path:** `--registry suffolk` (v3.40). Verified live 2026-08-18. Typical run ~60 s.
+**Fast path:** `--registry suffolk` (v3.41). Verified live 2026-08-18 and 2026-08-20. Typical run ~16 s.
 
 ---
 
