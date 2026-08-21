@@ -129,6 +129,7 @@ Determine the correct Massachusetts Registry of Deeds from the property address.
 - ✅ **Ready** — fully documented, multiple runs completed, all known edge cases captured
 - 🔶 **Ready (new)** — documented on first live run, technically complete but less battle-tested
 - 🔷 **Next priority** — high-activity county, not yet documented; run supervised and document as you go
+- 🟡 **Platform known** — search engine identified and entry point verified, but no fast path yet; adding it is a routing-table entry against an existing engine, not a new engine
 - ⬜ **Low priority** — not yet validated; do not run unsupervised on a real closing file
 
 **Registry Routing Table:**
@@ -140,7 +141,11 @@ Determine the correct Massachusetts Registry of Deeds from the property address.
 | Barnstable County | See municipality list below | https://search.barnstabledeeds.org/ALIS/WW400R.HTM?WSIQTP=LR01D&WSKYCD=N | Browntech ALIS | ✅ Ready |
 | Suffolk County | Boston, Chelsea, Revere, Winthrop | https://www.masslandrecords.com/suffolk/D/Default.aspx | Avenu/20-20 (ASP.NET) | ✅ Ready (v3.41 fast path — **both** Recorded Land and Registered Land/Land Court; consumes the registry's 1,000-record cap and 0-hit messages) |
 | Middlesex South | Cambridge, Newton, Framingham, and most southern Middlesex municipalities (Lowell area = Middlesex North, separate registry) | https://www.masslandrecords.com/MiddlesexSouth/D/Default.aspx | Avenu/20-20 (masslandrecords, Incapsula WAF) | 🔶 Ready (new) |
-| *(All other counties)* | | | | ⬜ Low priority |
+| Essex North; Worcester North; Hampden | Essex North = Andover/Lawrence/Methuen/North Andover; Worcester North = Ashburnham/Fitchburg/Leominster/Lunenburg/Westminster; Hampden = whole county | `search.lawrencedeeds.com` / `fitchburgdeeds.com` / `search.hampdendeeds.com`, all `/ALIS/WW400R.HTM?WSIQTP=LR01D&WSKYCD=N` | Browntech ALIS — **same engine as Norfolk/Barnstable**, no WAF | 🟡 Platform known |
+| Berkshire Middle/North/South; Dukes; Franklin; Hampshire; Middlesex North; Worcester | See the multi-district municipality list below | masslandrecords.com/`{BerkMiddle,BerkNorth,Berksouth,Dukes,Franklin,Hampshire,MiddlesexNorth,Worcester}`/D/Default.aspx | Avenu/20-20 — **same engine as Suffolk/Middlesex South**, Incapsula (headful Chrome) | 🟡 Platform known |
+| Bristol Fall River | Fall River, Freetown, Somerset, Swansea | https://i2o.uslandrecords.com/MA/BristolFallRiver/D/Default.aspx | Avenu/20-20 on a different host — **no WAF**; may be pure-HTTP scriptable | 🟡 Platform known |
+| Essex South; Bristol North; Bristol South | Essex South = 30 municipalities incl. Salem/Lynn/Peabody; Bristol North = Taunton area; Bristol South = New Bedford area | `salemdeeds.com` / `search.tauntondeeds.com` / `masearchsb.com` | Three **bespoke** platforms — a new engine each | ⬜ Low priority |
+| Nantucket | Nantucket | *unresolved — no reachable registry domain found* | Unknown | ⬜ Low priority |
 
 **Norfolk County municipalities:** Avon, Bellingham, Braintree, Brookline, Canton, Cohasset, Dedham, Dorchester, Dover, Foxborough, Franklin, Holbrook, Hyde Park, Medfield, Medway, Millis, Milton, Needham, Norfolk, Norwood, Plainville, Quincy, Randolph, Roxbury, Sharon, Stoughton, Walpole, Wellesley, West Roxbury, Westwood, Weymouth, Wrentham
 
@@ -148,7 +153,9 @@ Determine the correct Massachusetts Registry of Deeds from the property address.
 
 **Multi-district counties** (municipality-by-municipality breakdown ships with the plugin at `${CLAUDE_PLUGIN_ROOT}/data/ma-multi-registry-counties.md`): Berkshire (3), Bristol (3), Essex (2), Middlesex (2), Worcester (2). Any county NOT in that file has one registry for the whole county.
 
-**First run in an undocumented registry (🔷 or ⬜):** Do not run unsupervised on a real closing file. The first run in any new registry is a documentation run — expect to encounter unfamiliar UI, blocked automation, or unexpected behavior. Take notes on search URL, field names, image viewer behavior, and any download quirks, and add them to the Technical Notes section at the bottom of this file before relying on the workflow for that registry.
+**Platform, entry-point URL and WAF status for all 21 districts** — including the three bespoke platforms, the Hampden session quirk, and the tested-and-negative `i2o` Incapsula bypass — are in `${CLAUDE_PLUGIN_ROOT}/skills/legal-description/references/registry-platform-triage.md`. Read it before adding a registry.
+
+**First run in an undocumented registry (🔷, 🟡 or ⬜):** Do not run unsupervised on a real closing file. **A 🟡 Platform known district is not a supported district** — sharing an engine means the transport is written, not that the district behaves like its siblings. Every wrong-parcel and false-clean trap this workflow guards against was per-instance, not per-platform (a row cap applied before the date sort, a prefix-matching name box, filters that silently suppress rows, an office dropdown read before its postback lands), and each district needs its own town-code table harvested from its own search form. Treat the first run as a documentation run and verify those behaviours before trusting any result. The first run in any new registry is a documentation run — expect to encounter unfamiliar UI, blocked automation, or unexpected behavior. Take notes on search URL, field names, image viewer behavior, and any download quirks, and add them to the Technical Notes section at the bottom of this file before relying on the workflow for that registry.
 
 **Non-Western name order:** For sellers with Chinese, Korean, Vietnamese, or similar names where cultural convention places the surname first, confirm the correct surname. Most MA registries index by legal surname as recorded on the deed. When in doubt, try both orderings.
 
@@ -669,6 +676,7 @@ answer belongs here, and its absence here is a bug.
 | Middlesex South District — masslandrecords.com/MiddlesexSouth/D/Default.aspx | `${CLAUDE_PLUGIN_ROOT}/skills/legal-description/references/middlesex-south.md` |
 | Norfolk County — norfolkresearch.org | `${CLAUDE_PLUGIN_ROOT}/skills/legal-description/references/norfolk.md` |
 | Barnstable County — search.barnstabledeeds.org | `${CLAUDE_PLUGIN_ROOT}/skills/legal-description/references/barnstable.md` |
+| *All 21 districts* — platform / entry point / WAF triage (not a per-registry mechanics file) | `${CLAUDE_PLUGIN_ROOT}/skills/legal-description/references/registry-platform-triage.md` |
 
 ### Registry facts that change what you REPORT — these stay here
 

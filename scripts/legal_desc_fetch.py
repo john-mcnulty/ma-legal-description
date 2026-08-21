@@ -1815,7 +1815,6 @@ async def _plymouth_address_search(
     page: Page,
     street_number: str,
     street_name: str,
-    town: str = "",
     result: dict | None = None,
 ) -> bool:
     """
@@ -1828,6 +1827,11 @@ async def _plymouth_address_search(
     Use the first word of the street name for the broadest match
     (e.g. "WEXFORD" matches "Wexford Avenue").
     Returns True if the form was submitted; False on navigation timeout.
+
+    The search is COUNTY-WIDE: no town filter is applied (v3.42 — see the
+    comment at the form-fill step). Callers must scope by town afterwards
+    against the results grid, not before it.
+    
 
     Timing (v3.6): this path costs a full page reload PLUS a second
     __doPostBack to switch UI modes — structurally heavier than the plain
@@ -1849,27 +1853,29 @@ async def _plymouth_address_search(
     t3 = time.monotonic()
     await page.fill("#SearchFormEx1_ACSTextBox_StreetNumber", street_number)
     await page.fill("#SearchFormEx1_ACSTextBox_StreetName", street_name)
-    if town:
-        # v3.6: explicit short timeouts. A label/value mismatch here is an
-        # expected, handled case (falls through to "proceed without it"),
-        # not an error worth Playwright's 30s default actionability wait —
-        # timing data showed this pair of mismatched select_option() calls
-        # silently burning ~60s (2x default timeout) on every town-mismatch
-        # address-search retry.
-        try:
-            await page.select_option(
-                "#SearchFormEx1_ACSDropDownList_Towns",
-                label=re.sub(r'\s+', ' ', town).strip().title(),
-                timeout=3000,
-            )
-        except Exception:
-            try:
-                await page.select_option(
-                    "#SearchFormEx1_ACSDropDownList_Towns", value=town.upper(),
-                    timeout=3000,
-                )
-            except Exception:
-                pass  # town filter unavailable — proceed without it
+    # NO TOWN FILTER — deliberate; do not add one back without reading this.
+    #
+    # Until v3.42 this function tried to set #SearchFormEx1_ACSDropDownList_Towns
+    # two ways and BOTH were wrong for the real markup, so the filter was never
+    # once applied: the options are labelled in UPPERCASE ("HINGHAM") while the
+    # code sent Title case, and their values are numeric ("100080") while the
+    # code sent the town name. Both select_option() calls missed and execution
+    # fell through to a bare `pass`. The v3.6 note here saw the symptom — the
+    # pair burning ~60s of Playwright actionability timeout — and made the
+    # failure fast rather than correct.
+    #
+    # Removing it rather than fixing it matches the Suffolk v3.40 decision,
+    # where the Towns and Recorded Date filters were measured SILENTLY
+    # SUPPRESSING ROWS and both were deleted. Plymouth's dropdown has the same
+    # hazard: alongside the 27 towns it carries MULTIPLE TOWNS (100000), NONE
+    # (100180), SEE BOOK (100260) and PLYMTH COLONY (100300). A deed conveying
+    # parcels in more than one town is indexed under MULTIPLE TOWNS, so a
+    # working town filter would hide it from the subject town's search.
+    #
+    # The search is therefore county-wide, which is what it has effectively
+    # been all along. Town scoping happens AFTER the fact, in
+    # _town_matches_filter() against the results grid, where a non-matching row
+    # is visible and can be reported instead of silently absent.
     t4 = time.monotonic()
     await page.click("#SearchFormEx1_btnSearch")
     t5 = time.monotonic()
@@ -2095,7 +2101,6 @@ async def _plymouth_address_fallback(
     page: Page,
     street_number: str,
     street_name: str,
-    town: str,
     result: dict,
 ) -> dict | None:
     """
@@ -2109,7 +2114,7 @@ async def _plymouth_address_fallback(
     the out-conveyance, which is exactly the signal that the seller is no longer
     the record owner (v3.3).
     """
-    await _plymouth_address_search(page, street_number, street_name, town, result=result)
+    await _plymouth_address_search(page, street_number, street_name, result=result)
     t_submit = time.monotonic()
     has_results = await _has_results(page, timeout_ms=15000)
     t_results = time.monotonic()
@@ -3666,7 +3671,7 @@ async def run_plymouth(
                     f"Force address search: skipping name search, "
                     f"searching directly for {street_number} {street_name} (town={town!r})."
                 )
-                await _plymouth_address_search(page, street_number, street_name, town, result=result)
+                await _plymouth_address_search(page, street_number, street_name, result=result)
                 if not await _has_results(page):
                     result["status"] = "deed_not_found"
                     result["notes"].append("Force address search: no results.")
@@ -3712,7 +3717,7 @@ async def run_plymouth(
                         f"Trying address search fallback: "
                         f"street_number={street_number!r} street_name={street_name!r}."
                     )
-                    await _plymouth_address_search(page, street_number, street_name, town, result=result)
+                    await _plymouth_address_search(page, street_number, street_name, result=result)
                     if not await _has_results(page):
                         result["status"] = "deed_not_found"
                         result["notes"].append(
@@ -3746,7 +3751,7 @@ async def run_plymouth(
             # brought back before its Book link can be clicked.
             async def _replay_search():
                 if found_via_address:
-                    await _plymouth_address_search(page, street_number, street_name, town)
+                    await _plymouth_address_search(page, street_number, street_name)
                 elif result["found_via_compound_surname"]:
                     await _plymouth_search(page, seller_last.upper().strip(), "I")
                 else:
@@ -3957,7 +3962,7 @@ async def run_plymouth(
                     f"{retry_reason.capitalize()}: retrying with address search "
                     f"({street_number} {street_name}, town={town!r})."
                 )
-                await _plymouth_address_search(page, street_number, street_name, town, result=result)
+                await _plymouth_address_search(page, street_number, street_name, result=result)
                 if await _has_results(page, timeout_ms=15000):
                     found_via_address = True
                     result["found_via_address_search"] = True
@@ -4042,7 +4047,7 @@ async def run_plymouth(
                         f"misspelled name) — retrying with address search."
                     )
                     fb_row = await _plymouth_address_fallback(
-                        page, street_number, street_name, town, result
+                        page, street_number, street_name, result
                     )
                     if fb_row is not None:
                         found_via_address = True
