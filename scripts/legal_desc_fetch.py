@@ -9636,6 +9636,24 @@ def _alis_grantor_check_http(
         # row. If the final acquisition date is earlier, the prefetched set
         # is missing rows between the two dates — discard it and search live
         # rather than merge a set that was narrowed against the wrong deed.
+        # v3.45 (item 29b) — SECTION check, and it comes first: a set from
+        # the other index is not merely narrow, it is about a different
+        # parcel's index entirely. Live 2026-08-24: the grantee search
+        # selected the Land Court deed, the v3.14 address check retargeted to
+        # the Recorded Land parcel, and the grantor check then consumed the
+        # LAND COURT prefetch — 1 row instead of 3 — and reported
+        # "no subsequent instruments found - clean title".
+        pf_lc = pf_entry.get("land_court")
+        if pf_lc is not None and bool(pf_lc) != bool(land_court):
+            notes.append(
+                f"Grantor check: discarded the prefetched search for "
+                f"{_pair_label(pair)} — it ran against "
+                f"{'Land Court' if pf_lc else 'Recorded Land'} before the "
+                f"auto-retarget moved the selected deed to "
+                f"{'Land Court' if land_court else 'Recorded Land'}. "
+                f"Re-searching live in the correct section."
+            )
+            continue
         pf_window = pf_entry.get("window") or (0, 0, 0)
         if pf_window > window:
             notes.append(
@@ -11179,8 +11197,16 @@ def run_alis_http(
         # returned 150-190 rows it did not finish during extraction — the
         # grantor check then blocked on it, which is where 53s of a 94s run
         # actually went. Co-owner nets are searched live; they are cheap.
+        # v3.45 (item 29b) — SNAPSHOT the section ONCE, at the top, and use
+        # this local everywhere below. `result["land_court"]` is mutated on
+        # the MAIN thread by the v3.14 auto-retarget, which since v3.44 can
+        # move the selected deed ACROSS sections; reading the dict separately
+        # for the search and for the bookkeeping let the two disagree, so a
+        # Land Court result set got recorded as a Recorded Land one and the
+        # staleness guard could not see it.
+        pf_land_court = bool(result["land_court"])
         pairs = [(seller_last.upper(), seller_first.upper(), "*ALL")]
-        if not result["land_court"] and seller_first.strip():
+        if not pf_land_court and seller_first.strip():
             pairs.append((seller_last.upper(), seller_first.upper()[0],
                           _ALIS_DEED_GROUP))
         # v3.29 — window from the row selected SO FAR. A later auto-retarget
@@ -11198,13 +11224,21 @@ def run_alis_http(
                 meta = {}
                 rows = _alis_search_http(
                     psession, base_url, last, first, "R", town=grantor_town,
-                    land_court=result["land_court"], doc_type=pf_doc_type,
+                    land_court=pf_land_court, doc_type=pf_doc_type,
                     date_from=pf_param, notes=prefetch_notes, meta=meta,
                 )
                 prefetched[(last, first, pf_doc_type)] = {
                     "rows": rows,
                     "truncated": meta.get("truncated", False),
                     "window": pf_window,
+                    # v3.45 (item 29b) — record WHICH SECTION these rows came
+                    # from. Since v3.44 the grantee search spans Recorded Land
+                    # and Land Court, so an auto-retarget can move the selected
+                    # deed ACROSS sections after this prefetch has run. Without
+                    # this the grantor check would serve Land Court rows for a
+                    # Recorded Land deed (or vice versa) and report the result
+                    # as the seller's grantor history.
+                    "land_court": pf_land_court,
                 }
             except Exception as e:
                 prefetch_notes.append(
@@ -11568,7 +11602,36 @@ def run_alis_http(
     grantor_rows = []
     try:
         lc = result["land_court"]
-        name_pairs = [(seller_last.upper(), seller_first.upper())]
+        # v3.45 (item 29) — an EMPTY --first is this tool's ENTITY convention
+        # (the whole name goes in --last, per the Plymouth/Suffolk/ALIS
+        # invocations), NOT an unknown first name. `_pair_is_net`'s default
+        # rule is `not pair[1]`, so the seller's OWN pass was being
+        # classified as a broad deed-out NET whenever the seller was an
+        # entity — and a net is type-filtered to conveyances, on the
+        # reasoning that its hits are probably same-surname strangers.
+        #
+        # For an entity that reasoning is exactly inverted: the "surname" IS
+        # the complete, exact name of the seller, and its non-conveyance hits
+        # are the seller's OWN mortgages, municipal lien certificates,
+        # homesteads and liens. They were silently dropped. Live 2026-08-24:
+        # a run found the right 3 instruments (`rows_returned: 3`) and
+        # skipped all 3 as `rows_skipped_non_conveyance`, so
+        # `grantor_check.deeds` came back EMPTY. The deed-out answer was
+        # right, but the report showed none of the seller's encumbrances at
+        # the subject parcel — including an open six-figure mortgage.
+        #
+        # Marking the pair `is_net=False` explicitly is a no-op for an
+        # individual (a non-empty first name already evaluates False) and
+        # the fix for an entity.
+        _entity_seller = not seller_first.strip()
+        name_pairs = [(
+            seller_last.upper(), seller_first.upper(),
+            (f"{seller_last.upper()} (entity seller — full name)"
+             if _entity_seller else None),
+            None,          # doc_type: *ALL — the seller's own pass is never
+                           # restricted to the deed group
+            False,         # is_net: this is the NAMED SELLER, not a net
+        )]
         idx_pair = _alis_indexed_name_pair(row.get("name") or "")
         if idx_pair[0] and idx_pair not in name_pairs:
             name_pairs.append(idx_pair)
@@ -11667,7 +11730,25 @@ def run_alis_http(
             # could not be enumerated at all (no abstract, extraction
             # failed, entity seller). THIS is when the broad net earns its
             # keep, so fire the full surname-only pass and say why.
-            if not net_pairs:
+            if not net_pairs and _entity_seller:
+                # v3.45 (item 29) — for an ENTITY the fallback net would
+                # re-run the seller's own query: same surname, same empty
+                # first name, only narrowed to the deed group. The seller's
+                # own pass (above) is a strict SUPERSET of it — all document
+                # types, unfiltered — so the net adds nothing but a round
+                # trip, and its "hits may be strangers" framing is wrong for
+                # a name that IS the seller.
+                result["notes"].append(
+                    "Grantor check: entity seller — the deed-out net was NOT "
+                    "run separately because the seller's own full-name pass "
+                    f"({seller_last.upper()}) is the same query, unrestricted "
+                    "by document type. Its hits are the SELLER'S OWN "
+                    "instruments (mortgages, MLCs, homesteads, liens are all "
+                    "kept), not same-surname strangers. Note the standing "
+                    "limitation: neither pass reaches a MISSPELLED entity "
+                    "name in the index — use the address search for that."
+                )
+            elif not net_pairs:
                 net_pairs.append((
                     seller_last.upper(), "",
                     f"{seller_last.upper()} (surname only — FALLBACK: owner "
