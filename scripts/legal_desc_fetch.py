@@ -6741,6 +6741,93 @@ async def run_stub(registry: str) -> dict:
 # only differences are the base URL (domain) and town code conventions.
 # All helpers below take `base_url` as a parameter so they serve both.
 
+# ---------------------------------------------------------------------------
+# v3.43 (item 24) — ALIS NAME-FIELD LENGTH CAP
+#
+# The registry's own form hard-caps the name inputs. Read off the live form
+# HTML on norfolkresearch.org, 2026-08-24:
+#
+#     Recorded Land   W9SNM / W9GNM   maxlength=30
+#     Land Court      W9SN8 / W9GN8   maxlength=28
+#
+# An OVER-LENGTH name is NOT rejected. It degenerates SILENTLY, and in two
+# different ways depending on the town scope — both measured live with the
+# 45-character entity name (a nonprofit corporation). Entity names of that
+# length are routine; personal names rarely reach the cap, which is exactly
+# why this stayed latent for so long:
+#
+#   town=<a town>  -> ZERO rows. The v3.20 cap-retry consumed that as
+#                     "nothing indexed" and reported "0 row(s), COMPLETE ...
+#                     the subject-parcel check is complete" — a FALSE CLEAN
+#                     from a search that structurally could not return a row.
+#   town=*ALL      -> ~149 rows whose NAME CELL IS BLANK. They passed the
+#                     conveyance filter and became phantom grantor hits
+#                     attributed to the seller (deeds belonging to unrelated
+#                     parties in Quincy, Wrentham, Stoughton, Brookline).
+#
+# On one live run it did both at once: 12 strangers' instruments reported as
+# the seller's, and all 3 genuine subject-parcel instruments missed, at exit 0.
+#
+# Clipping is safe AND correct: both indexes are PREFIX-matched, so a shorter
+# name returns a strict SUPERSET of what the full name would have matched.
+# Entity names routinely exceed these caps; personal names rarely do, which
+# is why this stayed latent.
+_ALIS_NAME_MAXLEN_RECORDED   = 30
+_ALIS_NAME_MAXLEN_LAND_COURT = 28
+
+
+def _alis_name_limit(land_court: bool) -> int:
+    """Characters the ALIS name inputs accept for this section."""
+    return (_ALIS_NAME_MAXLEN_LAND_COURT if land_court
+            else _ALIS_NAME_MAXLEN_RECORDED)
+
+
+def _alis_truncate_name(name: str, land_court: bool):
+    """
+    Clip `name` to the registry's field limit.
+
+    Returns (clipped, was_clipped). Trailing whitespace is stripped after
+    clipping so a query never ends mid-space (the index is matched on the
+    literal string, and a trailing space can suppress otherwise-valid hits).
+    """
+    limit = _alis_name_limit(land_court)
+    s = name or ""
+    if len(s) <= limit:
+        return s, False
+    return s[:limit].rstrip(), True
+
+
+class AlisDegenerateResultError(RuntimeError):
+    """
+    The registry returned a result set that is not an answer to the query
+    we asked — the signature of an over-length or malformed name field.
+
+    Raised rather than returned so callers record the search as ERROR and it
+    lands in `incomplete_searches`. Returning [] would be actively dangerous:
+    "no rows" is exactly what the false-clean bug looked like.
+    """
+
+
+def _alis_result_set_is_degenerate(rows: list, queried_last: str) -> str:
+    """
+    Detect the degenerate result set described above. Returns a reason string
+    when the rows cannot be an answer to `queried_last`, else "".
+
+    Signature: a NON-empty surname was queried, rows came back, and most of
+    them carry NO name at all. A legitimate ALIS row always names its party.
+    Deliberately conservative — it needs a majority, so an odd unparsed row
+    never invalidates a good search.
+    """
+    if not queried_last or not rows:
+        return ""
+    blank = sum(1 for r in rows if not (r.get("name") or "").strip())
+    if blank > len(rows) / 2:
+        return (f"{blank} of {len(rows)} returned rows have a BLANK name cell "
+                f"after querying '{queried_last}' — the registry did not "
+                f"filter on the name (over-length or malformed name field)")
+    return ""
+
+
 def _alis_url(
     base_url: str,
     last: str,
@@ -6791,6 +6878,11 @@ def _alis_url(
     last_field  = "W9SN8"   if land_court else "W9SNM"
     first_field = "W9GN8"   if land_court else "W9GNM"
     wshtnm      = "WW401L00" if land_court else "WW401R00"
+    # v3.43 (item 24) — clip to the registry's field limit HERE, in the one
+    # place every ALIS query is built, so no caller can bypass it. An
+    # over-length name returns garbage or nothing, never an error.
+    last, _last_clipped   = _alis_truncate_name(last,  land_court)
+    first, _first_clipped = _alis_truncate_name(first, land_court)
     last_enc  = quote(last,  safe="")
     first_enc = quote(first, safe="")
     doc_enc   = quote(doc_type, safe="*")   # preserve * so *DD and *ALL are not percent-encoded
@@ -7419,12 +7511,43 @@ def _alis_search_http(
     set so callers can ACT on a capped search (the note alone let the
     Keegan grantor check report a truncated set as its final answer).
     """
+    # v3.43 (item 24) — clip before searching and SAY SO. _alis_url() clips
+    # too (belt and braces), but only here do we have `notes`/`meta` to
+    # record that the query was widened, so a larger-than-expected result
+    # set is explained rather than surprising.
+    last, _last_clipped   = _alis_truncate_name(last,  land_court)
+    first, _first_clipped = _alis_truncate_name(first, land_court)
+    if (_last_clipped or _first_clipped) and notes is not None:
+        notes.append(
+            f"NOTE: name clipped to the ALIS field limit "
+            f"({_alis_name_limit(land_court)} chars, "
+            f"{'Land Court' if land_court else 'Recorded Land'}) — searched "
+            f"'{last}', '{first}'. The index is PREFIX-matched, so this is a "
+            f"SUPERSET of the full name: no hit is lost, but same-prefix "
+            f"strangers may appear. Verify the party name on any hit."
+        )
+    if meta is not None and (_last_clipped or _first_clipped):
+        meta["name_clipped"] = True
+        meta["name_searched"] = (last, first)
+
     url = _alis_url(base_url, last, first, party, town=town,
                     land_court=land_court, doc_type=doc_type,
                     date_from=date_from, per_page=30)
     resp = _alis_http_get(session, url)
     html = resp.text
     new_rows = _alis_parse_results_html(html)
+
+    # v3.43 (item 24) — refuse a result set that is not an answer to our
+    # query. Raising (not returning []) is the point: callers log an ERROR
+    # and the name lands in `incomplete_searches`, whereas an empty return
+    # is indistinguishable from "nothing indexed" — the false clean itself.
+    _degen = _alis_result_set_is_degenerate(new_rows, last)
+    if _degen:
+        raise AlisDegenerateResultError(
+            f"ALIS returned a result set that does not answer the query: "
+            f"{_degen}. Treat this name as NOT searched."
+        )
+
     all_rows = list(new_rows)
     seen = {_alis_row_identity(r) for r in new_rows}
     next_control = "LC01N" if land_court else "LR01N"
@@ -9959,6 +10082,12 @@ def _alis_apply_row_fields(result: dict, row: dict) -> None:
     result["grantors"]      = [row["reverse_party"]] if row["reverse_party"] else []
     result["grantees"]      = [row["name"]] if row["name"] else []
     result["deed_property_address"] = row["doc_desc"] or ""
+    # v3.44 (item 25) — the SELECTED ROW decides the section. This used to be
+    # set by the grantee-search loop, which made it a property of "whichever
+    # section answered first" rather than of the deed actually chosen. Setting
+    # it here also covers the auto-retarget, which re-applies these fields and
+    # can legitimately swap to a row in the other section.
+    result["land_court"] = bool(row.get("land_court"))
 
 
 def _alis_fetch_deed_files(
@@ -10610,6 +10739,7 @@ def run_alis_http(
     verify_grantor_hit: str = "",
     show_timings: bool = True,
     lien_sweep: bool = False,
+    office: str = "auto",   # v3.44 (item 25) — "auto" | "recorded" | "registered"
 ) -> dict:
     """
     Shared pure-HTTP runner for the Browntech ALIS registries (Norfolk,
@@ -10717,23 +10847,75 @@ def run_alis_http(
     # -----------------------------------------------------------
     # STEP 1 — GRANTEE SEARCH (Recorded Land, then Land Court fallback)
     # -----------------------------------------------------------
+    # v3.44 (item 25) — search BOTH sections and select across the COMBINED
+    # candidate set.
+    #
+    # This loop used to `break` on the first section that returned rows, which
+    # made Land Court UNREACHABLE for any seller who also owned a Recorded Land
+    # parcel: the Recorded hit won at exit 0 with no warning that a Registered
+    # Land parcel existed. Live 2026-08-24 — a Registered Land subject parcel
+    # (Land Court deed, noted on its own certificate) came back as the seller's
+    # ADJOINING Recorded Land parcel, the Kilbride / 29 Fox Meadow failure mode.
+    #
+    # `--book` could not rescue it either: the pin was only applied within the
+    # section that had returned rows, so targeting the Land Court document
+    # failed with "did not match any result row" and `deed_not_found`. Nor
+    # could a name prefix — the item-24 28-character Land Court cap truncates
+    # both of that entity's indexed spellings to the same string.
+    #
+    # Every downstream step is already per-row section-aware (each parsed row
+    # carries `land_court`; the abstract URL, the image list and the --book
+    # match all key off it), so merging is safe. Suffolk has selected across
+    # both offices since v3.40; this brings the ALIS registries in line.
     rows = []
+    sections_with_rows = []
     for land_court in (False, True):
         section = "Land Court" if land_court else "Recorded Land"
+        if office == "recorded" and land_court:
+            result["notes"].append("Skipping Land Court (--office recorded).")
+            continue
+        if office == "registered" and not land_court:
+            result["notes"].append("Skipping Recorded Land (--office registered).")
+            continue
         result["notes"].append(
             f"Searching {section}: "
             + _alis_url(base_url, seller_last, seller_first, "E",
                         town=town, land_court=land_court, doc_type="*DD", per_page=30)
         )
-        rows = _alis_search_http(
-            session, base_url, seller_last, seller_first, "E", town=town,
-            land_court=land_court, doc_type="*DD", notes=result["notes"],
+        try:
+            sect_rows = _alis_search_http(
+                session, base_url, seller_last, seller_first, "E", town=town,
+                land_court=land_court, doc_type="*DD", notes=result["notes"],
+            )
+        except AlisDegenerateResultError as e:
+            # v3.43 (item 24) — a result set that does not answer the query is
+            # NOT "no rows". Say so; never let it read as an empty section.
+            sect_rows = []
+            result["notes"].append(
+                f"WARNING: the {section} grantee search returned an "
+                f"unusable result set and was NOT searched: {e}"
+            )
+        if sect_rows:
+            sections_with_rows.append(section)
+            rows.extend(sect_rows)
+            result["notes"].append(f"Found {len(sect_rows)} result(s) in {section}.")
+        else:
+            result["notes"].append(f"No results in {section}.")
+
+    # Both sections answered: the seller holds parcels in each, which is
+    # exactly the case that used to be silently resolved in favour of
+    # Recorded Land. Selection now happens across the merged set, but say so
+    # plainly — the wrong-parcel guard downstream needs the reader's attention.
+    if len(sections_with_rows) > 1:
+        result["notes"].append(
+            "CRITICAL: this seller has conveyance rows in BOTH Recorded Land "
+            "and Registered Land (Land Court). Selection ran across the "
+            "COMBINED candidate set, but a seller with a parcel in each "
+            "section is the classic wrong-parcel trap — confirm the selected "
+            "deed's address/certificate against the subject property before "
+            "relying on it, and see multiple_deed_candidates. Pin the section "
+            "with --office recorded|registered if you already know it."
         )
-        if rows:
-            result["land_court"] = land_court
-            result["notes"].append(f"Found {len(rows)} result(s) in {section}.")
-            break
-        result["notes"].append(f"No results in {section}.")
 
     if not rows:
         result["status"] = "deed_not_found"
@@ -12742,7 +12924,7 @@ def main() -> None:
                              "token if omitted)")
     parser.add_argument("--office", choices=["auto", "recorded", "registered"],
                         default="auto",
-                        help="Suffolk only: which masslandrecords Office to search. "
+                        help="Suffolk, Norfolk and Barnstable: which index to search. "
                              "'auto' (default) searches BOTH Recorded Land and "
                              "Registered Land (Land Court) and selects across the "
                              "combined candidates — a Land Court parcel's vesting "
@@ -12944,6 +13126,7 @@ def main() -> None:
                     verify_grantor_hit=args.verify_grantor_hit,
                     show_timings=args.timings,
                     lien_sweep=args.lien_sweep,
+                    office=args.office,
                 )
                 if _mode_note:
                     result.setdefault("notes", []).insert(0, _mode_note)
