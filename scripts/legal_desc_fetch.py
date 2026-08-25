@@ -2944,6 +2944,39 @@ def _parse_street_from_base_name(base_name: str) -> tuple:
     return "", ""
 
 
+def _street_words_from_base_name(base_name: str) -> str:
+    """
+    Street NAME + SUFFIX from a base name, with the house number and the
+    trailing town token dropped — the input the combined address search wants
+    (the suffix is then stripped by _alis_address_queries, which
+    queries the prefix-matched stem).
+
+    Stops at the first recognised suffix so a unit designator or the town does
+    not leak into the query:
+      "12 Birchwood Drive Dedham - Smith"          -> "BIRCHWOOD DRIVE"
+      "39 Larkspur Road Unit 17C Osterville - Doe" -> "LARKSPUR ROAD"
+      "7 Sycamore Weymouth - Roe"                  -> "SYCAMORE"   (no suffix)
+
+    Returns "" when no street number leads the base name, which the caller
+    must treat as "not asked", never as "nothing there".
+    """
+    num, first_word = _parse_street_from_base_name(base_name)
+    if not (num and first_word):
+        return ""
+    tokens = base_name.split(" - ")[0].strip().split()[1:]
+    words = []
+    for tok in tokens:
+        clean = re.sub(r"[.,]", "", tok).upper()
+        words.append(clean)
+        if clean in _STREET_SUFFIX_ALIASES or clean in _STREET_SUFFIX_EXPAND:
+            break
+    else:
+        # no suffix seen — keep the first word only, since everything after it
+        # may be the town (or a unit) and a wrong word narrows the query.
+        words = words[:1]
+    return " ".join(words).strip()
+
+
 def _parse_deed_date(date_str: str) -> tuple:
     """
     Parse a Plymouth deed recorded-date string into a sortable (year, month, day) tuple.
@@ -7586,6 +7619,436 @@ def _alis_search_http(
     return all_rows
 
 
+# ---------------------------------------------------------------------------
+# v3.46 (backlog item 28) — COMBINED address search: Recorded + Land Court
+# ---------------------------------------------------------------------------
+# Norfolk's page is titled "Search by Address (Recorded and Registered Land
+# Combined)" and it queries BOTH sections in ONE request. That makes it the
+# only index in this tool that is NAME-INDEPENDENT, which is precisely the
+# gap every name-side fix leaves open:
+#
+#   - the v3.43 name-field clip widens a query but cannot reach a name the
+#     registry SPELLED differently (the v3.45 standing limitation);
+#   - the v3.44 both-sections search still needs the name to be findable in
+#     at least one section;
+#   - a misindexed grantee defeats the name index outright.
+#
+# The address index answers "what is recorded against this PARCEL", so it
+# survives all three. It is a SUPPLEMENT and never a selector — see the 2003
+# coverage boundary below.
+#
+# Endpoint (verified live against norfolkresearch.org):
+#   form:   /ALIS/WW400R.HTM?WSIQTP=SY14D&WSKYCD=T
+#   search: /ALIS/WW400R.HTM?W9PADR=<addr>&W9ABR=<doctype>&W9TOWN=<code>
+#           &W9FDTA=<MMDDYYYY>&W9TDTA=&WSHTNM=WW414R00&WSIQTP=SY14AP
+#           &WSKYCD=T&WSWVER=2&WSSRPP=30
+#   field:  W9PADR, maxlength 30
+#
+# THREE MECHANICS, each of which produces a WRONG ANSWER if not coded:
+#
+#  1. IT PAGINATES, AND PAGE 1 IS TINY (~3 documents). Reading page 1 and
+#     stopping makes this index look sparse and useless — that conclusion was
+#     actually drawn once, and it was wrong. Walked to completion, one
+#     residential street number returned 14 documents = the entire parcel
+#     chain, including a municipal lien certificate on which the owner is not
+#     a party and which NO name search for the owner could ever return.
+#     Pagination is the same hidden-field re-GET as _alis_search_http(), with
+#     control SY14N in place of LR01N/LC01N.
+#
+#  2. THE SUFFIX SPELLING DECIDES WHETHER LAND COURT ROWS COME BACK — the
+#     house number does NOT. This corrects an earlier reading of the same
+#     index. Measured across five parcels on three streets:
+#         "<n> BIRCHWOOD ST"     -> Land Court rows, subject deed present
+#         "<n> BIRCHWOOD STREET" -> the SAME query minus every Land Court row
+#     because the two sections store the suffix differently (Land Court
+#     writes "BIRCHWOOD ST.", Recorded writes "BIRCHWOOD STREET"). An earlier
+#     recorded this as "a house NUMBER suppresses Land Court rows"; that was
+#     a PAGE-1-ONLY read of a paginated result (mechanic 1, one layer
+#     deeper) — the suppressed row was on page 2 all along.
+#
+#     W9PADR is PREFIX-matched, exactly like the ALIS name fields, so the
+#     fix is to drop the suffix entirely and query "<number> <STEM>":
+#         "12 BIRCHWOOD" is a strict SUPERSET of both "12 BIRCHWOOD ST"
+#         and "12 BIRCHWOOD STREET" — verified on 5/5 parcels, none missing.
+#     That is one query instead of two, it is far cheaper than the
+#     street-only sweep (a busy street runs past 75 documents; the
+#     number-qualified query is single digits), and it is the same
+#     "a shorter prefix returns a superset" argument as the v3.43 name clip.
+#
+#  3. ONE DOCUMENT LISTS EVERY ADDRESS IT TOUCHES. A single town-wide
+#     assessment carried 315 Addr: entries. Parse by DOCUMENT HEADER
+#     ("Doc#:" for Land Court, "Bk-Pg:" for Recorded), never by counting
+#     Addr: lines, and expect one document to match many streets. Each row
+#     therefore carries `addresses` as a LIST.
+#
+# THE 2003 BOUNDARY — where this index does not help. The Registry states it
+# has included the property address "for all applicable documents since 2003"
+# and that earlier listings are "very limited". So:
+#   * NEVER select a vesting deed from this index on a pre-2003 chain, and
+#   * NEVER read an empty address result as evidence of absence.
+# That is the v3.20 rule again: missing information is not a non-match.
+
+_ALIS_ADDRESS_FIELD_LIMIT = 30      # W9PADR maxlength, read off the form
+_ALIS_ADDRESS_MAX_PAGES   = 25      # ~3 docs/page, so 25 pages ~= 75 documents
+
+# Street-suffix aliases. Both spellings are queried because the two sections
+# store the suffix differently; this is mechanic 2 above, not cosmetics.
+_STREET_SUFFIX_ALIASES: dict[str, str] = {
+    "STREET": "ST", "AVENUE": "AVE", "ROAD": "RD", "DRIVE": "DR",
+    "LANE": "LN", "COURT": "CT", "PLACE": "PL", "TERRACE": "TER",
+    "CIRCLE": "CIR", "BOULEVARD": "BLVD", "HIGHWAY": "HWY",
+    "PARKWAY": "PKWY", "SQUARE": "SQ", "EXTENSION": "EXT",
+    "TURNPIKE": "TPKE", "HEIGHTS": "HTS", "LANDING": "LNDG",
+}
+_STREET_SUFFIX_EXPAND = {v: k for k, v in _STREET_SUFFIX_ALIASES.items()}
+
+_ALIS_ADDR_HEADER_RE = re.compile(r'(Doc#:|Bk-Pg:)\s*([0-9]+)\s*-\s*([0-9]+)', re.I)
+# Cut a captured value at the next "Label:" on the same line — the results page
+# packs several labelled fields per line ("Type: DEED  Doc$: 1.00",
+# "Town: X  Addr: Y", "<address> Map Book-Page:").
+_ALIS_ADDR_TRAILING_LABEL_RE = re.compile(r'\s{1,}[A-Z][A-Za-z$#/ -]{0,22}:.*$')
+
+
+def _alis_address_normalize_nbsp(html: str) -> str:
+    """
+    &#160;/&nbsp; are whitespace AND they appear inside the document headers
+    themselves ("Doc#:&#160;123456-1"), so they must be normalised before any
+    header split — otherwise the Land Court blocks silently do not match and
+    the page parses as Recorded-only. (Found exactly that way.)
+    """
+    return re.sub(r"&#160;|&nbsp;|&#xa0;", " ", html, flags=re.I)
+
+
+def _alis_address_field(text: str, *labels: str) -> str:
+    """First value for any of `labels`, trimmed at the next labelled field."""
+    for lab in labels:
+        mo = re.search(re.escape(lab) + r"\s*:\s*([^\n]*)", text)
+        if mo:
+            val = _ALIS_ADDR_TRAILING_LABEL_RE.sub("", mo.group(1).strip()).strip()
+            if val:
+                return val
+    return ""
+
+
+def _alis_parse_address_results_html(html: str) -> list:
+    """
+    Parse a combined-address results page into one dict per DOCUMENT.
+
+    Two block layouts share the page and their labels differ — this is not
+    cosmetic, and keying on the wrong one drops half the results:
+      Land Court : "Doc#: <n>-<seq>"  Address:  Descr:  Grantor:  Grantee:  Ctf#:
+      Recorded   : "Bk-Pg: <bk>-<pg>" Addr:     Desc:   Gtor:     Gtee:
+
+    Each row carries the abstract href's recording-date + control-number key
+    (rc_year/rc_month/rc_day/ctl_num), which is the same key the existing
+    Document Abstract fetchers use — so a row from here can be handed
+    straight to the abstract machinery with no extra lookup.
+    """
+    html = _alis_address_normalize_nbsp(html)
+    heads = list(_ALIS_ADDR_HEADER_RE.finditer(html))
+    rows = []
+    for idx, mo in enumerate(heads):
+        seg = html[mo.start(): heads[idx + 1].start() if idx + 1 < len(heads) else len(html)]
+        text = BeautifulSoup(seg, "html.parser").get_text("\n")
+        text = re.sub(r"[ \t]+", " ", text.replace("\xa0", " "))
+        text = re.sub(r"\n{2,}", "\n", text)
+        is_lc = mo.group(1).lower().startswith("doc#")
+
+        # EVERY address in THIS document (mechanic 3) — a list, never a scalar.
+        addresses = []
+        for raw in re.findall(r"(?:Address|Addr)\s*:\s*([^\n]+)", text):
+            val = _ALIS_ADDR_TRAILING_LABEL_RE.sub("", raw.strip()).strip()
+            if val and val not in addresses:
+                addresses.append(val)
+
+        def _href(pattern, _seg=seg):
+            hm = re.search(r'href="([^"]*WSIQTP=(?:%s)[^"]*)"' % pattern, _seg)
+            return hm.group(1).replace("&amp;", "&") if hm else ""
+
+        abstract_href = _href("LR09A|LC09A")
+        key = {}
+        for k in ("W9RCCY", "W9RCMM", "W9RCDD", "W9CTLN"):
+            km = re.search(k + r"=([^&\"]*)", abstract_href)
+            key[k] = km.group(1) if km else ""
+
+        ctf_mo = re.search(r"Ctf#\s*:?\s*\n?\s*([0-9]+)", text)
+        parties = re.findall(r"\b(Grantor|Grantee|Gtor|Gtee)\s*:\s*\n?\s*([^\n]+)", text)
+
+        rows.append({
+            "land_court":      is_lc,
+            "document_number": mo.group(2) if is_lc else "",
+            "sequence":        mo.group(3) if is_lc else "",
+            "book":            "" if is_lc else mo.group(2),
+            "page":            "" if is_lc else mo.group(3),
+            "book_page":       "" if is_lc else "%s-%s" % (mo.group(2), mo.group(3)),
+            "date_received":   _alis_address_field(text, "Recorded").split("@")[0].strip(),
+            "doc_type":        _alis_address_field(text, "Type"),
+            "doc_desc":        _alis_address_field(text, "Descr", "Desc"),
+            "town":            _alis_address_field(text, "Town"),
+            "addresses":       addresses,
+            "certificate":     ctf_mo.group(1) if ctf_mo else "",
+            "consideration":   _alis_address_field(text, "Consideration"),
+            "doc_date":        _alis_address_field(text, "Doc date"),
+            "grantors":        [p[1].strip() for p in parties if p[0].lower() in ("grantor", "gtor")],
+            "grantees":        [p[1].strip() for p in parties if p[0].lower() in ("grantee", "gtee")],
+            "ctl_num":         key["W9CTLN"],
+            "rc_year":         key["W9RCCY"],
+            "rc_month":        key["W9RCMM"],
+            "rc_day":          key["W9RCDD"],
+            "abstract_href":   abstract_href,
+            "img_href":        _href("LR15I|LC15I"),
+        })
+    return rows
+
+
+def _alis_address_row_identity(row: dict) -> tuple:
+    return (row.get("land_court"), row.get("document_number"), row.get("book"),
+            row.get("page"), row.get("ctl_num"), row.get("date_received"))
+
+
+def _alis_address_url(base_url: str, address: str, town: str,
+                      doc_type: str = "*ALL", date_from: str = "",
+                      per_page: int | None = 30) -> str:
+    """
+    Build a combined address-search URL. `date_from` is MMDDYYYY or "".
+
+    The date format is asserted rather than normalised, for the reason
+    recorded as backlog item 31: ALIS answers a MALFORMED date filter with
+    ZERO ROWS instead of an error, and a zero-row result is indistinguishable
+    from "nothing indexed" — the false-clean shape this codebase keeps having
+    to design against. A caller passing "08/10/2018" has a bug and should
+    hear about it immediately.
+    """
+    if date_from and not re.fullmatch(r"\d{8}", date_from):
+        raise ValueError(
+            "ALIS date_from must be MMDDYYYY (8 digits) or empty, got %r. "
+            "A malformed date is NOT rejected by the registry — it silently "
+            "returns zero rows, which reads as 'nothing indexed'." % (date_from,)
+        )
+    address = (address or "").strip().upper()[:_ALIS_ADDRESS_FIELD_LIMIT]
+    url = (
+        "%s/ALIS/WW400R.HTM?W9PADR=%s&W9ABR=%s&W9TOWN=%s"
+        "&W9FDTA=%s&W9TDTA=&WSHTNM=WW414R00&WSIQTP=SY14AP&WSKYCD=T&WSWVER=2"
+        % (base_url, quote(address, safe=""), quote(doc_type, safe="*"),
+           town, quote(date_from, safe=""))
+    )
+    if per_page:
+        url += "&WSSRPP=%s" % per_page
+    return url
+
+
+def _alis_address_search_http(session, base_url: str, address: str, town: str,
+                              doc_type: str = "*ALL", date_from: str = "",
+                              max_pages: int = _ALIS_ADDRESS_MAX_PAGES,
+                              notes: list = None, meta: dict = None) -> list:
+    """
+    Run one combined address search and walk its pagination (mechanic 1).
+
+    Sets meta["truncated"] when the page cap is hit with rows still coming.
+    A truncated address search must NEVER be reported as an absence of
+    anything — the same rule as every other capped search in this file.
+    """
+    url = _alis_address_url(base_url, address, town, doc_type, date_from)
+    resp = _alis_http_get(session, url)
+    html = resp.text
+    page_rows = _alis_parse_address_results_html(html)
+
+    all_rows = list(page_rows)
+    seen = {_alis_address_row_identity(r) for r in page_rows}
+    pages = 1
+    while page_rows and pages < max_pages:
+        fields = _alis_hidden_fields_html(html)
+        if not fields:
+            break
+        params = [(n, v) for n, v in fields if n not in ("WSIQTP", "WSSRPP")]
+        params.append(("WSIQTP", "SY14N"))
+        params.append(("WSSRPP", "30"))
+        resp = _alis_http_get(session, "%s/ALIS/WW400R.HTM" % base_url, params=params)
+        html = resp.text
+        fresh = _alis_parse_address_results_html(html)
+        page_rows = [r for r in fresh if _alis_address_row_identity(r) not in seen]
+        if not page_rows:
+            break
+        seen.update(_alis_address_row_identity(r) for r in page_rows)
+        all_rows.extend(page_rows)
+        pages += 1
+
+    truncated = pages >= max_pages and bool(page_rows)
+    if meta is not None:
+        meta["truncated"] = truncated
+        meta["pages_walked"] = pages
+    if truncated and notes is not None:
+        notes.append(
+            "WARNING: address search '%s' (town %s) hit the %d-page cap at %d "
+            "document(s) — the result is TRUNCATED. Do not read it as a complete "
+            "picture of the street." % (address, town, max_pages, len(all_rows))
+        )
+    return all_rows
+
+
+def _alis_address_queries(street_number: str, street: str) -> list:
+    """
+    Build the address queries for a parcel, cheapest-and-widest first.
+
+    Preferred form is "<number> <STEM>" with the suffix DROPPED: W9PADR is
+    prefix-matched, so the stem is a strict superset of both the abbreviated
+    and the spelled-out suffix (verified on 5/5 parcels), and it is the only
+    form that reliably returns Land Court rows — see mechanic 2 above.
+
+      ("12", "BIRCHWOOD DRIVE") -> ["12 BIRCHWOOD"]
+      ("12", "BIRCHWOOD ST")   -> ["12 BIRCHWOOD"]
+      ("",   "BIRCHWOOD ST")   -> ["BIRCHWOOD"]  (street-only fallback)
+
+    Returns [] when there is nothing to query, which callers must treat as
+    "not asked", never as "nothing found".
+    """
+    stem_words = re.sub(r"\s+", " ", (street or "").strip().upper()).split()
+    while stem_words and (stem_words[-1] in _STREET_SUFFIX_ALIASES
+                          or stem_words[-1] in _STREET_SUFFIX_EXPAND):
+        stem_words.pop()
+    stem = " ".join(stem_words).strip()
+    if not stem:
+        return []
+    num = str(street_number or "").strip().upper()
+    q = ("%s %s" % (num, stem)).strip()
+    return [q[:_ALIS_ADDRESS_FIELD_LIMIT]]
+
+
+def _alis_address_matches_number(row: dict, street_number: str, street: str) -> bool:
+    """
+    Does any address on this document name the subject street number?
+
+    Both sides are normalised loosely because the index is dirty — observed
+    values include a misspelled street name and inconsistent suffix and
+    punctuation between the two sections. A row with NO address at all
+    returns False here, but callers must treat that as UNVERIFIED rather than
+    as a different parcel (the v3.20 rule).
+    """
+    if not street_number:
+        return False
+    head = re.sub(r"\s+", " ", (street or "").strip().upper()).split()
+    stem = head[0] if head else ""
+    num = str(street_number).strip().upper()
+    for addr in row.get("addresses") or []:
+        a = re.sub(r"[.,]", " ", addr.upper())
+        a = re.sub(r"\s+", " ", a).strip()
+        toks = a.split()
+        if not toks:
+            continue
+        # the leading number must match exactly ("48" must not match "148"),
+        # and a range ("66-70") counts as a match on either endpoint
+        lead = toks[0]
+        nums = lead.split("-") if "-" in lead else [lead]
+        if num in nums and (not stem or stem in a):
+            return True
+    return False
+
+
+def _alis_land_court_tripwire(session, base_url: str, street_number: str,
+                              street: str, town: str, notes: list) -> dict:
+    """
+    ITEM 28, use 1 — the cheap fix for the item-25 blind spot.
+
+    After a Recorded-Land selection, ask the NAME-INDEPENDENT combined
+    address index whether the SUBJECT PARCEL has any Registered Land. The
+    v3.44 both-sections search already covers the case where the name index
+    can see the parcel; this covers the case it cannot — a misindexed,
+    variant, or successor owner name, which is how a Land Court parcel gets
+    reported as the seller's adjoining Recorded parcel at exit 0.
+
+    Restricted to the DEED GROUP (*DD) deliberately. Measured on one parcel:
+    50 documents / 17 pages / ~30 s unrestricted versus 1 document / 1 page /
+    ~2 s for the deed group, with the Land Court deed still returned. A
+    registered parcel's defining instrument is a deed noted on a certificate,
+    so the deed group is the right net for THIS question.
+
+    The cost of that restriction, stated plainly because it bounds the
+    negative answer: a registered parcel whose only address-indexed document
+    at this number is a NON-deed would not be seen here. That is why a clean
+    result is reported as support, never as proof.
+
+    Returns {"checked", "queries", "land_court_rows", "rows", "truncated"}.
+    `checked` False means the question was NOT asked (no street parsed, or
+    every query errored) — which is never the same as "no registered land".
+    """
+    out = {"checked": False, "queries": [], "land_court_rows": [],
+           "rows": 0, "truncated": False}
+    queries = _alis_address_queries(street_number, street)
+    if not queries or not town:
+        notes.append(
+            "Land Court tripwire (v3.46): SKIPPED — no street or town available, so "
+            "the address index was not queried. This is NOT a finding that the parcel "
+            "has no registered land."
+        )
+        return out
+
+    seen, ok = set(), False
+    for q in queries:
+        meta = {}
+        try:
+            rows = _alis_address_search_http(session, base_url, q, town,
+                                             doc_type="*DD", notes=notes, meta=meta)
+            ok = True
+        except Exception as exc:                      # noqa: BLE001
+            notes.append(
+                "Land Court tripwire: address query '%s' FAILED (%s) — treat the "
+                "tripwire as not run for that variant." % (q, exc)
+            )
+            continue
+        out["queries"].append({"query": q, "rows": len(rows),
+                               "truncated": bool(meta.get("truncated"))})
+        out["truncated"] = out["truncated"] or bool(meta.get("truncated"))
+        for r in rows:
+            ident = _alis_address_row_identity(r)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            out["rows"] += 1
+            if r["land_court"]:
+                out["land_court_rows"].append(r)
+
+    out["checked"] = ok
+    if not ok:
+        return out
+
+    # The query is already number-scoped, so a returned Land Court row is at
+    # (or prefix-matches) the subject number. Confirm against the row's own
+    # address where it has one; a row with NO address stays in — absent
+    # information is not a non-match (the v3.20 rule).
+    lc = out["land_court_rows"]
+    lc_here = [r for r in lc
+               if not r.get("addresses")
+               or _alis_address_matches_number(r, street_number, street)]
+    if lc_here:
+        cites = ", ".join(
+            "Doc %s%s" % (r["document_number"],
+                          (" / Ctf %s" % r["certificate"]) if r["certificate"] else "")
+            for r in lc_here[:5]
+        )
+        notes.append(
+            "CRITICAL (v3.46 Land Court tripwire): the combined address index shows "
+            "REGISTERED LAND at the subject address — %s. The selected deed is "
+            "Recorded Land. Confirm which section the subject parcel is in before "
+            "reporting; re-run with --office registered if it is Land Court." % cites
+        )
+    elif lc:
+        notes.append(
+            "NOTE (v3.46 Land Court tripwire): %d Registered Land deed(s) matched the "
+            "street prefix but not the subject number — likely a neighbouring parcel." % len(lc)
+        )
+    else:
+        notes.append(
+            "NOTE (v3.46 Land Court tripwire): no Registered Land deed found at this "
+            "address via the NAME-INDEPENDENT combined address index"
+            + (" — but the result was TRUNCATED, so this is not a complete answer."
+               if out["truncated"] else
+               ". Two limits bound this: address coverage is reliable only from 2003, "
+               "and the query is restricted to the deed group. It SUPPORTS the "
+               "Recorded Land selection without proving it.")
+        )
+    return out
+
+
 def _alis_get_pdf_hrefs_http(session, base_url: str, img_href: str) -> dict:
     """
     HTTP version of _alis_get_pdf_hrefs() — fetch the Document Image List
@@ -10758,6 +11221,7 @@ def run_alis_http(
     show_timings: bool = True,
     lien_sweep: bool = False,
     office: str = "auto",   # v3.44 (item 25) — "auto" | "recorded" | "registered"
+    land_court_tripwire: bool = True,   # v3.46 (item 28) — see STEP 6.5
 ) -> dict:
     """
     Shared pure-HTTP runner for the Browntech ALIS registries (Norfolk,
@@ -11583,6 +12047,43 @@ def run_alis_http(
                 # Multi-match with unrankable dates (note appended above) —
                 # still surface any unverified candidates.
                 _warn_unverified(None)
+
+    _tm.mark("STEP 6.5 - Land Court tripwire")
+    # -----------------------------------------------------------
+    # STEP 6.5 — LAND COURT TRIPWIRE (v3.46, backlog item 28)
+    #
+    # The selection above is final. If it landed on RECORDED LAND, ask the
+    # NAME-INDEPENDENT combined address index whether this street carries any
+    # Registered Land. v3.44 already searches both sections, but it can only
+    # find what the NAME index holds — a misindexed or variant-spelled owner
+    # is invisible to it, and that is exactly how a Land Court parcel gets
+    # reported as the seller's adjoining Recorded parcel at exit 0.
+    #
+    # Deliberately NOT run when the selected deed is already Land Court
+    # (nothing to warn about) and not run at all on a --book/--page pin,
+    # where the operator has already stated the answer.
+    result["land_court_tripwire"] = None
+    if not land_court_tripwire:
+        result["notes"].append(
+            "Land Court tripwire (v3.46): DISABLED for this run (--no-land-court-tripwire). "
+            "No conclusion about registered land at this address."
+        )
+    if land_court_tripwire and not result.get("land_court") and not target_book:
+        try:
+            _tw_num, _tw_word = _parse_street_from_base_name(base_name)
+            _tw_street = _street_words_from_base_name(base_name) or _tw_word
+            result["land_court_tripwire"] = _alis_land_court_tripwire(
+                session, base_url, _tw_num, _tw_street, town, result["notes"]
+            )
+        except Exception as _tw_exc:                      # noqa: BLE001
+            # Non-fatal by design: this is a corroborating check, and a
+            # failure here must never take down a run that has already
+            # found and verified a deed. But say so — a tripwire that did
+            # not run is not a tripwire that found nothing.
+            result["notes"].append(
+                f"Land Court tripwire (v3.46) did NOT run: {_tw_exc}. "
+                "No conclusion about registered land on this street."
+            )
 
     _tm.mark("STEP 7 - grantor check")
     # -----------------------------------------------------------
@@ -13037,6 +13538,14 @@ def main() -> None:
                              "the grantor check's results. Result lands in the "
                              "grantor_hit_verification JSON field. Combine with "
                              "--book/--page to keep the main deed selection pinned.")
+    parser.add_argument("--no-land-court-tripwire", dest="land_court_tripwire",
+                        action="store_false", default=True,
+                        help="v3.46 (item 28): skip the NAME-INDEPENDENT Land "
+                             "Court tripwire on the combined address index. It "
+                             "costs ~2s and runs only on a Recorded Land "
+                             "selection. Turn it off for offline/replay runs — "
+                             "it is the only step here that makes an extra "
+                             "live registry request.")
     parser.add_argument("--lien-sweep", action="store_true", default=False,
                         help="v3.38: also run the all-years, type-restricted "
                              "LIEN SWEEP for each owner (tax liens, "
@@ -13207,6 +13716,7 @@ def main() -> None:
                     verify_grantor_hit=args.verify_grantor_hit,
                     show_timings=args.timings,
                     lien_sweep=args.lien_sweep,
+                    land_court_tripwire=args.land_court_tripwire,
                     office=args.office,
                 )
                 if _mode_note:
