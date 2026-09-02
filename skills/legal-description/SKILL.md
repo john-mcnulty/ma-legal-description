@@ -76,14 +76,21 @@ Generated: [Date/Time]
 - Deed Property Address: ...  ← address as shown on deed (left margin notation, granting clause, or cover sheet — use most complete source)
 ## Title Flags / Notes
 [Flags, warnings, or notes]
-## Screenshots Saved
+## Source Pages Saved
 - [filename_p1.jpg] — Page 1
 - [filename_p2.jpg] — Page 2 (if applicable)
 ```
 
-### 2. Deed Screenshots (`.jpg`)
+### 2. Deed Page Images (`.jpg` — or whatever the registry serves)
 Named: `[Address] - [Seller Last Name] - deed_p1.jpg`, `_p2.jpg`, etc.
-Purpose: auditability — visual record of the actual deed.
+Purpose: auditability — a human must be able to open each saved page and
+visually confirm that the captured legal description matches the recorded
+instrument. **That is the requirement; the format is not.** Any capture
+(registry PDF, hi-res render, viewer screenshot) is acceptable provided
+every page the description was taken from is saved, legible, and cited.
+A page saved at the viewer's thumbnail resolution fails this test even
+when it happens to be readable — v3.47 fetches Plymouth pages at the
+2000 px render and emits a `WARNING` when any page came back smaller.
 
 ### 3. Legal Description Text (`.txt`)
 Named: `Legal Description - [Address] - [Seller Last Name].txt`
@@ -178,7 +185,7 @@ Otherwise, start with the **Recorded** section (~75% of properties). Ask the use
 
 **The run writes its own JSON to disk (v3.30).** Every run saves the complete result to **`<output>\<base-name> - result.json`** and reports the path as `result_file`. If the JSON you see in the terminal is truncated — a long grantor check easily overflows the tool output limit, and the tail is where `book`, `page` and `needs_review` live — **Read that file instead of re-running the search.** Recovering by re-running used to cost a second full run (~6 minutes on a common surname). A re-run refreshes the file; an unsuccessful re-run will not overwrite a successful record, diverting to a timestamped sibling and saying so in the notes.
 
-**Engines (v3.9):** Norfolk and Barnstable now run on a **pure-HTTP engine by default** (requests + BeautifulSoup, no browser) — runs complete in **~10–35 seconds** instead of ~3 minutes. `--engine {auto,http,playwright}` controls this: `auto` (default) uses HTTP and falls back to the old Playwright engine automatically on hard HTTP failure. Plymouth and Middlesex South remain Playwright-only. The result JSON's `engine` field reports which engine ran.
+**Engines (v3.9):** Norfolk and Barnstable now run on a **pure-HTTP engine by default** (requests + BeautifulSoup, no browser) — runs complete in **~10–35 seconds** instead of ~3 minutes. `--engine {auto,http,playwright}` controls this: `auto` (default) uses HTTP and falls back to the old Playwright engine automatically on hard HTTP failure. Plymouth and Middlesex South remain Playwright-only for the registry work. **Since v3.47 Plymouth also runs the same inline extraction, report draft and delivery as the ALIS engines, on its downloaded page images** — under the same `--extraction` modes — so a keyed Plymouth run finishes on its own (measured: the registry script is ~30 s; extraction adds one API call). Middlesex South and Suffolk still need `--deliver-text-file`. The result JSON's `engine` field reports which engine ran.
 
 **Script:** `${CLAUDE_PLUGIN_ROOT}/scripts/legal_desc_fetch.py`
 
@@ -336,8 +343,11 @@ https://search.barnstabledeeds.org/ALIS/WW400R.HTM?W9SNM=[LAST]&W9GNM=[FIRST]&W9
 
 **On exit 0 — reading the JSON output:**
 
-*Plymouth fields (v2.8):*
+*Plymouth fields (v2.8; extraction fields since v3.47):*
 - `book`, `page`, `document_number`, `recorded_date`, `deed_type`, `consideration` — use directly
+- **`legal_description`, `pdf_extraction`, `signing_date`, `grantors_full`/`grantees_full`, `tenancy`, `prior_deed_reference`, `title_flags`, `deed_property_address_pdf`, `recording_stamp`, `extraction_mode` (v3.47)** — the same inline extraction the ALIS engines have had since v3.10, run on the downloaded page images. On success the script also writes the report draft (`report_file`) and the three-form `.txt` (`txt_file`), and copies the paste-ready text (`clipboard_copied`) — **skip the Read-the-images step and go to Step 6.** Two verification notes come with it, and both matter for the audit: `"Recording stamp verified: ..."` means the stamp read off the images names the selected Bk/Pg (a **`WARNING: the recording stamp ... does NOT name the selected Bk/Pg`** means the viewer served a different instrument — stop); `"Address verified: ..."` / `"WARNING: ... names the subject STREET but the number could not be confirmed"` / **`"ADDRESS MISMATCH: ..."`** compare the extracted deed address to the street parsed from `--base-name` (no auto-retarget on Plymouth — the index-level town and street guards already ran; a mismatch means confirm the parcel by hand). In `claude-code` mode, or when `extraction_error`/`extraction_unavailable` is set, a `"READ THE DEED PAGE IMAGES ..."` note names the files and the manual path applies as before.
+- **Page-image resolution (v3.47)** — each `"Page N saved (...)"` note carries the capture method: `hires_src_download` is the 2000 px render (≈1550×2000); `src_download` or `screenshot` is the viewer's default ≈527×682 thumbnail. **A `WARNING: ... page image(s) were saved at the viewer's DEFAULT (thumbnail ...) resolution` note means the saved pages may not be legible enough to audit the transcription** — open the instrument in the registry viewer to verify before relying on the text.
+- **`timings` (v3.47)** — per-stage seconds (`STEP 1 - grantee search` … `STEP 5 - grantor check`, plus `STEP 6 - inline extraction` when it ran), `total_seconds`, `slowest`. Rendered as the report's Run Timings table when `show_timings` is on.
 - `deed_property_address` — street + town as indexed in the registry results grid; use to confirm the correct property was selected
 - `found_via_address_search` — `true` if the deed was located via property address search (either as the primary method or as an automatic town- or street-mismatch retry); `false` if found via grantee name search
 - `found_via_compound_surname` — `true` if the deed was located via the v3.5 hyphenated/compound-surname retry (surname-only search after the combined name search returned nothing). When `true`, confirm the selected grantee's surname is the full hyphenated name (e.g. `WHITFIELD-BARROW`) and that the first name matches.
@@ -718,7 +728,7 @@ type.)
 
 ## PERFORMANCE NOTES
 
-- **Typical elapsed time (Playwright fast path):** 3–5 minutes on Plymouth, Norfolk, and Barnstable; **~16 seconds on Suffolk** (v3.41, measured; was ~70 s at v3.40 — the difference is almost entirely the empty-search timeout, not the searches themselves). Manual fallback paths run 15–30 minutes on well-behaved registries. The old 45–70+ minute Suffolk figure described the manual browser path and no longer applies to `--registry suffolk`.
+- **Typical elapsed time (Playwright fast path):** **~30 s of script on Plymouth** (v3.47 measurement: 31.5 s for grantee search + 3-page pager walk + detail panel + 3 image downloads + 45-row grantor check; inline extraction adds one API call, and the old 3–5 minute figure was the assistant transcribing the images by hand after a script that had already finished); 3–5 minutes on Norfolk and Barnstable via Playwright (the HTTP engine is 10–65 s); **~16 seconds on Suffolk** (v3.41, measured; was ~70 s at v3.40 — the difference is almost entirely the empty-search timeout, not the searches themselves). Manual fallback paths run 15–30 minutes on well-behaved registries. The old 45–70+ minute Suffolk figure described the manual browser path and no longer applies to `--registry suffolk`.
 - **Playwright fast path (Plymouth, Norfolk, Barnstable):** When the script succeeds, Steps 2–5 run in ~60–180 seconds of unattended Playwright automation instead of 15–20 minutes of browser tool calls. Expected end-to-end time: 3–5 minutes (Step 1 + Playwright + Step 6 + Step 7 + Step 8). For Plymouth, the town-mismatch retry adds ~30–60 seconds when the seller owns multiple Plymouth County properties. Norfolk and Barnstable both use shared `_alis_*` helpers and behave identically performance-wise.
 - **Browser tool calls (token proxy):** Target under 50 per run on ✅ Ready registries. First runs on new registries will exceed this. Playwright runs consume ~0–5 browser tool calls total (the Playwright script itself does not count — it's invoked via Bash) vs. 30–60 for the full manual path.
 - **Image resolution (Suffolk):** the ~217×281 px figure described the on-page render, not what the fast path saves. The script rewrites the `ACSResource.axd` request to `CNTHEIGHT=2000` and saves a **1542×2000** JPEG per page (measured 2026-08-18) — fully legible.

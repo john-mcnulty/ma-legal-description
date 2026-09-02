@@ -1,7 +1,79 @@
 #!/usr/bin/env python3
 """
 legal_desc_fetch.py — fast-path for Legal Description Search Workflow
-Version: 3.40
+Version: 3.47
+
+v3.47 changes (Plymouth: legible source images + inline extraction — the
+assistant loop, not the registry, was the cost):
+
+  A timed Plymouth run measured the SCRIPT at 31.5 s end to end (grantee
+  search, 3-page pager walk, detail panel, 3 image downloads, 45-row
+  grantor check). The same run took 2.6 minutes of wall clock, and an
+  earlier one 5.4, because everything after the script was manual: Read
+  each page image, transcribe the legal description, write a temp file,
+  re-invoke with --deliver-text-file, write the report by hand. Two
+  defects underneath that, fixed here:
+
+  47a  The saved page images were 527x682 px — the viewer's THUMBNAIL
+       render. _download_viewer_image() fetched #ImageViewer1_docImage's
+       src as-is; Middlesex South and Suffolk have rewritten the same
+       Avenu ACSResource.axd request to CNTHEIGHT=2000 (a 1542x2000 scan)
+       since v3.8/v3.40 and Plymouth never got the port. A typed modern
+       deed happened to be readable at 527 px; a metes-and-bounds or
+       handwritten one is not, and the images exist so a HUMAN can check
+       the transcription against the record. Ported. A page that still
+       comes back at the default size is now SAID (per-page method tag +
+       a WARNING note) rather than passing silently — the acceptance
+       test for a saved page is "legible enough to audit", not "a .jpg".
+
+  47b  Plymouth had NO inline extraction: _run_pdf_extraction() was only
+       ever called from the ALIS flow, so legal_description was null, no
+       report draft / .txt / clipboard was produced, and the v3.27
+       extraction modes did not apply. _extract_pdf_fields() now sends
+       image pages as image blocks (PDFs unchanged), and the Plymouth
+       dispatch runs the same extraction, report draft and delivery as
+       ALIS — gated by the same --extraction {auto,api,claude-code}
+       resolution, with the same claude-code fallback note naming the
+       files to Read. Two checks come with it, both cheap and both aimed
+       at the audit question: the extracted recording stamp is compared
+       to the selected Bk/Pg (a mismatch means the viewer served the
+       wrong instrument), and the extracted property address is compared
+       to the street parsed from --base-name (WARNING on mismatch; no
+       auto-retarget on Plymouth — its index-level town and street guards
+       already ran before the images were fetched).
+
+  47c  run_plymouth() now records per-stage timings (_Timings, v3.31),
+       so the next "where did the time go" question is answered from the
+       result JSON instead of a stopwatch around the process.
+
+  47d  Found by the first live run of 47b: the address check tokenises
+       on [A-Z0-9]+, so a possessive street name ("Baker's Lane") split
+       into BAKER + S and could never equal the BAKERS parsed from
+       --base-name — an ADDRESS MISMATCH on the correct parcel. This was
+       latent in the shared ALIS helpers too, and one layer up: with the
+       apostrophe written in --base-name, the v3.12 index street guard
+       fired a false "does not match expected street" and a needless
+       address-search retry (measured: +18 s, and on a parcel whose deed
+       is absent from the address index the retry could pick a worse
+       row). _parse_street_from_base_name() now strips apostrophes at the
+       source, and every matcher normalises both sides (_addr_norm).
+
+  47e  Also from that run: the extracted legal_description came back as
+       one flat string with no line or paragraph breaks, while the
+       delivery's "verbatim" form promises line breaks preserved. The
+       schema description now asks for the instrument's line breaks as
+       newlines and paragraph breaks as blank lines, and says in so many
+       words not to correct apparent typos or odd punctuation — the same
+       run showed why: the recorded deed carried a semicolon inside a
+       date ("dated March 3; 2015" style), the extraction reproduced it,
+       and a hand transcription from the old 527 px thumbnail had
+       silently "fixed" it to a comma.
+       The record is the record; the human audit exists to catch exactly
+       this, and it can only do so if the text was not tidied first.
+
+  The report heading "Screenshots Saved" is now "Source Pages Saved": the
+  requirement is a human-auditable copy of each page the description was
+  taken from, in whatever format the registry serves.
 
 v3.40 changes (a PORT DIVERGENCE, not a design change — the public copy had
 silently lost half of the v3.36 guard):
@@ -1686,20 +1758,49 @@ _PLYMOUTH_TOWN_ABBREVS: dict[str, str] = {
 async def _download_viewer_image(page: Page, output_path: Path) -> str:
     """
     Download the deed image currently shown in the Plymouth image viewer.
-    Strategy 1: fetch the img src URL via the authenticated browser session.
-    Strategy 2: Playwright element screenshot fallback.
-    Returns: 'src_download' | 'screenshot' | 'failed'
+
+    v3.47 (47a) — the viewer's <img> src is an Avenu ACSResource.axd request
+    whose CNTWIDTH/CNTHEIGHT params set the SERVER-SIDE render size, and the
+    default is the on-screen container (~527x682 px — a thumbnail). Saving
+    that as the audit copy defeats the point of saving it. Rewrite to a
+    2000 px render exactly as Middlesex South (v3.8) and Suffolk (v3.40) do
+    on the same platform; fall back to the default src, then to an element
+    screenshot, so a markup change degrades to the old behaviour instead of
+    failing the run. The caller reports the method per page, and warns when
+    any page was not the hi-res render.
+    Returns: 'hires_src_download' | 'src_download' | 'screenshot' | 'failed'
     """
-    img_src = await page.get_attribute("#ImageViewer1_docImage", "src")
-    if img_src:
-        if img_src.startswith("/"):
-            img_url = f"https://titleview.org{img_src}"
-        elif img_src.startswith("http"):
-            img_url = img_src
-        else:
-            img_url = f"https://titleview.org/plymouthdeeds/{img_src}"
+    src = None
+    try:
+        # .src (property) is already absolute; the attribute may be relative.
+        src = await page.evaluate(
+            "() => { const i = document.querySelector('#ImageViewer1_docImage');"
+            " return i ? i.src : null; }"
+        )
+    except Exception:
+        pass
+    if not src:
+        src = await page.get_attribute("#ImageViewer1_docImage", "src")
+    if src and not src.startswith("http"):
+        src = (f"https://titleview.org{src}" if src.startswith("/")
+               else f"https://titleview.org/plymouthdeeds/{src}")
+
+    if src and "ACSResource" in src:
+        hi = re.sub(r"CNTHEIGHT=\d+", "CNTHEIGHT=2000", src)
+        hi = re.sub(r"CNTWIDTH=\d+", "CNTWIDTH=1550", hi)
+        if hi != src:
+            try:
+                resp = await page.request.get(hi)
+                if resp.ok:
+                    body = await resp.body()
+                    if len(body) > 5000:  # sanity: not an error page / placeholder
+                        output_path.write_bytes(body)
+                        return "hires_src_download"
+            except Exception:
+                pass
+    if src:
         try:
-            response = await page.request.get(img_url)
+            response = await page.request.get(src)
             if response.ok:
                 output_path.write_bytes(await response.body())
                 return "src_download"
@@ -1708,8 +1809,11 @@ async def _download_viewer_image(page: Page, output_path: Path) -> str:
 
     img_el = await page.query_selector("#ImageViewer1_docImage")
     if img_el:
-        await img_el.screenshot(path=str(output_path))
-        return "screenshot"
+        try:
+            await img_el.screenshot(path=str(output_path))
+            return "screenshot"
+        except Exception:
+            pass
 
     return "failed"
 
@@ -2697,8 +2801,8 @@ def _street_matches_filter(street_filter: str, street: str) -> bool:
     "&OTHERS" multi-parcel marker.  Both arguments are uppercased here, so the
     caller need not.
     """
-    sf = (street_filter or "").upper().strip()
-    s = (street or "").upper().strip()
+    sf = _addr_norm(street_filter).strip()   # v3.47 — apostrophes dropped both sides
+    s = _addr_norm(street).strip()
     if not sf or not s:
         return False
     return sf in s
@@ -2940,7 +3044,12 @@ def _parse_street_from_base_name(base_name: str) -> tuple:
     tokens = part.split()
     # Accept "155", "155R", "12A" etc. — Massachusetts rear-lot addresses use letter suffixes
     if len(tokens) >= 2 and re.match(r'^\d+[A-Za-z]{0,2}$', tokens[0]):
-        return tokens[0], tokens[1].upper()
+        # v3.47 (47d) — registries index "Baker's Lane" as BAKERS; a street
+        # word carrying the apostrophe matched nothing downstream (the
+        # index street guard fired a false mismatch and a needless
+        # address-search retry, and the extracted-address check reported
+        # ADDRESS MISMATCH on the correct parcel).
+        return tokens[0], _addr_norm(tokens[1])
     return "", ""
 
 
@@ -2966,7 +3075,7 @@ def _street_words_from_base_name(base_name: str) -> str:
     tokens = base_name.split(" - ")[0].strip().split()[1:]
     words = []
     for tok in tokens:
-        clean = re.sub(r"[.,]", "", tok).upper()
+        clean = _addr_norm(re.sub(r"[.,]", "", tok))   # v3.47 — apostrophes dropped
         words.append(clean)
         if clean in _STREET_SUFFIX_ALIASES or clean in _STREET_SUFFIX_EXPAND:
             break
@@ -3672,6 +3781,10 @@ async def run_plymouth(
         "errors": [],
     }
 
+    # v3.47 (47c) — per-stage timings, as the ALIS flow has had since v3.31.
+    _tm = _Timings()
+    _tm.mark("STEP 1 - grantee search")
+
     # Plymouth name format: "LAST FIRST" (no comma, no spaces in compound first names)
     first_normalized = seller_first.upper().replace(" ", "")
     combined_name = f"{seller_last.upper()} {first_normalized}"
@@ -3799,6 +3912,7 @@ async def run_plymouth(
             # Selection does not depend on this (the name path re-sorts in Python
             # and the address path picks by max book/doc), but the on-screen order
             # must still match what the notes claim, and prefer_first= relies on it.
+            _tm.mark("STEP 2 - page size, sort, pager walk, select row")
             await _avenu_set_page_size_100(page)
             sorted_desc = await _sort_results_by_date_desc(page)
             result["notes"].append(
@@ -4188,6 +4302,7 @@ async def run_plymouth(
             # -----------------------------------------------------------
             # STEP 3 — DETAIL PANEL (full parties + consideration)
             # -----------------------------------------------------------
+            _tm.mark("STEP 3 - detail panel")
             panel_opened = await _open_detail_panel(page, ctl=row["ctl"], expected_book=row["book"])
             if panel_opened:
                 detail = await _read_detail_panel(page)
@@ -4224,6 +4339,7 @@ async def run_plymouth(
             # -----------------------------------------------------------
             # STEP 4 — VIEW IMAGES → download deed pages
             # -----------------------------------------------------------
+            _tm.mark("STEP 4 - page images")
             # Click "View Images" tab to set up server session (no popup fires)
             try:
                 view_images_link = await page.query_selector('a[href*="TabController1$ImageViewertabitem"]')
@@ -4265,6 +4381,25 @@ async def run_plymouth(
                 else:
                     result["errors"].append(f"Page {page_num} download failed.")
 
+            # v3.47 (47a) — say it when a page is NOT the hi-res render. The
+            # saved images are the audit copy; a thumbnail that passes
+            # silently is the same missing-information-read-as-a-pass shape
+            # as every other silent degrade in this file.
+            _default_res = [
+                n for n in result["notes"]
+                if n.startswith("Page ")
+                and ("(src_download)" in n or "(screenshot)" in n)
+            ]
+            if _default_res:
+                result["notes"].append(
+                    f"WARNING: {len(_default_res)} page image(s) were saved at "
+                    "the viewer's DEFAULT (thumbnail, ~527x682 px) resolution, "
+                    "not the 2000 px render — the hi-res rewrite did not apply. "
+                    "Small type may not be legible enough to audit the "
+                    "transcription; open the instrument in the registry viewer "
+                    "to verify."
+                )
+
         except Exception as e:
             result["errors"].append(f"Main workflow failed: {e}")
             await browser.close()
@@ -4280,6 +4415,7 @@ async def run_plymouth(
         # Checks every grantee on the deed as a potential Grantor, not just
         # the named seller.  Catches subsequent deeds by joint tenant co-owners.
         # -----------------------------------------------------------
+        _tm.mark("STEP 5 - grantor check")
         try:
             g_page = await context.new_page()
             original_book = result.get("book", "")
@@ -4426,6 +4562,7 @@ async def run_plymouth(
     result["status"] = "success" if result["files"] else "error"
     if not result["files"] and not result["errors"]:
         result["errors"].append("No files downloaded.")
+    _tm.finish(result)
     return result
 
 
@@ -9155,8 +9292,12 @@ _DEED_SCHEMA = {
                 "and plan references, condominium unit recitals including "
                 "the master deed reference, appurtenant rights, and any "
                 "'subject to' clauses that are part of the description. "
-                "Preserve the original wording and punctuation. Null only "
-                "if no legal description appears."
+                "Preserve the original wording and punctuation EXACTLY — "
+                "do not correct apparent typos or unusual punctuation. "
+                "Preserve the instrument's line breaks as newline "
+                "characters and its paragraph breaks as blank lines, so "
+                "the text can be checked line-for-line against the page "
+                "images. Null only if no legal description appears."
             ),
         },
         "property_address": {
@@ -9334,7 +9475,8 @@ _GRANTOR_HIT_SAMPLE_CAP = 5
 _EXTRACT_SYSTEM = (
     "You extract structured title data from scanned Massachusetts Registry "
     "of Deeds instruments (Browntech ALIS registries such as Norfolk and "
-    "Barnstable). The attached PDF pages together form ONE recorded "
+    "Barnstable serve PDFs; Avenu registries such as Plymouth serve page "
+    "images). The attached pages together form ONE recorded "
     "instrument, in page order; the first page is usually a registry cover "
     "sheet or bears the recording stamp. Transcribe fields exactly as "
     "written on the instrument — do not paraphrase, normalize names, or "
@@ -9488,22 +9630,39 @@ def _resolve_extraction_mode(requested: str):
     return True, "api", None, None
 
 
+# v3.47 (47b) — the browser registries (Plymouth, Middlesex South, Suffolk)
+# save deed pages as images, not PDFs. Extension → image media type; a
+# file not listed here is sent as a PDF.
+_IMAGE_MEDIA_TYPES = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp",
+}
+
+
 def _extract_pdf_fields(client, pdf_paths: list, schema: dict,
                         instruction: str,
                         model: str = _EXTRACT_MODEL_MAIN) -> dict:
     """
-    Send the given PDFs (pages of one instrument) to Claude with a
-    structured-output schema and return the parsed field dict.
-    Raises on API/parse failure — callers wrap.
+    Send the given pages of one instrument (PDFs, or page images since
+    v3.47) to Claude with a structured-output schema and return the parsed
+    field dict. Raises on API/parse failure — callers wrap.
     """
     content = []
     for p in pdf_paths:
         data = base64.standard_b64encode(Path(p).read_bytes()).decode("utf-8")
-        content.append({
-            "type": "document",
-            "source": {"type": "base64", "media_type": "application/pdf",
-                       "data": data},
-        })
+        media = _IMAGE_MEDIA_TYPES.get(Path(p).suffix.lower())
+        if media:
+            content.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": media,
+                           "data": data},
+            })
+        else:
+            content.append({
+                "type": "document",
+                "source": {"type": "base64", "media_type": "application/pdf",
+                           "data": data},
+            })
     content.append({"type": "text", "text": instruction})
 
     response = client.messages.create(
@@ -9660,6 +9819,122 @@ def _run_pdf_extraction(result: dict, land_court: bool) -> None:
                 _mark_extraction_unavailable(result, e)
 
 
+def _stamp_matches_selection(stamp: str, book, page) -> bool:
+    """
+    v3.47 — does the recording stamp read off the page images name the
+    SELECTED book and page? Token match, so 'Bk: 12345 Pg: 678' and
+    'Book 12345, Page 678' both pass; a stamp naming a different book or
+    page means the viewer served another instrument than the row clicked.
+    """
+    if not (stamp and book and page):
+        return False
+    toks = [t.lstrip("0") or "0" for t in re.findall(r"\d+", str(stamp))]
+    return (str(book).lstrip("0") in toks) and (str(page).lstrip("0") in toks)
+
+
+def _timings_add_stage(result: dict, label: str, seconds: float) -> None:
+    """
+    v3.47 — append a stage measured OUTSIDE the runner (inline extraction
+    happens in main(), after the runner has already finished its timings)
+    to the finished timings block. Swallows everything: a timing bug must
+    never be able to fail a run.
+    """
+    try:
+        t = result.get("timings")
+        if not t:
+            return
+        stage = {"stage": label, "seconds": round(seconds, 2)}
+        t["stages"].append(stage)
+        t["total_seconds"] = round(t["total_seconds"] + stage["seconds"], 2)
+        t["slowest"] = max(t["stages"], key=lambda s: s["seconds"])
+    except Exception:
+        pass
+
+
+def _run_image_extraction(result: dict, *, extract_pdf: bool,
+                          extraction_mode: str, mode_note,
+                          street_number: str, street_name: str,
+                          land_court: bool = False) -> None:
+    """
+    v3.47 (47b) — inline extraction for a browser registry whose deed pages
+    arrive as IMAGES. Same _run_pdf_extraction, same --extraction gating,
+    same claude-code note naming the files to Read; plus two post-checks
+    aimed at the AUDIT question rather than the which-parcel one (the
+    index-level town/street guards ran before the images were fetched):
+
+      * the extracted recording stamp vs the SELECTED Bk/Pg — a mismatch
+        means the viewer served a different instrument than the row that
+        was clicked, and the legal description is from the wrong deed;
+      * the extracted property address vs the street parsed from
+        --base-name — a WARNING / ADDRESS MISMATCH note, never an
+        auto-retarget.
+
+    Mutates `result`; never raises.
+    """
+    try:
+        result["extraction_mode"] = extraction_mode
+        if mode_note:
+            result.setdefault("notes", []).insert(0, mode_note)
+        if result.get("status") != "success" or not result.get("files"):
+            return
+        if not extract_pdf:
+            result["notes"].append(
+                "READ THE DEED PAGE IMAGES to extract the legal description "
+                "and deed fields (claude-code extraction mode): "
+                + ", ".join(Path(f).name for f in result["files"])
+            )
+            return
+
+        t0 = time.perf_counter()
+        _run_pdf_extraction(result, land_court=land_court)
+        _timings_add_stage(result, "STEP 6 - inline extraction",
+                           time.perf_counter() - t0)
+        if not result.get("legal_description"):
+            return
+
+        stamp = result.get("recording_stamp")
+        if stamp:
+            if _stamp_matches_selection(stamp, result.get("book"), result.get("page")):
+                result["notes"].append(
+                    f"Recording stamp verified: '{stamp}' names the selected "
+                    f"Bk {result.get('book')}/Pg {result.get('page')}."
+                )
+            else:
+                result["notes"].append(
+                    f"WARNING: the recording stamp read off the page images "
+                    f"('{stamp}') does NOT name the selected Bk "
+                    f"{result.get('book')}/Pg {result.get('page')} — the "
+                    "viewer may have served a different instrument. Verify "
+                    "the page images against the index row before using "
+                    "this legal description."
+                )
+        addr = result.get("deed_property_address_pdf")
+        if addr and street_number and street_name:
+            if _alis_address_matches(street_number, street_name, addr):
+                result["notes"].append(
+                    f"Address verified: extracted deed address '{addr}' "
+                    f"matches {street_number} {street_name}."
+                )
+            elif _alis_street_word_matches(street_name, addr):
+                result["notes"].append(
+                    f"WARNING: extracted deed address '{addr}' names the "
+                    f"subject STREET but the number could not be confirmed "
+                    f"against {street_number} {street_name} — verify the "
+                    "parcel on the page images."
+                )
+            else:
+                result["notes"].append(
+                    f"ADDRESS MISMATCH: extracted deed address '{addr}' does "
+                    f"not match {street_number} {street_name}. Do NOT use "
+                    "this legal description until the parcel is confirmed — "
+                    "the seller may own more than one property, or the "
+                    "parcel may be Registered Land."
+                )
+    except Exception as e:
+        result.setdefault("notes", []).append(
+            f"Inline image extraction failed (non-fatal): {e}")
+
+
 def _alis_indexed_name_pair(indexed: str) -> tuple:
     """
     Parse an ALIS index name string into (last, first) for a name search.
@@ -9692,8 +9967,19 @@ def _alis_address_matches(street_num: str, street_word: str, address: str) -> bo
     """
     if not (street_num and street_word and address):
         return False
-    tokens = re.findall(r"[A-Z0-9]+", address.upper())
-    return street_num.upper() in tokens and street_word.upper() in tokens
+    tokens = re.findall(r"[A-Z0-9]+", _addr_norm(address))
+    return street_num.upper() in tokens and _addr_norm(street_word) in tokens
+
+
+def _addr_norm(s: str) -> str:
+    """
+    v3.47 — uppercase with apostrophes removed, so a possessive street name
+    survives tokenisation: "Baker's Lane" used to split into BAKER + S
+    and could never match the street word BAKERS parsed from --base-name,
+    producing an ADDRESS MISMATCH on the correct parcel. Both sides are
+    normalised, so "Baker's" and "Bakers" in the base name behave alike.
+    """
+    return (s or "").upper().replace("'", "").replace("’", "")
 
 
 def _alis_street_word_matches(street_word: str, address: str) -> bool:
@@ -9706,7 +9992,7 @@ def _alis_street_word_matches(street_word: str, address: str) -> bool:
     """
     if not (street_word and address):
         return False
-    return street_word.upper() in re.findall(r"[A-Z0-9]+", address.upper())
+    return _addr_norm(street_word) in re.findall(r"[A-Z0-9]+", _addr_norm(address))
 
 
 _ENTITY_NAME_TOKENS = {
@@ -10759,7 +11045,7 @@ def _write_markdown_report(result: dict, base_name: str, seller_display: str,
     """
     v3.16 — render the Step 6 markdown report DRAFT from the result JSON,
     using the skill's documented structure (LEGAL DESCRIPTION / Deed
-    Metadata / Title Flags / Screenshots Saved). Runs only on a successful
+    Metadata / Title Flags / Source Pages Saved). Runs only on a successful
     run with a populated legal_description; NEVER overwrites an existing
     report file (manual edits must survive a re-run). Sets
     result["report_file"] on success. Callers wrap non-fatally.
@@ -10965,7 +11251,9 @@ def _write_markdown_report(result: dict, base_name: str, seller_display: str,
               "| Stage | Seconds |", "|---|---|"]
         L += [f"| {s['stage']} | {s['seconds']} |" for s in _t["stages"]]
         L.append("")
-    L += ["---", "", "## Screenshots Saved", ""]
+    # v3.47 — "Source Pages Saved": the requirement is a human-auditable copy
+    # of each page the description was taken from, whatever the format.
+    L += ["---", "", "## Source Pages Saved", ""]
     for i, f in enumerate(result.get("files") or [], 1):
         L.append(f"- [{Path(f).name}] — Page {i}")
     extras = []
@@ -13564,7 +13852,8 @@ def main() -> None:
                              "of a slow run); this only controls the report.")
     parser.add_argument("--extraction", choices=("auto", "api", "claude-code"),
                         default="auto",
-                        help="v3.27, Norfolk/Barnstable HTTP engine: how the deed "
+                        help="v3.27 (Norfolk/Barnstable HTTP engine; Plymouth since "
+                             "v3.47, on its downloaded page images): how the deed "
                              "PDFs get read. 'auto' (default) uses the Claude API "
                              "when ANTHROPIC_API_KEY and the anthropic SDK are "
                              "available and otherwise runs in claude-code mode; "
@@ -13860,6 +14149,21 @@ def main() -> None:
                 lien_sweep=args.lien_sweep,
             )
         )
+        # v3.47 (47b) — inline extraction + report draft, exactly as the
+        # ALIS flow does after its grantor check. Delivery (.txt/.docx/
+        # clipboard) follows in _finish_run for every registry.
+        _run_image_extraction(
+            result, extract_pdf=extract_pdf, extraction_mode=extraction_mode,
+            mode_note=_mode_note, street_number=sn, street_name=st,
+        )
+        try:
+            _write_markdown_report(
+                result, args.base_name, f"{args.first} {args.last}".strip(),
+                output_folder, show_timings=args.timings,
+            )
+        except Exception as e:
+            result.setdefault("notes", []).append(
+                f"Report draft failed (non-fatal): {e}")
     elif args.registry == "barnstable":
         barnstable_town, barnstable_notes = _barnstable_resolve_town(args.town, args.base_name)
         result = _run_alis_registry(
