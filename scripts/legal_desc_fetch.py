@@ -1,7 +1,82 @@
 #!/usr/bin/env python3
 """
 legal_desc_fetch.py — fast-path for Legal Description Search Workflow
-Version: 3.47
+Version: 3.48
+
+v3.48 changes (item 42 — Suffolk and Middlesex South get inline extraction,
+so NO registry now depends on the assistant retyping a legal description):
+
+  Suffolk and Middlesex South were the last two registries without inline
+  extraction: the assistant Read the page images, retyped the description
+  into a temp file and re-invoked with --deliver-text-file. The argument
+  for closing that is TRANSCRIPTION FIDELITY, not speed — a hand
+  transcription silently "corrects" the record. Measured on the live
+  fixtures below, the extraction reproduced both deeds word-for-word
+  (Land Court: byte-identical to the verified hand transcription; Suffolk
+  Recorded: 320/320 words identical), and where it differed from the hand
+  copy it was RIGHT — the hand copy had pasted the grantors' "meaning and
+  intending" clause into the description body.
+
+  Both registries already saved the exact artifact needed (deed_p{n}.jpg
+  at the same CNTHEIGHT=2000 render), and _extract_pdf_fields has
+  dispatched on extension via _IMAGE_MEDIA_TYPES since v3.47, so the
+  wiring is small. The work was in the four things that would have gone
+  wrong quietly:
+
+  48a  _write_markdown_report THREW on Suffolk. It did summary['total']
+       on a value run_suffolk sets to the STRING "hits_found"/"no_hits"/
+       "incomplete" (ALIS and Plymouth set a dict of counts). The
+       caller's try/except swallowed the TypeError into "Report draft
+       failed (non-fatal)", so the first Suffolk run to reach the report
+       writer would have produced NO report and only a soft note.
+       isinstance(summary, dict) — Suffolk falls into the unclassified
+       branch, which is correct for a registry with no classification.
+
+  48b  The v3.47 stamp check would have CRIED WOLF ON EVERY LAND COURT
+       RUN. _stamp_matches_selection returned False whenever book/page
+       were falsy, and Registered Land has neither — so every CORRECT
+       Suffolk Land Court run would have warned "the viewer may have
+       served a different instrument". Suffolk is the one registry that
+       routinely lands in Land Court. It now returns match/mismatch/
+       UNKNOWN and keys Land Court on Document Number, corroborated by
+       "Noted on Certificate" and the registration book/page. "unknown"
+       (no stamp, nothing to check against) is reported as an unchecked
+       box, never as a warning and never as a clean check.
+
+  48c  Inline extraction could put the WRONG CERTIFICATE on a Land Court
+       run. When the detail panel's Certificate/Encumbrance read comes
+       back empty — seen live — extraction filled certificate_of_title
+       from the instrument, and a certificate recited in a deed is the
+       one the land is DESCRIBED on (conveyed out of), not the one this
+       deed is noted on. Live: panel empty, extraction 77105, cover sheet
+       "Noted on Certificate : 198332". Before item 42 the field stayed
+       visibly "___"; filling it silently would have replaced missing
+       information with confident wrong information. Fixed at the source
+       (the schema now defines the field as the "Noted on Certificate"
+       number and says to return null rather than a recited one) and
+       backed by _reconcile_lc_certificate, which prefers the panel,
+       falls back to the cover sheet, and WARNS when the two disagree or
+       when the number came from the deed text alone.
+
+  48d  The extracted description drifted between runs of the same deed:
+       one run stopped at the end of the description, another swept in
+       the homestead release and the derivation clause (891 vs 1353
+       chars). The schema now names what follows a description and is not
+       part of it — homestead release, execution/acknowledgment blocks,
+       recording stamp, and the derivation clause (already captured in
+       prior_deed_reference, and re-emitted by the .txt's third form from
+       the SELECTED deed's own citation). Two consecutive runs then
+       returned byte-identical text.
+
+  Also: the report's "Deed Property Address" fell back to printing None
+  when an instrument states no address; it now falls back to the indexed
+  address and says which source it came from.
+
+  Live-validated 2026-09-02: Suffolk Recorded (Vandermeer / 22 Cardiff St
+  Unit 1, Bk 59214/117, 5 pages, 64 s), Suffolk Registered (Hollister / 15
+  Larkspur Rd, Doc 812445 noted on Ctf 198332, 3 pages, ~55 s x3), and
+  Middlesex South (Draycott / 7 Ashcombe Rd Unit 1, Bk 70921/188, 3 pages,
+  54 s). Stamp verified and address verified on all three.
 
 v3.47 changes (Plymouth: legible source images + inline extraction — the
 assistant loop, not the registry, was the cost):
@@ -4946,6 +5021,12 @@ async def run_middlesex_south(
 
     street_token = (street_name or "").upper().strip()
 
+    # v3.48 (item 42) — per-stage timings, same as Suffolk and Plymouth.
+    # finish() is called from the `finally` below to cover this runner's
+    # early `return result` paths; it is idempotent and never raises.
+    _tm = _Timings()
+    _tm.mark("STEP 1 - grantee search")
+
     async with async_playwright() as p:
         browser = await _msouth_launch(p, headless, result)
         context = await browser.new_context(accept_downloads=True)
@@ -5053,6 +5134,7 @@ async def run_middlesex_south(
                 f"{row['recorded_date']} | Name: {row['name']} | Street: {row['street']}"
             )
 
+            _tm.mark("STEP 2 - detail panel")
             # -----------------------------------------------------------
             # STEP 2 — DETAIL PANEL (Doc #, pages, consideration, parties)
             # -----------------------------------------------------------
@@ -5091,6 +5173,7 @@ async def run_middlesex_south(
                     "to the results row."
                 )
 
+            _tm.mark("STEP 3 - page images")
             # -----------------------------------------------------------
             # STEP 3 — VIEW IMAGES → ImageViewerEx.aspx → hi-res download
             # -----------------------------------------------------------
@@ -5141,6 +5224,7 @@ async def run_middlesex_south(
                 else:
                     result["errors"].append(f"Page {page_num} download failed.")
 
+            _tm.mark("STEP 4 - grantor check")
             # -----------------------------------------------------------
             # STEP 4 — GRANTOR CHECK (seller + all deed grantees)
             #
@@ -5258,6 +5342,7 @@ async def run_middlesex_south(
             await browser.close()
             return result
         finally:
+            _tm.finish(result)
             try:
                 await page.close()
             except Exception:
@@ -6226,6 +6311,16 @@ async def run_suffolk(
 
     street_token = (street_name or "").upper().strip()
 
+    # v3.48 (item 42) — per-stage timings, as Plymouth got at v3.47 and the
+    # ALIS flow has had since v3.31. Without them --no-timings/show_timings
+    # was a setting that silently did nothing on this registry, and
+    # _timings_add_stage no-opped, so the inline-extraction stage went
+    # unmeasured too. finish() is called from the `finally` below because
+    # this runner has several early `return result` paths; it is idempotent
+    # and swallows its own errors.
+    _tm = _Timings()
+    _tm.mark("STEP 1 - grantee search")
+
     async with async_playwright() as p:
         browser = await _msouth_launch(p, headless, result)
         context = await browser.new_context(accept_downloads=True)
@@ -6341,6 +6436,7 @@ async def run_suffolk(
                     f"{' or '.join(o for o in offices if o not in failed_offices)}"
                     " — continuing to the address search.")
 
+            _tm.mark("STEP 2 - non-conveyance filter")
             # -----------------------------------------------------------
             # STEP 2 — NON-CONVEYANCE FILTER
             # -----------------------------------------------------------
@@ -6367,6 +6463,7 @@ async def run_suffolk(
                         "exists, and add any real conveyance type to the script "
                         "vocabulary.")
 
+            _tm.mark("STEP 3 - select deed row")
             # -----------------------------------------------------------
             # STEP 3 — STREET-AWARE SELECTION ACROSS BOTH OFFICES
             # -----------------------------------------------------------
@@ -6546,6 +6643,7 @@ async def run_suffolk(
                     "may not be the most recent. Narrow the search before "
                     "relying on this result.")
 
+            _tm.mark("STEP 4 - detail panel")
             # -----------------------------------------------------------
             # STEP 4 — DETAIL PANEL
             #
@@ -6666,6 +6764,7 @@ async def run_suffolk(
                         "Detail panel did not open — party/doc#/consideration "
                         "data limited to the results row.")
 
+            _tm.mark("STEP 5 - page images")
             # -----------------------------------------------------------
             # STEP 5 — VIEW IMAGES → hi-res download of every page
             # -----------------------------------------------------------
@@ -6724,6 +6823,7 @@ async def run_suffolk(
                         result["errors"].append(
                             f"Page {page_num} download failed.")
 
+            _tm.mark("STEP 6 - grantor check")
             # -----------------------------------------------------------
             # STEP 6 — GRANTOR CHECK (seller + all deed grantees, both offices)
             #
@@ -6861,6 +6961,7 @@ async def run_suffolk(
             await browser.close()
             return result
         finally:
+            _tm.finish(result)
             try:
                 await page.close()
             except Exception:
@@ -9297,7 +9398,17 @@ _DEED_SCHEMA = {
                 "Preserve the instrument's line breaks as newline "
                 "characters and its paragraph breaks as blank lines, so "
                 "the text can be checked line-for-line against the page "
-                "images. Null only if no legal description appears."
+                "images. "
+                "STOP AT THE END OF THE DESCRIPTION. Do NOT include: the "
+                "homestead release or declaration; the execution, signature, "
+                "witness, notary or acknowledgment blocks; the recording or "
+                "excise stamp; or the derivation clause ('Meaning and "
+                "intending to convey the same premises conveyed to the "
+                "grantor by deed recorded at ...'), which is captured "
+                "separately in prior_deed_reference. Those follow the "
+                "description rather than forming part of it, and including "
+                "them makes the output vary between runs of the same deed. "
+                "Null only if no legal description appears."
             ),
         },
         "property_address": {
@@ -9320,9 +9431,17 @@ _DEED_SCHEMA = {
         "certificate_of_title": {
             "type": ["string", "null"],
             "description": (
-                "Land Court (Registered Land) only: the Certificate of "
-                "Title number ('Certificate of Title No. NNNNN' or 'Ctf#'). "
-                "Null for Recorded Land instruments."
+                "Land Court (Registered Land) only: the certificate this "
+                "instrument is NOTED ON — the number on the cover sheet's "
+                "'Noted on Certificate' line (or a registrar's notation to "
+                "the same effect). This is NOT the same as a certificate "
+                "recited in the body or in the property description: that "
+                "one is the certificate the land is DESCRIBED on, i.e. the "
+                "one being conveyed OUT of, and reporting it here would "
+                "cite the wrong certificate. If the instrument recites a "
+                "certificate but has no 'Noted on Certificate' line, return "
+                "null rather than the recited number. Null for Recorded "
+                "Land instruments."
             ),
         },
         "consideration": {
@@ -9346,10 +9465,17 @@ _DEED_SCHEMA = {
         "recording_stamp": {
             "type": ["string", "null"],
             "description": (
-                "The book and page from the recording stamp in the margin "
-                "or header (e.g. 'Bk 34918 Pg 103'), used to sanity-check "
-                "that the right instrument was downloaded. Null if none "
-                "visible."
+                "The recording identifiers stamped on the instrument, used "
+                "to sanity-check that the right document was downloaded. "
+                "RECORDED LAND: the book and page from the margin stamp, "
+                "header, or cover sheet (e.g. 'Bk 34918 Pg 103'). "
+                "REGISTERED LAND (Land Court) HAS NO BOOK AND PAGE — report "
+                "the Document Number and the 'Noted on Certificate' number "
+                "instead (e.g. 'Doc 812445, Noted on Certificate 198332'), "
+                "plus the 'Land Court Book and Page' registration reference "
+                "if one is printed. Never report a Land Court registration "
+                "book/page as though it were a Recorded Land book and page. "
+                "Null if none visible."
             ),
         },
         "grantors_full": {
@@ -9819,17 +9945,62 @@ def _run_pdf_extraction(result: dict, land_court: bool) -> None:
                 _mark_extraction_unavailable(result, e)
 
 
-def _stamp_matches_selection(stamp: str, book, page) -> bool:
+def _stamp_matches_selection(stamp: str, book, page, *,
+                             land_court: bool = False,
+                             document_number=None,
+                             certificate=None,
+                             lc_book_page=None) -> str:
     """
-    v3.47 — does the recording stamp read off the page images name the
-    SELECTED book and page? Token match, so 'Bk: 12345 Pg: 678' and
-    'Book 12345, Page 678' both pass; a stamp naming a different book or
-    page means the viewer served another instrument than the row clicked.
+    v3.47, extended v3.48 (item 42) — does the recording stamp read off the
+    page images name the SELECTED instrument? Returns "match" | "mismatch" |
+    "unknown". Token match, so 'Bk: 12345 Pg: 678' and 'Book 12345, Page
+    678' both pass; a stamp naming a different instrument means the viewer
+    served something other than the row that was clicked.
+
+    REGISTERED LAND HAS NO BOOK AND PAGE. The v3.47 check returned False
+    whenever either was falsy, so porting it to Suffolk unchanged would have
+    fired "the viewer may have served a different instrument" on every
+    CORRECT Land Court run — and Suffolk is the one registry that routinely
+    lands in Land Court, which is the whole reason --office exists. A
+    warning that cries wolf on every run is worse than no warning. A Land
+    Court instrument is keyed instead on its Document Number (the Suffolk
+    cover sheet prints it twice: "Document Number : 812445" and "Doc#
+    00812445"), corroborated by "Noted on Certificate" and by the "Land
+    Court Book and Page" registration reference. Any one of those matching
+    is a match; a stamp naming none of them is a mismatch.
+
+    "unknown" is NOT a mismatch — it means the check could not run (no
+    stamp, a stamp with no digits, or nothing to check it against, as on an
+    older paper filing with no cover sheet). A check that cannot run must
+    say so rather than warn.
     """
-    if not (stamp and book and page):
-        return False
-    toks = [t.lstrip("0") or "0" for t in re.findall(r"\d+", str(stamp))]
-    return (str(book).lstrip("0") in toks) and (str(page).lstrip("0") in toks)
+    toks = {t.lstrip("0") or "0" for t in re.findall(r"\d+", str(stamp or ""))}
+    if not toks:
+        return "unknown"
+
+    def _n(v):
+        digits = re.sub(r"\D", "", str(v or ""))
+        return (digits.lstrip("0") or "0") if digits else None
+
+    if land_court:
+        checks = []
+        for ident in (document_number, certificate):
+            n = _n(ident)
+            if n:
+                checks.append(n in toks)
+        # The registration book/page is a PAIR — both halves must appear,
+        # or "148" alone would match almost any stamp by accident.
+        pair = [t.lstrip("0") or "0"
+                for t in re.findall(r"\d+", str(lc_book_page or ""))]
+        if len(pair) == 2:
+            checks.append(all(p in toks for p in pair))
+        if not checks:
+            return "unknown"
+        return "match" if any(checks) else "mismatch"
+
+    if not (book and page):
+        return "unknown"
+    return "match" if (_n(book) in toks and _n(page) in toks) else "mismatch"
 
 
 def _timings_add_stage(result: dict, label: str, seconds: float) -> None:
@@ -9854,7 +10025,8 @@ def _timings_add_stage(result: dict, label: str, seconds: float) -> None:
 def _run_image_extraction(result: dict, *, extract_pdf: bool,
                           extraction_mode: str, mode_note,
                           street_number: str, street_name: str,
-                          land_court: bool = False) -> None:
+                          land_court: bool = False,
+                          stage_label: str = "STEP 6 - inline extraction") -> None:
     """
     v3.47 (47b) — inline extraction for a browser registry whose deed pages
     arrive as IMAGES. Same _run_pdf_extraction, same --extraction gating,
@@ -9885,29 +10057,58 @@ def _run_image_extraction(result: dict, *, extract_pdf: bool,
             )
             return
 
+        # v3.48 (item 42) — snapshot the certificate BEFORE extraction can
+        # fill it, so a panel-sourced number (authoritative) stays
+        # distinguishable from one read off the instrument.
+        _panel_cert = result.get("certificate_of_title") if land_court else None
+
         t0 = time.perf_counter()
         _run_pdf_extraction(result, land_court=land_court)
-        _timings_add_stage(result, "STEP 6 - inline extraction",
-                           time.perf_counter() - t0)
+        _timings_add_stage(result, stage_label, time.perf_counter() - t0)
         if not result.get("legal_description"):
             return
 
         stamp = result.get("recording_stamp")
-        if stamp:
-            if _stamp_matches_selection(stamp, result.get("book"), result.get("page")):
-                result["notes"].append(
-                    f"Recording stamp verified: '{stamp}' names the selected "
-                    f"Bk {result.get('book')}/Pg {result.get('page')}."
-                )
-            else:
-                result["notes"].append(
-                    f"WARNING: the recording stamp read off the page images "
-                    f"('{stamp}') does NOT name the selected Bk "
-                    f"{result.get('book')}/Pg {result.get('page')} — the "
-                    "viewer may have served a different instrument. Verify "
-                    "the page images against the index row before using "
-                    "this legal description."
-                )
+        if land_court:
+            _reconcile_lc_certificate(result, stamp, _panel_cert)
+        # v3.48 (item 42) — cite the selection the way the section cites it.
+        # Registered Land has no Bk/Pg, so a Land Court run names Document
+        # No. + Certificate instead (the same citation the report uses).
+        if land_court:
+            cite = "Document No. " + str(result.get("document_number") or "___")
+            if result.get("certificate_of_title"):
+                cite += (", noted on Certificate of Title No. "
+                         + str(result["certificate_of_title"]))
+        else:
+            cite = f"Bk {result.get('book')}/Pg {result.get('page')}"
+        verdict = _stamp_matches_selection(
+            stamp, result.get("book"), result.get("page"),
+            land_court=land_court,
+            document_number=result.get("document_number"),
+            certificate=result.get("certificate_of_title"),
+            lc_book_page=result.get("land_court_registration_book_page"),
+        )
+        if verdict == "match":
+            result["notes"].append(
+                f"Recording stamp verified: '{stamp}' names the selected "
+                f"{cite}."
+            )
+        elif verdict == "mismatch":
+            result["notes"].append(
+                f"WARNING: the recording stamp read off the page images "
+                f"('{stamp}') does NOT name the selected {cite} — the "
+                "viewer may have served a different instrument. Verify "
+                "the page images against the index row before using "
+                "this legal description."
+            )
+        elif stamp:
+            result["notes"].append(
+                f"NOTE: a recording stamp was read off the page images "
+                f"('{stamp}') but it could NOT be checked against the "
+                f"selected {cite} — no identifier was available on both "
+                "sides. This is an unchecked box, not a clean check: "
+                "confirm the page images against the index row yourself."
+            )
         addr = result.get("deed_property_address_pdf")
         if addr and street_number and street_name:
             if _alis_address_matches(street_number, street_name, addr):
@@ -9933,6 +10134,129 @@ def _run_image_extraction(result: dict, *, extract_pdf: bool,
     except Exception as e:
         result.setdefault("notes", []).append(
             f"Inline image extraction failed (non-fatal): {e}")
+
+
+def _stamp_noted_certificate(stamp: str):
+    """
+    v3.48 (item 42) — the certificate named on a Land Court cover sheet's
+    "Noted on Certificate" line, pulled back out of the extracted stamp
+    string. That line is the authority for which certificate a deed is
+    noted on; a certificate recited in the body is the one the land is
+    DESCRIBED on (conveyed out of) and is a different number.
+    """
+    mt = re.search(r"noted\s+on\s+(?:certificate|ctf)[^0-9]{0,20}(\d+)",
+                   str(stamp or ""), re.I)
+    return mt.group(1) if mt else None
+
+
+def _reconcile_lc_certificate(result: dict, stamp: str, panel_cert) -> None:
+    """
+    v3.48 (item 42) — keep the Land Court certificate honest now that
+    inline extraction can fill it.
+
+    Precedence is the settled rule: the detail panel's Certificate /
+    Encumbrance reference, which equals the cover sheet's "Noted on
+    Certificate" line. Extraction reads the same cover sheet, so it is a
+    fine SECOND source — but it can also return a certificate recited in
+    the deed body, which is the certificate the land is described on, not
+    this deed's. Before item 42 a failed panel read left the field null and
+    the run said "Certificate of Title No. ___"; letting extraction quietly
+    put a plausible wrong number there would replace visible missing
+    information with invisible bad information, which is the mistake this
+    codebase keeps having to unlearn.
+
+    Live origin: Hollister / 15 Larkspur Rd, 2026-09-02 — the panel returned
+    no certificate reference, extraction filled 77105 from the instrument,
+    and the cover sheet reads "Noted on Certificate : 198332".
+    """
+    noted = _stamp_noted_certificate(stamp)
+    cur = result.get("certificate_of_title")
+
+    def _d(v):
+        s = re.sub(r"\D", "", str(v or ""))
+        return s.lstrip("0") or None if s else None
+
+    if panel_cert:
+        # Panel spoke; it wins. A disagreeing cover sheet is still news.
+        if noted and _d(noted) != _d(panel_cert):
+            result["notes"].append(
+                f"WARNING: certificate disagreement — the detail panel's "
+                f"Certificate/Encumbrance reference is {panel_cert}, but the "
+                f"cover sheet's 'Noted on Certificate' line reads {noted}. "
+                "Both name this deed's certificate and they should match. "
+                "Confirm on the page images before citing either."
+            )
+        return
+
+    if noted:
+        if cur and _d(cur) != _d(noted):
+            result["notes"].append(
+                f"Certificate corrected to {noted}: the extraction returned "
+                f"{cur}, but that number is recited in the instrument rather "
+                f"than on the cover sheet's 'Noted on Certificate' line — a "
+                "recited certificate is the one the land is DESCRIBED on "
+                "(conveyed out of), not the one this deed is noted on. "
+                f"Citing {noted}; confirm on the page images."
+            )
+        else:
+            result["notes"].append(
+                f"Certificate of Title {noted} read off the cover sheet's "
+                "'Noted on Certificate' line (the detail panel returned no "
+                "Certificate/Encumbrance reference on this run)."
+            )
+        result["certificate_of_title"] = noted
+        return
+
+    if cur:
+        result["notes"].append(
+            f"WARNING: Certificate of Title {cur} came from the deed text "
+            "alone — the detail panel returned no Certificate/Encumbrance "
+            "reference and no 'Noted on Certificate' line was read off the "
+            "cover sheet. A certificate recited in an instrument is usually "
+            "the one the land is DESCRIBED on, NOT the one this deed is "
+            "noted on. Do NOT cite it until it is confirmed on the images."
+        )
+
+
+def _finish_image_registry(result: dict, args, output_folder: Path, *,
+                           street_number: str, street_name: str,
+                           extract_pdf: bool, extraction_mode: str,
+                           mode_note,
+                           stage_label: str = "STEP 6 - inline extraction") -> None:
+    """
+    v3.48 (item 42) — the common tail for a browser registry whose deed
+    pages arrive as IMAGES: inline extraction, then the Step 6 report
+    draft. Plymouth got both at v3.47; Suffolk and Middlesex South were the
+    last two registries without them, so on both the assistant had to Read
+    the page images, retype the legal description into a temp file and
+    re-invoke with --deliver-text-file. The argument for closing that is
+    TRANSCRIPTION FIDELITY, not speed: a hand transcription silently
+    "corrects" the record (the v3.47 case was a semicolon inside a date),
+    and the fix is to let the schema-constrained extraction do the typing.
+    With this in place no registry in the plugin depends on the assistant
+    retyping a legal description.
+
+    land_court is read off the RESULT, not passed in: Suffolk selects
+    across BOTH offices, so which section the deed came from is only known
+    once the run has finished. Getting it wrong would label a Registered
+    Land instrument "Recorded Land" in the extraction instruction and skip
+    the certificate_of_title fill.
+    """
+    _run_image_extraction(
+        result, extract_pdf=extract_pdf, extraction_mode=extraction_mode,
+        mode_note=mode_note, street_number=street_number,
+        street_name=street_name,
+        land_court=bool(result.get("land_court")),
+        stage_label=stage_label,
+    )
+    try:
+        _write_markdown_report(
+            result, args.base_name, f"{args.first} {args.last}".strip(),
+            output_folder, show_timings=args.timings,
+        )
+    except Exception as e:
+        result.setdefault("notes", []).append(
+            f"Report draft failed (non-fatal): {e}")
 
 
 def _alis_indexed_name_pair(indexed: str) -> tuple:
@@ -11110,7 +11434,24 @@ def _write_markdown_report(result: dict, base_name: str, seller_display: str,
             L.append(f"  - (held {result['tenancy']})")
     if result.get("prior_deed_reference"):
         L.append(f"- Prior Deed Reference: {result['prior_deed_reference']}")
-    L.append(f"- Deed Property Address: {result.get('deed_property_address_pdf')}")
+    # v3.48 (item 42) — the extracted address is the best source, but it can
+    # be null on an instrument that states no address (a metes-and-bounds
+    # deed, an old paper filing). Fall back to what the registry indexed
+    # rather than printing "None", and say which source it came from so the
+    # two are never confused — the abstract-vs-PDF disagreement check (v3.26)
+    # exists precisely because they can differ.
+    _addr_pdf = result.get("deed_property_address_pdf")
+    _addr_idx = (result.get("deed_property_address_abstract")
+                 or result.get("deed_property_address"))
+    if _addr_pdf:
+        L.append(f"- Deed Property Address: {_addr_pdf}")
+    elif _addr_idx:
+        L.append(f"- Deed Property Address: {_addr_idx} "
+                 "(from the registry index — the instrument itself states "
+                 "no address; confirm on the page images)")
+    else:
+        L.append("- Deed Property Address: NOT STATED on the instrument and "
+                 "not indexed — confirm the parcel on the page images")
     if result.get("recording_stamp"):
         L.append(f"- Recording Stamp (verification): {result['recording_stamp']}")
     L += ["", "---", "", "## Title Flags / Notes", ""]
@@ -11128,9 +11469,19 @@ def _write_markdown_report(result: dict, base_name: str, seller_display: str,
     gc = result.get("grantor_check") or {}
     deeds = gc.get("deeds") or []
     summary = gc.get("summary")
-    if deeds and summary:
+    if deeds and isinstance(summary, dict):
         # v3.23 — classification ran: lead with the short review set, then
         # the full tagged list (nothing is dropped).
+        #
+        # v3.48 (item 42) — isinstance, not truthiness. ALIS and Plymouth
+        # set summary to a dict of counts; run_suffolk sets it to the STRING
+        # "hits_found" / "no_hits" / "incomplete". A truthy string reached
+        # summary['total'] and raised TypeError, which the caller's
+        # try/except swallowed into "Report draft failed (non-fatal)" — so
+        # the first Suffolk run to reach the report writer would have got no
+        # report and only a soft note saying why. Suffolk falls into the
+        # unclassified `elif deeds:` branch below, which is correct: that
+        # registry has no parcel classification.
         flags.append(
             f"**GRANTOR CHECK — {summary['total']} instrument(s) found; "
             f"{summary['needs_review']} need review (subject parcel: "
@@ -14152,18 +14503,12 @@ def main() -> None:
         # v3.47 (47b) — inline extraction + report draft, exactly as the
         # ALIS flow does after its grantor check. Delivery (.txt/.docx/
         # clipboard) follows in _finish_run for every registry.
-        _run_image_extraction(
-            result, extract_pdf=extract_pdf, extraction_mode=extraction_mode,
-            mode_note=_mode_note, street_number=sn, street_name=st,
+        # v3.48 (item 42) — shared with Suffolk and Middlesex South.
+        _finish_image_registry(
+            result, args, output_folder, street_number=sn, street_name=st,
+            extract_pdf=extract_pdf, extraction_mode=extraction_mode,
+            mode_note=_mode_note,
         )
-        try:
-            _write_markdown_report(
-                result, args.base_name, f"{args.first} {args.last}".strip(),
-                output_folder, show_timings=args.timings,
-            )
-        except Exception as e:
-            result.setdefault("notes", []).append(
-                f"Report draft failed (non-fatal): {e}")
     elif args.registry == "barnstable":
         barnstable_town, barnstable_notes = _barnstable_resolve_town(args.town, args.base_name)
         result = _run_alis_registry(
@@ -14202,6 +14547,14 @@ def main() -> None:
                 args.headless, street_number=sn, street_name=st,
             )
         )
+        # v3.48 (item 42) — inline extraction + report draft on the page
+        # images this runner already saved at CNTHEIGHT=2000.
+        _finish_image_registry(
+            result, args, output_folder, street_number=sn, street_name=st,
+            extract_pdf=extract_pdf, extraction_mode=extraction_mode,
+            mode_note=_mode_note,
+            stage_label="STEP 5 - inline extraction",
+        )
     elif args.registry == "suffolk":
         # Suffolk is browser-only: masslandrecords sits behind Incapsula, which
         # answers a scripted request with a block page (verified 2026-08-18 —
@@ -14226,6 +14579,15 @@ def main() -> None:
                 force_address_search=args.force_address_search,
                 lien_sweep=args.lien_sweep,
             )
+        )
+        # v3.48 (item 42) — inline extraction + report draft. The stamp
+        # check inside reads land_court off the result, because Suffolk
+        # selects across both offices and either section can win.
+        _finish_image_registry(
+            result, args, output_folder, street_number=sn, street_name=st,
+            extract_pdf=extract_pdf, extraction_mode=extraction_mode,
+            mode_note=_mode_note,
+            stage_label="STEP 7 - inline extraction",
         )
     else:
         result = asyncio.run(run_stub(args.registry))
