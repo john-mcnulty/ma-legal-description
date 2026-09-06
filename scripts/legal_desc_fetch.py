@@ -1,7 +1,44 @@
 #!/usr/bin/env python3
 """
 legal_desc_fetch.py — fast-path for Legal Description Search Workflow
-Version: 3.48
+Version: 3.49
+
+v3.49 changes (item 44 — the ALIS type vocabulary could not see a UCC
+fixture filing, because the registry spells it "Finance Statement"):
+
+  _NON_CONVEYANCE_SUBSTR carried the exact literal "FINANCING", which does
+  not substring-match "FINANCE STATEMENT". ALIS (Barnstable Land Court)
+  indexes UCC fixture filings under the SHORTER spelling, so a live run
+  returned TWO of them — an initial filing and its own continuation, both
+  noted on the subject certificate — as `unknown`, and the v3.36 classifier
+  correctly refused to guess: two `WARNING: ... has UNRECOGNISED type
+  'Finance Statement' ... at the SUBJECT property` notes that had to be
+  resolved by reading the instruments.
+
+  This is the v3.29 BKCY-vs-BANKRUPTCY lesson exactly: the CONCEPT was in
+  the vocabulary, one of its SPELLINGS was not, and an exact literal cannot
+  see a spelling it was not given. Fixed by matching the prefix "FINANC",
+  which covers FINANCE / FINANCING / REFINANCE in one entry rather than
+  leaving a third spelling to be discovered by a third run. The terse
+  Avenu/20-20 side already had "UCC" and the "CONTN UC" compounds and is
+  unchanged.
+
+  The prefix is deliberately wide, so the regression guard matters: the
+  "DEED" allowlist is tested BEFORE the non-conveyance vocabulary, so
+  "DEED OF REFINANCE" still classifies as a conveyance. Pinned by a test.
+
+  WHAT THIS CHANGES IN WHAT YOU REPORT: a UCC fixture filing is an
+  ENCUMBRANCE, not a conveyance, so it no longer sits in the unknown tier
+  demanding a manual read on every run. It is still never dismissed — it
+  stays in `grantor_check.deeds` and, at the subject parcel, still emits
+  the encumbrance note. A solar-loan fixture filing is a real closing
+  action item (payoff / transfer / subordination and a UCC-3 termination);
+  the workflow reports it as found, and clearing it remains out of scope
+  per the standing discharge rule.
+
+  Live: the run that produced the two warnings was re-run after the fix —
+  same 17 grantor hits, nothing dropped or re-tiered, UNRECOGNISED count
+  2 -> 0, both rows now reported as encumbrances at the subject parcel.
 
 v3.48 changes (item 42 — Suffolk and Middlesex South get inline extraction,
 so NO registry now depends on the assistant retyping a legal description):
@@ -2174,7 +2211,19 @@ _NON_CONVEYANCE_SUBSTR = (
     "TAX TAKING", "TAKING", "TAX LIEN", "TAX TITLE",
     "MORTGAGE", "DISCHARGE", "ASSIGNMENT", "RELEASE", "ATTACHMENT",
     "EASEMENT", "LIEN", "NOTICE", "HOMESTEAD", "PLAN", "BANKRUPT",
-    "AFFIDAVIT", "CERTIFICATE", "SUBORDINAT", "TERMINAT", "FINANCING",
+    "AFFIDAVIT", "CERTIFICATE", "SUBORDINAT", "TERMINAT",
+    # UCC financing statements. Matched on the PREFIX, because the two
+    # registries spell the SAME instrument differently and the exact literal
+    # "FINANCING" silently missed one of them: ALIS (Barnstable Land Court)
+    # indexes the type as "Finance Statement", observed live 2026-09-06 when
+    # a solar-loan fixture filing AND its continuation both came back
+    # UNRECOGNISED at the subject parcel and had to be read by hand. The
+    # spelled-out form elsewhere is "FINANCING STATEMENT". "FINANC" covers
+    # FINANCE / FINANCING / REFINANCE alike. Same lesson as the v3.29
+    # BKCY-vs-BANKRUPTCY miss: pair a concept across EVERY vocabulary rather
+    # than trusting one spelling. The terse Avenu side already has "UCC" and
+    # the "CONTN UC" compounds in _NON_CONVEYANCE_CODES.
+    "FINANC",
     # v3.36 — the spelled-out counterparts of the Plymouth code table
     # (ALIS labels, and Plymouth's own 301xxx range). Every concept is
     # paired across BOTH vocabularies here, which is the v3.29
