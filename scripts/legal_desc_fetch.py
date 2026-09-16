@@ -1,7 +1,69 @@
 #!/usr/bin/env python3
 """
 legal_desc_fetch.py — fast-path for Legal Description Search Workflow
-Version: 3.49
+Version: 3.50
+
+v3.50 changes (Plymouth Book Search — two findings from reviewing a
+subdivision covenant and its lot releases by hand):
+
+  1. THE DETAIL-PANEL REFERENCES LIST WAS CUT OFF AT 10, SILENTLY. The
+     panel's References grid pages 10 rows at a time behind its own
+     ASP.NET pager ('DocDetails1$GridView_Document_Refs', 'Page$N'), and
+     _read_detail_panel took a fixed 400-character slice of the panel text
+     — page 1 only, shorter still when instrument names are long. Measured:
+     a covenant with 11 references lost its 11th (a lot release), and a
+     phased condominium's master deed showed 10 of its 19 amendments.
+     These feed detail_references / cross_references, i.e. the later
+     discharges and releases a reader chases, so a dropped row is lost
+     title signal with nothing saying so. New _avenu_read_references()
+     reads the grid rows, walks the pager (waiting on grid CONTENT, never
+     a selector), and compares the count to the panel's own
+     "References - N" caption. New JSON: detail_references_expected,
+     detail_references_complete; a short read is a WARNING note.
+
+     MIDDLESEX SOUTH AND SUFFOLK HAD THE SAME DEFECT — same Avenu grid,
+     same 400-character slice in _msouth_read_detail / _suffolk_read_detail.
+     Measured live: a Middlesex South master deed with References - 47 and
+     a Suffolk master deed with References - 683 each came back with 10.
+     All three runners now take the list from _read_detail_panel, which
+     they already call; the per-registry slices are gone. (Leaving them
+     would have been WORSE than before: they would now read the grid's
+     LAST page, after the shared reader had walked it.) Live: 47/47; and
+     683/683 unique with the page guard lifted — Suffolk serves the list in
+     a different order on every page LOAD but a stable one within a
+     session, so the walk neither skips nor repeats. With the guard in
+     place (_AVENU_REFS_MAX_PAGES = 50, i.e. 500 references) a list that
+     long stops and says INCOMPLETE; a vesting deed essentially never gets
+     there, a master deed can.
+
+  2. --book/--page AND --verify-grantor-hit NOW WORK ON PLYMOUTH. Both were
+     refused pre-flight (v3.35) because only the ALIS HTTP engine had them.
+     The registry's Recorded Land "Book Search" (Navigator LinkButton01) is
+     an exact, name-independent jump to one instrument — no prefix match,
+     no 1000-row cap applied before a sort, no pager — so:
+       * --book N --page P pins the vesting deed and skips the grantee name
+         search and its town/street retries. The pin is still CHECKED: the
+         seller must appear among the grantees, the index address/town must
+         agree, the conveyance guard and the image stamp/address checks
+         still run. JSON pinned_by_book_page. A Bk/Pg with no instrument is
+         deed_not_found (exit 2).
+       * --verify-grantor-hit BOOK/PAGE downloads every page of one grantor
+         hit (2000 px), reads its detail panel, extracts it with the deed
+         schema, checks its recording stamp, and classifies it against the
+         subject — the same grantor_hit_verification contract as ALIS.
+     Plymouth needs Book AND Page; a half-specified request is refused
+     before any search.
+     Mechanics learned live: a zero-hit Book Search shows "Search criteria
+     resulted in 0 hits." and no Book banner; on an OR (grantor) row the
+     Name cell is the grantor; sequential Book Searches in one session
+     intermittently time out and succeed in a fresh browser context (the
+     search is retried once in one).
+
+  Also fixed while testing: an entity seller (--first "") produced
+  "NAME " with a trailing space, so the grantor check searched the entity
+  twice; WHITMAN -> WHTMN added to _PLYMOUTH_TOWN_ABBREVS (a two-row name
+  search fired a needless town-mismatch retry); and the "Selected row"
+  note now labels grantor/grantee correctly on a grantor-side row.
 
 v3.49 changes (item 44 — the ALIS type vocabulary could not see a UCC
 fixture filing, because the registry spells it "Finance Statement"):
@@ -1860,6 +1922,8 @@ _PLYMOUTH_TOWN_ABBREVS: dict[str, str] = {
     "PLYMOUTH":      "PLMTH",  # confirmed 2026-05-14
     "KINGSTON":      "KGSTN",  # confirmed 2026-06-19 (Reyes/Beckwith run)
     "MARSHFIELD":    "MSHFD",  # confirmed 2026-07-08 (KDM Realty Corp run)
+    "WHITMAN":       "WHTMN",  # confirmed 2026-09-16 (a two-row name search
+                               # fired a needless town-mismatch retry)
 }
 
 
@@ -1990,6 +2054,154 @@ async def _plymouth_search(page: Page, combined_name: str, party_type: str,
     await page.fill("#SearchFormEx1_ACSTextBox_LastName1", combined_name)
     await page.click("#SearchFormEx1_btnSearch")
     return True
+
+
+# v3.50 — Recorded Land "Book Search" (Navigator LinkButton01).
+_PLYMOUTH_BOOK_SEARCH_LINK = "Navigator1$SearchCriteria1$LinkButton01"
+
+
+async def _plymouth_book_search(page: Page, book: str, pg: str,
+                                timeout_ms: int = 30000) -> list:
+    """
+    v3.50 — open one Recorded Land instrument by Book/Page and return its
+    result rows (one row per indexed party, OR and EE sides).
+
+    Book Search is exact and NAME-INDEPENDENT: no prefix matching, no
+    1000-row cap applied before a sort, no pager. That is what makes it the
+    right tool for a --book/--page pin and for --verify-grantor-hit.
+
+    Two traps are handled here rather than left to callers:
+      * the results area can still show the PREVIOUS search's grid, so the
+        rows are accepted only once the search banner names THIS book and
+        page, and only rows whose Book/Page cells match are returned;
+      * a zero-hit search leaves no new grid at all, which is returned as
+        [] — the caller must treat that as "no instrument at this Bk/Pg",
+        never as a clean result.
+
+    Page size is set to 100 in the rare case one Bk/Pg carries more than
+    20 party rows. Raises on navigation failure (callers retry once in a
+    fresh context — sequential Book Searches in one session were measured
+    timing out intermittently).
+    """
+    book = str(book).strip().lstrip("0") or "0"
+    pg = str(pg).strip().lstrip("0") or "0"
+    await page.goto(PLYMOUTH_SEARCH, wait_until="domcontentloaded", timeout=30000)
+    await page.wait_for_function("() => typeof __doPostBack === 'function'",
+                                 timeout=15000)
+    if not await page.is_visible("#SearchFormEx1_ACSTextBox_Book"):
+        await page.evaluate(
+            f"() => __doPostBack('{_PLYMOUTH_BOOK_SEARCH_LINK}', '')")
+        await page.wait_for_selector("#SearchFormEx1_ACSTextBox_Book",
+                                     state="visible", timeout=15000)
+    await page.fill("#SearchFormEx1_ACSTextBox_Book", book)
+    await page.fill("#SearchFormEx1_ACSTextBox_PageNumber", pg)
+    await page.click("#SearchFormEx1_btnSearch")
+
+    banner = re.compile(rf"Book:\s*{re.escape(book)}\s+Page Number:\s*{re.escape(pg)}\b")
+    waited = 0
+    while waited < timeout_ms:
+        await page.wait_for_timeout(500)
+        waited += 500
+        try:
+            body = await page.inner_text("body")
+        except Exception:
+            continue
+        # A zero-hit search shows this message and NO "Book: … Page Number:"
+        # banner (measured 2026-09-16); the page was freshly loaded above,
+        # so the message cannot be left over from an earlier search.
+        if re.search(r"resulted in 0 hits", body, re.I):
+            return []
+        if banner.search(body):
+            if re.search(r"(?<![0-9])0 rows\)", body) or not await page.query_selector(
+                    'a[href*="GridView_Document$ctl02$ButtonRow"]'):
+                # banner is for this search; give the grid a moment, then
+                # accept an empty result only if it stays empty
+                await page.wait_for_timeout(1500)
+                if not await page.query_selector(
+                        'a[href*="GridView_Document$ctl02$ButtonRow"]'):
+                    return []
+            break
+    else:
+        raise TimeoutError(f"Book Search for Bk {book}/Pg {pg} did not return "
+                           f"within {timeout_ms // 1000} s")
+
+    await _avenu_set_page_size_100(page)
+    rows = await _read_all_result_rows(page)
+    return [r for r in rows
+            if (r.get("book") or "").lstrip("0") == book
+            and (r.get("page") or "").lstrip("0") == pg]
+
+
+async def _plymouth_open_and_download_instrument(
+    context, book: str, pg: str, base_name: str, label: str,
+    output_folder: Path, notes: list, errors: list,
+) -> dict:
+    """
+    v3.50 — Book Search one instrument in a FRESH page, open its detail
+    panel, and download every page image at the 2000 px render. Used by
+    --verify-grantor-hit. Returns {"rows", "detail", "files", "ok"}.
+    One retry in a new page on a search timeout.
+    """
+    out = {"rows": [], "detail": None, "files": [], "ok": False}
+    for attempt in (1, 2):
+        # Attempt 2 runs in a NEW browser context: the intermittent Book
+        # Search timeouts were per-session and cleared with a fresh session.
+        ctx = context if attempt == 1 else await context.browser.new_context(
+            accept_downloads=True)
+        vpage = await ctx.new_page()
+        try:
+            rows = await _plymouth_book_search(vpage, book, pg)
+            out["rows"] = rows
+            if not rows:
+                notes.append(f"Book Search found NO instrument at Bk {book}/Pg {pg}.")
+                return out
+            live_ctl = rows[0]["ctl"]
+            if await _open_detail_panel(vpage, ctl=live_ctl, expected_book=book):
+                out["detail"] = await _read_detail_panel(vpage)
+            link = await vpage.query_selector('a[href*="TabController1$ImageViewertabitem"]')
+            if link:
+                await link.click()
+                await vpage.wait_for_timeout(1500)
+            await vpage.goto(PLYMOUTH_VIEWER, wait_until="domcontentloaded", timeout=30000)
+            await vpage.wait_for_selector("#ImageViewer1_docImage", timeout=20000)
+            await vpage.wait_for_timeout(1500)
+            total = await _parse_page_count(vpage)
+            for n in range(1, total + 1):
+                if n > 1:
+                    before = await vpage.evaluate(
+                        "() => document.querySelector('#ImageViewer1_docImage').src")
+                    await vpage.click("#ImageViewer1_BtnNext")
+                    for _ in range(40):
+                        await vpage.wait_for_timeout(250)
+                        now = await vpage.evaluate(
+                            "() => document.querySelector('#ImageViewer1_docImage').src")
+                        if now != before:
+                            break
+                    await vpage.wait_for_timeout(700)
+                path = output_folder / f"{base_name} - {label}_p{n}.jpg"
+                method = await _download_viewer_image(vpage, path)
+                if method == "failed":
+                    errors.append(f"{label}: page {n} download failed.")
+                else:
+                    out["files"].append(str(path))
+                    notes.append(f"{label}: page {n} saved ({method}): {path.name}")
+            out["ok"] = bool(out["files"]) and len(out["files"]) == total
+            return out
+        except Exception as e:
+            if attempt == 2:
+                errors.append(f"{label}: Bk {book}/Pg {pg} could not be opened "
+                              f"({type(e).__name__}: {e}).")
+                return out
+            notes.append(f"{label}: first attempt failed ({type(e).__name__}); "
+                         "retrying in a fresh page.")
+        finally:
+            try:
+                await vpage.close()
+                if ctx is not context:
+                    await ctx.close()
+            except Exception:
+                pass
+    return out
 
 
 async def _plymouth_compound_surname_retry(
@@ -2536,6 +2748,9 @@ async def _read_all_result_rows(page: Page, cols: dict = None,
     pass anchor='Type Desc'.
     """
     _COLS = cols or {
+        # v3.50 — "party" (OR / EE) tells a Book Search's grantor rows from
+        # its grantee rows; unused (and harmless) elsewhere.
+        "party": "Party",
         "book": "Book", "page": "Page", "doc_number": "Doc",
         "deed_type": "Type", "recorded_date": "Rec Date",
         "street": "Street", "town": "Town",
@@ -3079,27 +3294,143 @@ async def _read_detail_panel(page: Page) -> dict:
             m = re.search(r"Consideration.*?([\d,]+\.\d{2})", panel_text, re.IGNORECASE | re.DOTALL)
         if m:
             consideration = m.group(1)
-        # v3.24 — the panel's References cross-ref list (e.g. "References - 2:
-        # 29868/325 DECLARATION OF HOMESTEAD 2005"), naming later homesteads,
-        # discharges, death certificates and related deeds against this
-        # instrument. Same title signal as the Middlesex South detail-panel
-        # References (v3.8) and the ALIS abstract's Ref By: list (v3.22);
-        # Plymouth was the one registry where the panel was read but this
-        # section dropped. Same slice parse as _msouth_read_detail_header.
-        ref_idx = panel_text.find("References")
-        if ref_idx >= 0:
-            references = [s.strip() for s in
-                          panel_text[ref_idx:ref_idx + 400].splitlines()
-                          if s.strip()]
     except Exception:
         pass
+
+    # v3.24 — the panel's References cross-ref list, naming later
+    # homesteads, discharges, death certificates and related deeds against
+    # this instrument. v3.50 — read the GRID, every pager page of it (see
+    # _avenu_read_references); the v3.24 400-character text slice saw
+    # page 1 only.
+    refs = await _avenu_read_references(page)
 
     return {
         "grantors": grantors,
         "grantees": grantees,
         "consideration": consideration,
-        "references": references,
+        "references": refs["references"],
+        "references_expected": refs["expected"],
+        "references_complete": refs["complete"],
+        "references_note": refs["note"],
     }
+
+
+# v3.50 — the detail panel's References grid and its pager. Same markup on
+# every Avenu/20-20 site the plugin drives (Plymouth, Middlesex South,
+# Suffolk — measured live 2026-09-16), and read once, by _read_detail_panel,
+# which all three runners call.
+_AVENU_REFS_GRID = '[id$="GridView_Document_Refs"]'
+_AVENU_REFS_MAX_PAGES = 50   # 500 references; a guard, not a cap to reach
+
+_AVENU_REFS_JS = """() => {
+    const g = document.querySelector('[id$="GridView_Document_Refs"]');
+    if (!g) return null;
+    const rows = [];
+    for (const tr of g.querySelectorAll('tr')) {
+        // Data rows carry a ButtonRow link; the header and pager rows do not.
+        if (!tr.querySelector('a[href*="ButtonRow"]')) continue;
+        rows.push([...tr.children].map(td => td.innerText.trim())
+                                  .filter(s => s).join(' '));
+    }
+    const pages = [...g.querySelectorAll('a[href*="Page$"]')]
+        .map(a => (a.getAttribute('href').match(/Page\\$(\\d+)/) || [])[1])
+        .filter(Boolean).map(Number);
+    return {rows, pages};
+}"""
+
+
+async def _avenu_read_references(page: Page) -> dict:
+    """
+    v3.50 — read EVERY row of the detail panel's References grid.
+
+    The grid shows 10 rows per page behind its own ASP.NET pager
+    (__doPostBack('DocDetails1$GridView_Document_Refs','Page$N')), and the
+    v3.24 reader took a fixed 400-character slice of the panel text — page
+    1 only, and shorter still when the instrument names are long
+    ("DECLARATION OF HOMESTEAD"). An instrument with 11+ references lost
+    the rest SILENTLY: a subdivision covenant's 11th reference was the
+    unconditional release of a lot, and a phased condominium's master deed
+    showed 10 of its 19 amendments.
+
+    Walks the pager by requesting Page$(k+1) until it is absent (the
+    "..." link after a 10-page window carries that same argument), waits
+    on grid CONTENT rather than a selector (the old grid stays in the DOM
+    until the UpdatePanel re-render lands), and checks the total against
+    the panel's own "References - N" caption. A short read is reported,
+    never passed off as the whole list.
+
+    Returns {"references": [str], "expected": int|None,
+             "complete": bool|None, "note": str|None}. Never raises.
+    """
+    out = {"references": [], "expected": None, "complete": None, "note": None}
+    try:
+        panel_text = await page.inner_text('[id*="DocDetails"]')
+        mc = re.search(r"References\s*-\s*(\d+)", panel_text)
+        if mc:
+            out["expected"] = int(mc.group(1))
+        snap = await page.evaluate(_AVENU_REFS_JS)
+        if snap is None:
+            if out["expected"]:
+                out["complete"] = False
+                out["note"] = (
+                    f"WARNING: the detail panel says References - "
+                    f"{out['expected']} but the References grid could not be "
+                    "read — the cross-reference list is MISSING, not empty.")
+            else:
+                out["complete"] = True if mc is None or out["expected"] == 0 else None
+            return out
+
+        seen = list(snap["rows"])
+        current = 1
+        stopped = ""
+        while current < _AVENU_REFS_MAX_PAGES:
+            if (current + 1) not in snap["pages"]:
+                break
+            before = snap["rows"]
+            await page.evaluate(
+                "(n) => __doPostBack('DocDetails1$GridView_Document_Refs',"
+                " 'Page$' + n)", current + 1)
+            changed = False
+            for _ in range(60):          # up to ~15 s
+                await page.wait_for_timeout(250)
+                nxt = await page.evaluate(_AVENU_REFS_JS)
+                if nxt and nxt["rows"] and nxt["rows"] != before:
+                    # settle: take two identical reads (same rule as the grid)
+                    await page.wait_for_timeout(300)
+                    again = await page.evaluate(_AVENU_REFS_JS)
+                    snap = again if again and again["rows"] == nxt["rows"] else nxt
+                    changed = True
+                    break
+            if not changed:
+                stopped = (f"page {current + 1} did not load")
+                break
+            seen += snap["rows"]
+            current += 1
+        else:
+            stopped = f"stopped at the {_AVENU_REFS_MAX_PAGES}-page guard"
+
+        out["references"] = seen
+        if out["expected"] is not None:
+            out["complete"] = len(seen) >= out["expected"] and not stopped
+            if not out["complete"]:
+                out["note"] = (
+                    f"WARNING: the detail panel says References - "
+                    f"{out['expected']} but only {len(seen)} were read"
+                    + (f" ({stopped})" if stopped else "")
+                    + ". The cross-reference list is INCOMPLETE — do not "
+                    "read a missing reference as the absence of one.")
+        else:
+            out["complete"] = not stopped
+        if current > 1 and out["complete"]:
+            out["note"] = (f"References: read all {len(seen)} across "
+                           f"{current} pager page(s).")
+    except Exception as e:
+        out["complete"] = False
+        out["note"] = (f"WARNING: reading the References grid failed "
+                       f"({type(e).__name__}: {e}) — "
+                       f"{len(out['references'])} read; the list may be "
+                       "INCOMPLETE.")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -3347,6 +3678,7 @@ async def _grantor_check_search(
             continue
         rows.append({
             "book":          r["book"],
+            "page":          r.get("page", ""),   # v3.50 — for --verify-grantor-hit
             "doc_number":    r["doc_number"],
             "deed_type":     r["deed_type"],
             "recorded_date": r["recorded_date"],
@@ -3860,6 +4192,9 @@ async def run_plymouth(
     street_name: str = "",
     force_address_search: bool = False,
     lien_sweep: bool = False,
+    target_book: str = "",
+    target_page: str = "",
+    verify_grantor_hit: str = "",
 ) -> dict:
     """
     Plymouth County Registry of Deeds — full workflow:
@@ -3901,9 +4236,13 @@ async def run_plymouth(
         "found_via_compound_surname": False,
         "selected_row_is_not_a_deed": False,
         "results_truncated_at_cap": False,
+        # v3.50 — set when --book/--page pinned the instrument via Book Search.
+        "pinned_by_book_page": False,
+        "grantor_hit_verification": None,
         "notes": [],
         "errors": [],
     }
+    pinned = bool(target_book)
 
     # v3.47 (47c) — per-stage timings, as the ALIS flow has had since v3.31.
     _tm = _Timings()
@@ -3911,7 +4250,11 @@ async def run_plymouth(
 
     # Plymouth name format: "LAST FIRST" (no comma, no spaces in compound first names)
     first_normalized = seller_first.upper().replace(" ", "")
-    combined_name = f"{seller_last.upper()} {first_normalized}"
+    # v3.50 — .strip(): an entity seller passes --first "", which left a
+    # trailing space, so the grantor check searched the entity TWICE
+    # ("NAME " as the named seller and "NAME" off the detail panel). The
+    # stripped string prefix-matches everything the spaced one did.
+    combined_name = f"{seller_last.upper()} {first_normalized}".strip()
     # First token of the seller's first name, used to filter surname-only retry
     # results (e.g. "ALAN" matched against grantee "WHITFIELD-BARROW ALAN D").
     first_token = (seller_first.upper().split() or [""])[0]
@@ -3928,7 +4271,56 @@ async def run_plymouth(
             found_via_address = False
             first_name_filter = ""  # set when the compound-surname retry fires
 
-            if force_address_search:
+            if pinned:
+                # v3.50 — --book/--page: open the named instrument by Book
+                # Search. Exact and name-independent, so every name-search
+                # trap (prefix match, misindexed name, the 1000-row cap
+                # applied before the sort, same-town multi-parcel sellers)
+                # is out of the path. The pin is reported, and the seller
+                # and address are still CHECKED against it below — a pin is
+                # an instruction about which instrument, not a guarantee it
+                # is the right one.
+                if not target_page:
+                    result["errors"].append(
+                        "--book on Plymouth needs --page too (Recorded Land "
+                        "is addressed by Book AND Page).")
+                    await browser.close()
+                    return result
+                pin_rows = []
+                for attempt in (1, 2):
+                    try:
+                        pin_rows = await _plymouth_book_search(
+                            page, target_book, target_page)
+                        break
+                    except Exception as e:
+                        if attempt == 2:
+                            raise
+                        result["notes"].append(
+                            f"Book Search attempt 1 failed ({type(e).__name__}) "
+                            "— retrying in a fresh browser context.")
+                        await page.close()
+                        context = await browser.new_context(accept_downloads=True)
+                        page = await context.new_page()
+                if not pin_rows:
+                    result["status"] = "deed_not_found"
+                    result["notes"].append(
+                        f"--book {target_book} --page {target_page}: Book Search "
+                        "found NO Recorded Land instrument at that Book/Page. "
+                        "Check the citation (and whether the parcel is "
+                        "Registered Land, which has no Book/Page).")
+                    await browser.close()
+                    return result
+                result["pinned_by_book_page"] = True
+                result["notes"].append(
+                    f"PINNED (v3.50): --book {target_book} --page {target_page} "
+                    f"opened by Book Search — {len(pin_rows)} party row(s): "
+                    + " | ".join(f"{r.get('party') or '?'} {r['name']} "
+                                 f"{r['deed_type']} Doc#{r['doc_number']}"
+                                 for r in pin_rows)
+                    + ". The grantee name search and its wrong-parcel "
+                    "retries were NOT run; the seller-name, conveyance-type "
+                    "and address checks below still apply.")
+            elif force_address_search:
                 if not street_number or not street_name:
                     result["status"] = "error"
                     result["errors"].append(
@@ -3952,7 +4344,7 @@ async def run_plymouth(
             else:
                 await _plymouth_search(page, combined_name, "I")
 
-            if not force_address_search and not await _has_results(page):
+            if not pinned and not force_address_search and not await _has_results(page):
                 body = await page.inner_text("body")
                 result["notes"].append(
                     f"No results for '{combined_name}' as Grantee. "
@@ -4020,6 +4412,9 @@ async def run_plymouth(
             # page, so a row selected from an earlier page must have its page
             # brought back before its Book link can be clicked.
             async def _replay_search():
+                if pinned:
+                    await _plymouth_book_search(page, target_book, target_page)
+                    return
                 if found_via_address:
                     await _plymouth_address_search(page, street_number, street_name)
                 elif result["found_via_compound_surname"]:
@@ -4050,7 +4445,9 @@ async def run_plymouth(
             all_rows = await _read_all_result_rows_paginated(
                 page, notes=result["notes"], flags=result
             )
-            search_label = "Address search" if found_via_address else "Grantee search"
+            search_label = ("Book Search (pinned)" if pinned
+                            else "Address search" if found_via_address
+                            else "Grantee search")
             result["notes"].append(
                 f"{search_label} returned {len(all_rows)} row(s). "
                 + " | ".join(
@@ -4108,7 +4505,7 @@ async def run_plymouth(
             # out so _select_best_row() picks the actual vesting deed, not whatever
             # was most recently recorded.  Falls back to the unfiltered set if no
             # conveyance-type rows survive (prevents silent exit-2 on unusual indexes).
-            if not found_via_address and all_rows:
+            if not found_via_address and not pinned and all_rows:
                 # v3.4 — use the shared classifier so tax-title redemptions ("CR"),
                 # tax takings, municipal lien certificates, easements, etc. are never
                 # treated as a vesting deed (the 2026-06-23 run reported a redemption).
@@ -4140,7 +4537,25 @@ async def run_plymouth(
                 )
                 sorted_desc = True  # Python sort guarantees descending order
 
-            if found_via_address:
+            if pinned:
+                # v3.50 — every row is the pinned instrument (one per indexed
+                # party); only rows at this Bk/Pg survived the Book Search.
+                # If more than one DOCUMENT shares the Bk/Pg, prefer a
+                # conveyance and say so. The grantee (EE) row is preferred
+                # because its Name cell is the grantee.
+                docs = {r.get("doc_number") for r in all_rows}
+                if len(docs) > 1:
+                    result["notes"].append(
+                        f"WARNING: {len(docs)} different documents are indexed at "
+                        f"Bk {target_book}/Pg {target_page} (Doc# "
+                        f"{', '.join(sorted(d or '?' for d in docs))}) — a "
+                        "conveyance is preferred; confirm on the page images.")
+                conv = [r for r in all_rows
+                        if not _is_non_conveyance_instrument(r.get("deed_type", ""))]
+                pool = conv or all_rows
+                ee = [r for r in pool if (r.get("party") or "").upper() == "EE"]
+                row = (ee or pool)[0] if pool else None
+            elif found_via_address:
                 # Address search: pick by (book, doc_number) descending so we get
                 # the most recently recorded deed. Using doc_number as a tiebreaker
                 # handles the case where multiple documents share the same book
@@ -4180,7 +4595,7 @@ async def run_plymouth(
             town_mismatch = False
             street_mismatch = False
 
-            if not found_via_address:
+            if not found_via_address and not pinned:
                 if town and (row.get("town") or "").upper() not in ("", "NONE"):
                     town_mismatch = not _town_matches_filter(
                         town.upper(), (row.get("town") or "").upper()
@@ -4308,6 +4723,7 @@ async def run_plymouth(
             # (run 2026-06-23-001 reported the redemption; 2026-06-24-001 fixed it).
             if (
                 not found_via_address
+                and not pinned
                 and row is not None
                 and _is_non_conveyance_instrument(row.get("deed_type", ""))
             ):
@@ -4393,12 +4809,42 @@ async def run_plymouth(
             result["deed_property_address"] = (
                 f"{row['street']}, {row['town']}" if row["street"] else row["town"]
             )
+            # v3.50 — a Book Search lists the instrument under EITHER party:
+            # on a grantor (OR) row the Name cell is the GRANTOR and Reverse
+            # Party the grantee — the reverse of a grantee name search.
+            _row_is_or = (row.get("party") or "").upper() == "OR"
+            _row_grantor = row["name"] if _row_is_or else row["reverse_party"]
+            _row_grantee = row["reverse_party"] if _row_is_or else row["name"]
             result["notes"].append(
                 f"Selected row: {row['deed_type']} Doc#{row['doc_number']} "
                 f"Bk{row['book']}/Pg{row['page']} {row['recorded_date']} | "
-                f"Grantor: {row['reverse_party']} | Grantee: {row['name']} | "
+                f"Grantor: {_row_grantor} | Grantee: {_row_grantee} | "
                 f"Address: {row['street']}, {row['town']}"
             )
+            if pinned:
+                # v3.50 — the pin skipped the town/street retries, so the
+                # index address is CHECKED here instead (a note, never a
+                # retarget: the operator named this instrument).
+                idx_street = (row.get("street") or "").strip()
+                idx_town = (row.get("town") or "").strip().upper()
+                if street_name and idx_street:
+                    if not _street_matches_filter(street_name, idx_street):
+                        result["notes"].append(
+                            f"WARNING (pinned): the index address of Bk "
+                            f"{target_book}/Pg {target_page} is {idx_street!r}, "
+                            f"which does not name '{street_name}'. Confirm the "
+                            "pin is the subject parcel before using it.")
+                elif street_name:
+                    result["notes"].append(
+                        f"NOTE (pinned): Bk {target_book}/Pg {target_page} has "
+                        "no street indexed, so the pin could not be checked "
+                        "against the subject street from the index — the "
+                        "extracted deed address check below is the check.")
+                if (town and idx_town and idx_town not in ("NONE", "SEEBK")
+                        and not _town_matches_filter(town.upper(), idx_town)):
+                    result["notes"].append(
+                        f"WARNING (pinned): Bk {target_book}/Pg {target_page} is "
+                        f"indexed to town {idx_town!r}, not {town!r}.")
 
             # -----------------------------------------------------------
             # v3.13 — BRING THE SELECTED ROW BACK ON SCREEN BEFORE CLICKING IT
@@ -4441,6 +4887,12 @@ async def run_plymouth(
                 # homesteads / discharges / related deeds against this deed);
                 # same treatment as Middlesex South's detail-panel References.
                 result["detail_references"] = detail.get("references") or []
+                # v3.50 — the panel's own count, and whether every pager page
+                # of the References grid was read.
+                result["detail_references_expected"] = detail.get("references_expected")
+                result["detail_references_complete"] = detail.get("references_complete")
+                if detail.get("references_note"):
+                    result["notes"].append(detail["references_note"])
                 if result["detail_references"]:
                     result["notes"].append(
                         "Detail panel references (cross-refs against this "
@@ -4456,9 +4908,32 @@ async def run_plymouth(
                         result["notes"].append(xnote)
             else:
                 # Fall back to single grantor from results row
-                result["grantors"] = [row["reverse_party"]] if row["reverse_party"] else []
-                result["grantees"] = [row["name"]] if row["name"] else []
+                result["grantors"] = [_row_grantor] if _row_grantor else []
+                result["grantees"] = [_row_grantee] if _row_grantee else []
                 result["notes"].append("Detail panel did not open — using results-row party data only.")
+
+            if pinned:
+                # v3.50 — a pin bypasses the grantee NAME search, so nothing
+                # yet says the seller took title by this instrument. Check it.
+                ee_names = list(result["grantees"]) or [
+                    (r["reverse_party"] if (r.get("party") or "").upper() == "OR"
+                     else r["name"])
+                    for r in all_rows if r.get("name")]
+                surname = re.sub(r"[^A-Z]", "", seller_last.upper())
+                if surname and not any(
+                        surname in re.sub(r"[^A-Z]", "", n.upper())
+                        for n in ee_names):
+                    result["notes"].append(
+                        f"WARNING (pinned): the seller '{seller_last}' is NOT "
+                        f"named as a grantee of Bk {target_book}/Pg "
+                        f"{target_page} (grantees: {ee_names or 'none read'}). "
+                        "Either the pin is the wrong instrument, or title is "
+                        "held under another name (a trust, an entity, a "
+                        "former name). Resolve before relying on this deed.")
+                else:
+                    result["notes"].append(
+                        f"Pinned instrument names the seller '{seller_last}' "
+                        f"as grantee ({', '.join(ee_names)}).")
 
             # -----------------------------------------------------------
             # STEP 4 — VIEW IMAGES → download deed pages
@@ -4540,6 +5015,7 @@ async def run_plymouth(
         # the named seller.  Catches subsequent deeds by joint tenant co-owners.
         # -----------------------------------------------------------
         _tm.mark("STEP 5 - grantor check")
+        all_grantor_rows: list[dict] = []   # v3.50 — read by --verify-grantor-hit
         try:
             g_page = await context.new_page()
             original_book = result.get("book", "")
@@ -4567,7 +5043,6 @@ async def run_plymouth(
                 if cleaned and cleaned != combined_name:
                     _add_search_name(cleaned, grantee_display)
 
-            all_grantor_rows: list[dict] = []
             seen_docs: set[tuple] = set()
 
             # v3.29 — server-side date window (see _GRANTOR_WINDOW_LOOKBACK_DAYS).
@@ -4680,6 +5155,67 @@ async def run_plymouth(
             await g_page.close()
         except Exception as e:
             result["notes"].append(f"Grantor check failed (non-fatal): {e}")
+
+        # -----------------------------------------------------------
+        # v3.50 — --verify-grantor-hit BOOK/PAGE (Plymouth)
+        # -----------------------------------------------------------
+        if verify_grantor_hit:
+            _tm.mark("STEP 5b - verify grantor hit")
+            vb, _, vp = verify_grantor_hit.partition("/")
+            vb = vb.strip().lstrip("0")
+            vp = vp.strip().lstrip("0")
+            target_hit = next(
+                (r for r in all_grantor_rows
+                 if (r.get("book") or "").lstrip("0") == vb
+                 and (not vp or (r.get("page") or "").lstrip("0") == vp)),
+                None)
+            if target_hit is None:
+                result["grantor_hit_verification"] = {
+                    "status": "not_found", "requested": verify_grantor_hit}
+                result["notes"].append(
+                    f"--verify-grantor-hit {verify_grantor_hit} did not match "
+                    "any grantor-check hit, so it was NOT verified. Hits "
+                    "found: " + (", ".join(
+                        f"Bk{r['book']}/{r.get('page') or '?'} {r['deed_type']}"
+                        for r in all_grantor_rows) or "none")
+                    + ". (The hit must come from the check's own searches.)")
+            elif not vp:
+                result["grantor_hit_verification"] = {
+                    "status": "not_performed", "requested": verify_grantor_hit,
+                    "reason": "Plymouth needs BOOK/PAGE — Book Search is "
+                              "addressed by both"}
+                result["notes"].append(
+                    f"--verify-grantor-hit {verify_grantor_hit}: pass BOOK/PAGE "
+                    f"on Plymouth (e.g. {vb}/"
+                    f"{target_hit.get('page') or 'PAGE'}). NOT verified.")
+            else:
+                label = f"grantor_hit_Bk{vb}_Pg{vp}"
+                fetched = await _plymouth_open_and_download_instrument(
+                    context, vb, vp, base_name, label, output_folder,
+                    result["notes"], result["errors"])
+                det = fetched.get("detail") or {}
+                result["grantor_hit_verification"] = {
+                    "status": ("downloaded" if fetched["ok"]
+                               else "download_incomplete" if fetched["files"]
+                               else "download_failed"),
+                    "requested": verify_grantor_hit,
+                    "book": vb, "page": vp,
+                    "document_number": target_hit.get("doc_number"),
+                    "doc_type": target_hit.get("deed_type"),
+                    "recorded_date": target_hit.get("recorded_date"),
+                    "index_address": ", ".join(
+                        x for x in (target_hit.get("street"), target_hit.get("town")) if x),
+                    "grantors": det.get("grantors") or [],
+                    "grantees": det.get("grantees") or [],
+                    "consideration": det.get("consideration"),
+                    "files": fetched["files"],
+                    "extraction": None,
+                }
+                if not fetched["ok"]:
+                    result["notes"].append(
+                        f"WARNING: --verify-grantor-hit {verify_grantor_hit}: "
+                        "the instrument's pages were NOT all downloaded — the "
+                        "verification is INCOMPLETE; see errors.")
 
         await browser.close()
 
@@ -4916,15 +5452,17 @@ async def _msouth_read_detail(page: Page) -> dict:
                 out = {};
                 hdr.forEach((h, i) => { out[h] = val[i] !== undefined ? val[i] : ''; });
             }
-            const full = panel.innerText;
-            const refIdx = full.indexOf('References');
-            return {header: out,
-                    references: refIdx >= 0 ? full.slice(refIdx, refIdx + 400)
-                        .split('\\n').map(s => s.trim()).filter(s => s) : []};
+            return {header: out};
         }"""
     )
+    # v3.50 — References are no longer read here. This used a 400-character
+    # slice of the panel text, which kept page 1 of a grid that pages 10
+    # rows at a time (a master deed with 47 references came back with 10).
+    # _read_detail_panel reads the whole grid, and the runner takes the list
+    # from there — re-reading here after that pager walk would see only the
+    # LAST page.
     if not data:
-        return {"doc_number": "", "num_pages": "", "consideration": "", "references": []}
+        return {"doc_number": "", "num_pages": "", "consideration": ""}
     hdr = data.get("header") or {}
 
     def _get(*keys):
@@ -4938,7 +5476,6 @@ async def _msouth_read_detail(page: Page) -> dict:
         "doc_number":    _get("Doc. #"),
         "num_pages":     _get("# of Pgs"),
         "consideration": _get("Consideration"),
-        "references":    data.get("references") or [],
     }
 
 
@@ -5190,8 +5727,8 @@ async def run_middlesex_south(
             panel_opened = await _open_detail_panel(page, ctl=row["ctl"], expected_book=row["book"])
             detail_pages = ""
             if panel_opened:
-                parties = await _read_detail_panel(page)   # parties only
-                msouth  = await _msouth_read_detail(page)  # header table + references
+                parties = await _read_detail_panel(page)   # parties + references
+                msouth  = await _msouth_read_detail(page)  # header table
                 result["grantors"]        = parties["grantors"]
                 result["grantees"]        = parties["grantees"]
                 result["document_number"] = msouth["doc_number"] or None
@@ -5202,15 +5739,24 @@ async def run_middlesex_south(
                     f"consideration={msouth['consideration']} | "
                     f"Grantors: {parties['grantors']} | Grantees: {parties['grantees']}"
                 )
-                if msouth["references"]:
+                # v3.50 — the complete References list, every pager page.
+                msouth_refs = parties.get("references") or []
+                result["detail_references"] = msouth_refs
+                result["detail_references_expected"] = parties.get("references_expected")
+                result["detail_references_complete"] = parties.get("references_complete")
+                if parties.get("references_note"):
+                    result["notes"].append(parties["references_note"])
+                if msouth_refs:
                     result["notes"].append(
                         "Detail panel references (cross-refs — discharges etc.): "
-                        + " | ".join(msouth["references"][:8])
+                        + " | ".join(msouth_refs[:8])
+                        + (f" | ...(+{len(msouth_refs) - 8} more — all in "
+                           "cross_references)" if len(msouth_refs) > 8 else "")
                     )
                     # v3.26 — normalised into the shared cross_references
                     # shape (full list, not the note's first 8).
                     result["cross_references"] = _normalize_cross_references(
-                        msouth["references"], "Middlesex South detail panel")
+                        msouth_refs, "Middlesex South detail panel")
                     xnote = _cross_reference_note(result["cross_references"])
                     if xnote:
                         result["notes"].append(xnote)
@@ -6052,7 +6598,7 @@ async def _suffolk_read_detail(page: Page) -> dict:
     )
     empty = {"doc_number": "", "num_pages": "", "consideration": "",
              "book_page": "", "doc_status": "", "property_lines": [],
-             "certificate_refs": [], "references": []}
+             "certificate_refs": []}
     if not data:
         return empty
     hdr = data.get("header") or {}
@@ -6090,12 +6636,9 @@ async def _suffolk_read_detail(page: Page) -> dict:
                                      ("Grantor/Grantee", "References"))
                  if re.fullmatch(r"\d{3,8}", t)]
 
-    references = []
-    ridx = full.find("References")
-    if ridx >= 0:
-        references = [s.strip() for s in
-                      full[ridx:ridx + 400].splitlines() if s.strip()]
-
+    # v3.50 — References are read by _read_detail_panel (whole grid, every
+    # pager page); the 400-character page-1 slice that lived here kept 10 of
+    # a master deed's 683. See _avenu_read_references.
     return {
         "doc_number":       _get("Doc. #"),
         "num_pages":        _get("# of Pgs"),
@@ -6104,7 +6647,6 @@ async def _suffolk_read_detail(page: Page) -> dict:
         "doc_status":       _get("Doc. Status"),
         "property_lines":   prop,
         "certificate_refs": cert_refs,
-        "references":       references,
     }
 
 
@@ -6746,7 +7288,7 @@ async def run_suffolk(
                     expected_book="" if is_lc else (row["book"] or ""),
                     anchor_col=panel_anchor)
                 if panel_opened:
-                    parties = await _read_detail_panel(page)   # parties only
+                    parties = await _read_detail_panel(page)   # parties + references
                     det = await _suffolk_read_detail(page)     # header + blocks
                     result["grantors"] = parties["grantors"]
                     result["grantees"] = parties["grantees"]
@@ -6754,7 +7296,12 @@ async def run_suffolk(
                                                  or result["document_number"])
                     result["consideration"] = det["consideration"] or None
                     detail_pages = det["num_pages"]
-                    result["detail_references"] = det["references"]
+                    # v3.50 — the complete References list, every pager page.
+                    result["detail_references"] = parties.get("references") or []
+                    result["detail_references_expected"] = parties.get("references_expected")
+                    result["detail_references_complete"] = parties.get("references_complete")
+                    if parties.get("references_note"):
+                        result["notes"].append(parties["references_note"])
                     result["notes"].append(
                         f"Detail panel: Doc#{det['doc_number']} "
                         f"pages={det['num_pages']} "
@@ -6801,9 +7348,9 @@ async def run_suffolk(
                             "is the Land Court registration book/page, NOT a "
                             "Recorded Land citation. Confirm both against the "
                             "deed image before use.")
-                    if det["references"]:
+                    if result["detail_references"]:
                         result["cross_references"] = _normalize_cross_references(
-                            det["references"], "Suffolk detail panel")
+                            result["detail_references"], "Suffolk detail panel")
                         xnote = _cross_reference_note(result["cross_references"])
                         if xnote:
                             result["notes"].append(xnote)
@@ -10265,6 +10812,96 @@ def _reconcile_lc_certificate(result: dict, stamp: str, panel_cert) -> None:
             "the one the land is DESCRIBED on, NOT the one this deed is "
             "noted on. Do NOT cite it until it is confirmed on the images."
         )
+
+
+def _plymouth_extract_verified_hit(result: dict, *, extract_pdf: bool,
+                                   street_number: str, street_name: str) -> None:
+    """
+    v3.50 — full extraction of a --verify-grantor-hit instrument on
+    Plymouth (page images), the same _DEED_SCHEMA call the ALIS engine
+    makes, plus the which-parcel note. In claude-code mode, or when
+    extraction has latched unavailable, the files are NAMED instead, so a
+    verification that was not read never looks like one that was.
+    Mutates `result`; never raises.
+    """
+    ver = result.get("grantor_hit_verification") or {}
+    files = ver.get("files") or []
+    if not files:
+        return
+    try:
+        names = ", ".join(Path(f).name for f in files)
+        if not extract_pdf or result.get("extraction_unavailable"):
+            why = ("claude-code extraction mode" if not extract_pdf
+                   else f"extraction unavailable: {result['extraction_unavailable']}")
+            result["notes"].append(
+                f"READ THE GRANTOR-HIT PAGE IMAGES to verify Bk "
+                f"{ver.get('book')}/Pg {ver.get('page')} ({why}): {names}")
+            return
+        client, reason = _anthropic_client()
+        if client is None:
+            result["notes"].append(
+                f"Grantor-hit verification extraction skipped ({reason}) — "
+                f"READ: {names}")
+            return
+        try:
+            fields = _extract_pdf_fields(
+                client, files, _DEED_SCHEMA,
+                "These are the page images of an instrument the seller (or "
+                "a co-owner) executed as GRANTOR after acquiring the subject "
+                "property, surfaced by a grantor-index search and pulled up "
+                "for verification. Extract the requested fields.")
+        except Exception as e:
+            fields = {"error": f"{type(e).__name__}: {e}"}
+            _mark_extraction_unavailable(result, e)
+        ver["extraction"] = fields
+        if "error" in fields:
+            result["notes"].append(
+                f"WARNING: --verify-grantor-hit extraction failed "
+                f"({fields['error']}) — READ: {names}")
+            return
+        cite = f"Bk {ver.get('book')}/Pg {ver.get('page')}"
+        # Same audit check as the main deed: do the images name the hit?
+        stamp = fields.get("recording_stamp")
+        verdict = _stamp_matches_selection(stamp, ver.get("book"), ver.get("page"))
+        ver["stamp_check"] = verdict
+        if verdict == "mismatch":
+            result["notes"].append(
+                f"WARNING: the verified grantor hit's recording stamp "
+                f"('{stamp}') does NOT name {cite} — the viewer may have "
+                "served a different instrument. Do not rely on this "
+                f"verification. READ: {names}")
+            return
+        if verdict != "match":
+            result["notes"].append(
+                f"NOTE: the verified grantor hit's recording stamp could not "
+                f"be checked against {cite} (read: {stamp!r}) — confirm the "
+                "images are that instrument.")
+        addr = fields.get("property_address")
+        if not addr:
+            result["notes"].append(
+                f"WARNING: verified grantor hit {cite}: no property address "
+                "could be extracted — the parcel is UNVERIFIED, not a "
+                f"different parcel. READ: {names}")
+        elif street_number and street_name and _alis_address_matches(
+                street_number, street_name, addr):
+            sev = ("CRITICAL" if _classify_instrument(ver.get("doc_type") or "")
+                   != "non_conveyance" else "NOTE")
+            result["notes"].append(
+                f"{sev}: verified grantor hit {cite} "
+                f"({ver.get('doc_type')}) is at the SUBJECT property — "
+                f"extracted address '{addr}'.")
+        elif street_name and _alis_street_word_matches(street_name, addr):
+            result["notes"].append(
+                f"WARNING: verified grantor hit {cite}: extracted address "
+                f"'{addr}' names the subject STREET but the number could not "
+                "be confirmed — treat it as the POSSIBLE subject parcel.")
+        else:
+            result["notes"].append(
+                f"Verified grantor hit {cite}: extracted address '{addr}' — "
+                "a different parcel from the subject.")
+    except Exception as e:
+        result["notes"].append(
+            f"Grantor-hit verification extraction failed (non-fatal): {e}")
 
 
 def _finish_image_registry(result: dict, args, output_folder: Path, *,
@@ -14211,18 +14848,21 @@ def main() -> None:
                              "browser engine; 'auto' (default) = HTTP with automatic "
                              "Playwright fallback on hard HTTP failure.")
     parser.add_argument("--book", default="",
-                        help="Norfolk/Barnstable HTTP engine only: target a specific "
-                             "instrument instead of the most-recent heuristic — book "
-                             "number (Recorded Land) or document number (Land Court). "
-                             "Use after a multiple_deed_candidates result identified "
-                             "the correct deed.")
+                        help="Norfolk/Barnstable (HTTP engine) and Plymouth: target a "
+                             "specific instrument instead of the most-recent heuristic — "
+                             "book number (Recorded Land) or document number (ALIS Land "
+                             "Court). Use after a multiple_deed_candidates result "
+                             "identified the correct deed, or when the vesting deed's "
+                             "Bk/Pg is already known. Plymouth opens it by Book Search "
+                             "and requires --page.")
     parser.add_argument("--page", default="",
                         help="Page number to pair with --book (Recorded Land only).")
     parser.add_argument("--verify-grantor-hit", default="",
-                        help="Norfolk/Barnstable HTTP engine only: fully download "
+                        help="Norfolk/Barnstable (HTTP engine) and Plymouth: fully download "
                              "and extract ONE grantor-check hit to confirm a "
                              "suspected deed-out — 'BOOK/PAGE' (Recorded Land) or "
-                             "document number (Land Court). The hit must appear in "
+                             "document number (ALIS Land Court); Plymouth requires "
+                             "BOOK/PAGE. The hit must appear in "
                              "the grantor check's results. Result lands in the "
                              "grantor_hit_verification JSON field. Combine with "
                              "--book/--page to keep the main deed selection pinned.")
@@ -14340,8 +14980,25 @@ def main() -> None:
         ("--book", args.book),
         ("--page", args.page),
     ) if v]
-    if _http_only and (args.registry not in ("norfolk", "barnstable")
-                       or args.engine == "playwright"):
+    # v3.50 — Plymouth implements all three via Book Search, but Book
+    # Search is addressed by Book AND Page, so a half-specified request is
+    # refused here rather than discovered mid-run.
+    if args.registry == "plymouth":
+        _ply_err = None
+        if bool(args.book) != bool(args.page):
+            _ply_err = ("--registry plymouth needs --book AND --page together "
+                        "(Recorded Land Book Search is addressed by both).")
+        elif args.verify_grantor_hit and "/" not in args.verify_grantor_hit:
+            _ply_err = ("--registry plymouth needs --verify-grantor-hit as "
+                        "BOOK/PAGE (e.g. 12345/67).")
+        if _ply_err:
+            print(json.dumps({"status": "error", "notes": [],
+                              "errors": [_ply_err + " No search was performed."]},
+                             indent=2))
+            sys.exit(1)
+    if _http_only and args.registry != "plymouth" and (
+            args.registry not in ("norfolk", "barnstable")
+            or args.engine == "playwright"):
         _why = (f"--registry {args.registry}"
                 if args.registry not in ("norfolk", "barnstable")
                 else "--engine playwright")
@@ -14355,7 +15012,8 @@ def main() -> None:
             "notes": [],
             "errors": [
                 f"{_why} does not implement {', '.join(_http_only)} — these "
-                f"are ALIS HTTP-engine features (Norfolk/Barnstable). No "
+                f"are implemented only by the ALIS HTTP engine (Norfolk/"
+                f"Barnstable) and Plymouth. No "
                 f"search was performed: running anyway would silently ignore "
                 f"the flag(s) and exit 0 with a result that LOOKS like the "
                 f"request was honored. " + _fix
@@ -14547,6 +15205,8 @@ def main() -> None:
                 street_number=sn, street_name=st,
                 force_address_search=args.force_address_search,
                 lien_sweep=args.lien_sweep,
+                target_book=args.book or "", target_page=args.page or "",
+                verify_grantor_hit=args.verify_grantor_hit or "",
             )
         )
         # v3.47 (47b) — inline extraction + report draft, exactly as the
@@ -14558,6 +15218,8 @@ def main() -> None:
             extract_pdf=extract_pdf, extraction_mode=extraction_mode,
             mode_note=_mode_note,
         )
+        _plymouth_extract_verified_hit(
+            result, extract_pdf=extract_pdf, street_number=sn, street_name=st)
     elif args.registry == "barnstable":
         barnstable_town, barnstable_notes = _barnstable_resolve_town(args.town, args.base_name)
         result = _run_alis_registry(
