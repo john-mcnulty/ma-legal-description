@@ -1,7 +1,37 @@
 #!/usr/bin/env python3
 """
 legal_desc_fetch.py — fast-path for Legal Description Search Workflow
-Version: 3.50
+Version: 3.51
+
+v3.51 changes (item 50 — a Plymouth address pick crossed TOWN LINES and
+returned another town's deed at exit 0):
+
+  A Lakeville subject returned a deed for the same house number on a
+  same-named road in MARION. The grantee search HAD the right row, but its
+  town code 'LKVL' was not in _PLYMOUTH_TOWN_ABBREVS (confirmed by the town
+  harvest 2026-07-08 and never added), so the town filter matched 0 of 15
+  rows, the multi-row town-mismatch retry fired, and the address search —
+  county-wide since v3.42 — picked the highest Book in the COUNTY. v3.42
+  said town scoping would happen afterwards against the grid; it never did,
+  on any of the three address pick sites.
+
+  1. LAKEVILLE -> LKVL and MARION -> MRION added to the dictionary.
+  2. New _plymouth_scope_rows_to_town() runs before EVERY address pick
+     (--force-address-search / trust fallback, the town/street-mismatch
+     retry, the v3.3 misindexed-name fallback): rows in the subject town
+     first; else rows the seller's own grantee search also returned (this
+     is what survives the NEXT dictionary gap); else rows with no town
+     indexed, as UNVERIFIED; else a CRITICAL note.
+  3. The dictionary-gap message now fires where it matters. It used to be a
+     NOTE on SINGLE-row runs only, where the gap is harmless, and silent on
+     multi-row runs, where it chose the parcel. A multi-row run with 0 town
+     matches and an unrecognised code now says DICTIONARY GAP by name.
+  4. Final-selection town guard (path-independent, like the v3.12 conveyance
+     guard): a selected row indexed to a DIFFERENT known town sets the new
+     JSON flag `selected_row_town_mismatch` and a CRITICAL note; an
+     unrecognised code gets a NOTE that the town could not be checked.
+  Also: _town_matches_filter() is never handed an empty town code by the new
+  code — "" is a substring of every town name and would "match".
 
 v3.50 changes (Plymouth Book Search — two findings from reviewing a
 subdivision covenant and its lot releases by hand):
@@ -1924,7 +1954,28 @@ _PLYMOUTH_TOWN_ABBREVS: dict[str, str] = {
     "MARSHFIELD":    "MSHFD",  # confirmed 2026-07-08 (KDM Realty Corp run)
     "WHITMAN":       "WHTMN",  # confirmed 2026-09-16 (a two-row name search
                                # fired a needless town-mismatch retry)
+    # v3.51 (item 50) — both confirmed 2026-07-08 by the town harvest and left
+    # out for 2.5 months. The LAKEVILLE gap returned a MARION deed at exit 0.
+    "LAKEVILLE":     "LKVL",   # confirmed 2026-07-08 (harvest); 2026-09-22 run
+    "MARION":        "MRION",  # confirmed 2026-07-08 (harvest)
 }
+
+# v3.51 — the 27 Plymouth County municipalities, as the GRID spells them
+# (the Towns dropdown says MIDDLEBORO). Used only to tell a grid town code
+# that names some OTHER known town from one the script cannot recognise at
+# all — the second is a dictionary gap, not evidence of a different town.
+_PLYMOUTH_TOWNS: tuple[str, ...] = (
+    "ABINGTON", "BRIDGEWATER", "BROCKTON", "CARVER", "DUXBURY",
+    "EAST BRIDGEWATER", "HALIFAX", "HANOVER", "HANSON", "HINGHAM", "HULL",
+    "KINGSTON", "LAKEVILLE", "MARION", "MARSHFIELD", "MATTAPOISETT",
+    "MIDDLEBOROUGH", "NORWELL", "PEMBROKE", "PLYMOUTH", "PLYMPTON",
+    "ROCHESTER", "ROCKLAND", "SCITUATE", "WAREHAM", "WEST BRIDGEWATER",
+    "WHITMAN",
+)
+
+# Grid town cells that carry no town at all. `_town_matches_filter` must never
+# see an empty code: "" is a substring of every town name, so it "matches".
+_PLYMOUTH_TOWNLESS_CODES = frozenset({"", "NONE", "SEEBK"})
 
 
 # ---------------------------------------------------------------------------
@@ -2542,10 +2593,13 @@ async def _plymouth_address_fallback(
     street_number: str,
     street_name: str,
     result: dict,
+    town: str = "",
+    seller_rows: list | None = None,
 ) -> dict | None:
     """
     Run a Plymouth property-address search and return the most recently
-    recorded deed-type row, or None.
+    recorded deed-type row, or None. v3.51: the pick is scoped to `town`
+    first (_plymouth_scope_rows_to_town) — the search itself is county-wide.
 
     An address search is index-name-independent, so it recovers the vesting (or
     most-recent) deed when a grantee name search misses it — most often because
@@ -2595,6 +2649,10 @@ async def _plymouth_address_fallback(
             "Address-search fallback: no deed-type rows after filtering."
         )
         return None
+    addr_rows = _plymouth_scope_rows_to_town(
+        addr_rows, town, result["notes"], "Address-search fallback",
+        seller_rows=seller_rows,
+    )
     try:
         row = max(
             addr_rows,
@@ -3127,6 +3185,119 @@ def _town_matches_filter(tf: str, t: str) -> bool:
         if ab == tf and full == t:
             return True
     return False
+
+
+def _plymouth_town_code_is_known(code: str) -> bool:
+    """
+    v3.51 — True if grid town code `code` is recognisably SOME Plymouth County
+    town (substring or dictionary match). False means the script cannot read
+    the code at all — a dictionary gap, which says nothing about which town
+    the row is in.
+    """
+    c = (code or "").strip().upper()
+    if c in _PLYMOUTH_TOWNLESS_CODES:
+        return False
+    return any(_town_matches_filter(full, c) for full in _PLYMOUTH_TOWNS)
+
+
+def _plymouth_unknown_town_codes(rows: list) -> list:
+    """v3.51 — distinct grid town codes in `rows` that name no known town."""
+    seen: list = []
+    for r in rows:
+        c = (r.get("town") or "").strip().upper()
+        if (c and c not in _PLYMOUTH_TOWNLESS_CODES and c not in seen
+                and not _plymouth_town_code_is_known(c)):
+            seen.append(c)
+    return seen
+
+
+def _plymouth_scope_rows_to_town(
+    rows: list,
+    town: str,
+    notes: list,
+    label: str,
+    seller_rows: list | None = None,
+) -> list:
+    """
+    v3.51 (item 50) — scope ADDRESS-search rows to the subject town before a
+    row is picked from them.
+
+    The address search has been county-wide since v3.42 (the Towns dropdown
+    filter never applied and was removed), and v3.42 said town scoping would
+    happen afterwards against the grid. It never did: every address pick took
+    the highest Book across the county, so a same-numbered street in another
+    town could win — live 2026-09-22, a LAKEVILLE subject returned the same
+    house number on a same-named road in MARION at exit 0 (the Lakeville row
+    carried 'LKVL', which the dictionary did not know).
+
+    Tiers, first non-empty wins:
+      1. rows whose town code matches `town`;
+      2. rows at a Bk/Pg that the seller's own grantee search also returned
+         (`seller_rows`) — the seller's deed at this address, whatever its
+         town code says; this is what survives a future dictionary gap;
+      3. rows with no town indexed (blank / NONE / SEEBK) — not provably in
+         another town, but unverified, and said so;
+      4. otherwise every row is indexed to another town: returned unchanged
+         with a CRITICAL note, and the final town guard flags the selection.
+    """
+    if not town or not rows:
+        return rows
+    tf = town.strip().upper()
+
+    def _code(r: dict) -> str:
+        return (r.get("town") or "").strip().upper()
+
+    def _fmt(rs: list) -> str:
+        return ", ".join(
+            f"Bk{r.get('book')}/{r.get('page')} {r.get('street')!r} town={_code(r)!r}"
+            for r in rs[:10]
+        ) + (f", ...(+{len(rs) - 10} more)" if len(rs) > 10 else "")
+
+    matched = [r for r in rows
+               if _code(r) not in _PLYMOUTH_TOWNLESS_CODES
+               and _town_matches_filter(tf, _code(r))]
+    if matched:
+        dropped = [r for r in rows if r not in matched]
+        if dropped:
+            notes.append(
+                f"{label}: scoped to town '{town}' — kept {len(matched)} of "
+                f"{len(rows)} row(s); set aside {len(dropped)} indexed to other "
+                f"towns or none: {_fmt(dropped)}.")
+        return matched
+
+    unknown = _plymouth_unknown_town_codes(rows)
+    if seller_rows:
+        keys = {(str(r.get("book")), str(r.get("page"))) for r in seller_rows}
+        linked = [r for r in rows
+                  if (str(r.get("book")), str(r.get("page"))) in keys]
+        if linked:
+            notes.append(
+                f"WARNING: {label}: no row is indexed to town '{town}', but "
+                f"{len(linked)} row(s) at this address are ALSO in the seller's "
+                f"own grantee search — using those: {_fmt(linked)}."
+                + (f" Town code(s) {unknown} are unknown to the script — if one "
+                   f"is '{town}', add it to _PLYMOUTH_TOWN_ABBREVS."
+                   if unknown else ""))
+            return linked
+
+    townless = [r for r in rows if _code(r) in _PLYMOUTH_TOWNLESS_CODES]
+    if townless:
+        notes.append(
+            f"WARNING: {label}: no row is indexed to town '{town}'; using the "
+            f"{len(townless)} row(s) with NO town indexed and setting aside "
+            f"{len(rows) - len(townless)} indexed to other towns. The town of "
+            f"the selection is UNVERIFIED — confirm it on the deed.")
+        return townless
+
+    notes.append(
+        f"CRITICAL: {label}: EVERY row is indexed to a town other than "
+        f"'{town}' ({_fmt(rows)}). The selection below is probably a "
+        f"same-numbered street in ANOTHER TOWN — do not use it until the deed "
+        f"itself shows the subject town."
+        + (f" Town code(s) {unknown} are unknown to the script; if one of them "
+           f"is '{town}', add it to _PLYMOUTH_TOWN_ABBREVS and re-run."
+           if unknown else ""))
+    return rows
 
 
 def _street_matches_filter(street_filter: str, street: str) -> bool:
@@ -4235,6 +4406,8 @@ async def run_plymouth(
         "found_via_address_search": False,
         "found_via_compound_surname": False,
         "selected_row_is_not_a_deed": False,
+        # v3.51 (item 50) — the selected row is indexed to another town.
+        "selected_row_town_mismatch": False,
         "results_truncated_at_cap": False,
         # v3.50 — set when --book/--page pinned the instrument via Book Search.
         "pinned_by_book_page": False,
@@ -4556,6 +4729,10 @@ async def run_plymouth(
                 ee = [r for r in pool if (r.get("party") or "").upper() == "EE"]
                 row = (ee or pool)[0] if pool else None
             elif found_via_address:
+                # v3.51 — the address search is county-wide; scope to the
+                # subject town before picking (item 50).
+                all_rows = _plymouth_scope_rows_to_town(
+                    all_rows, town, result["notes"], "Address search")
                 # Address search: pick by (book, doc_number) descending so we get
                 # the most recently recorded deed. Using doc_number as a tiebreaker
                 # handles the case where multiple documents share the same book
@@ -4626,6 +4803,20 @@ async def run_plymouth(
                         f"Best available row is Bk{row['book']} town={row['town']!r} "
                         f"(possible wrong property — seller may own multiple Plymouth Co. properties)."
                     )
+                    # v3.51 (item 50) — the single-row NOTE above was the ONLY
+                    # place a dictionary gap was reported, i.e. only where it
+                    # is harmless. Here it decides the parcel: say so.
+                    _gap = _plymouth_unknown_town_codes(all_rows)
+                    if _gap:
+                        result["notes"].append(
+                            f"WARNING: town filter matched 0 of {len(all_rows)} "
+                            f"name-search row(s), and town code(s) {_gap} are "
+                            f"unknown to the script — probably a DICTIONARY GAP, "
+                            f"not a different town. If one of them is '{town}', "
+                            f"add it to _PLYMOUTH_TOWN_ABBREVS. The address-search "
+                            f"retry below is scoped to '{town}' and to the "
+                            f"seller's own rows so it cannot cross town lines."
+                        )
             elif street_mismatch:
                 result["notes"].append(
                     f"WARNING: name-search selected row street {row.get('street')!r} does not "
@@ -4681,6 +4872,11 @@ async def run_plymouth(
                             f"{len(addr_deed_rows)} deed-type row(s)."
                         )
                         addr_rows = addr_deed_rows
+                    addr_rows = _plymouth_scope_rows_to_town(
+                        addr_rows, town, result["notes"],
+                        f"Address search ({retry_reason} retry)",
+                        seller_rows=all_rows,
+                    )
                     try:
                         row = max(
                             addr_rows,
@@ -4734,7 +4930,8 @@ async def run_plymouth(
                         f"misspelled name) — retrying with address search."
                     )
                     fb_row = await _plymouth_address_fallback(
-                        page, street_number, street_name, result
+                        page, street_number, street_name, result,
+                        town=town, seller_rows=all_rows,
                     )
                     if fb_row is not None:
                         found_via_address = True
@@ -4800,6 +4997,35 @@ async def run_plymouth(
                     )
             else:
                 result["selected_row_is_not_a_deed"] = False
+
+            # -----------------------------------------------------------
+            # v3.51 (item 50) — FINAL-SELECTION TOWN GUARD (path-independent)
+            # -----------------------------------------------------------
+            # Same idea as the conveyance guard above: whatever path chose the
+            # row, a row indexed to a DIFFERENT known town is flagged. An
+            # unknown code is a dictionary gap and gets a NOTE, not the flag.
+            _sel_town = (row.get("town") or "").strip().upper() if row else ""
+            if (town and row is not None
+                    and _sel_town not in _PLYMOUTH_TOWNLESS_CODES
+                    and not _town_matches_filter(town.upper(), _sel_town)):
+                if _plymouth_town_code_is_known(_sel_town):
+                    result["selected_row_town_mismatch"] = True
+                    if not pinned:  # the pin has its own WARNING (pinned)
+                        result["notes"].append(
+                            f"CRITICAL: the selected instrument Bk{row.get('book')}/"
+                            f"{row.get('page')} is indexed to town {_sel_town!r}, "
+                            f"NOT '{town}' (address {row.get('street')!r}). It is "
+                            f"probably ANOTHER PARCEL. DO NOT report it as the "
+                            f"vesting deed until the deed itself shows the subject "
+                            f"town; if the seller's deed is absent, check Plymouth "
+                            f"Registered Land and a misindexed grantee name.")
+                else:
+                    result["notes"].append(
+                        f"NOTE: town code {_sel_town!r} on the selected row is not "
+                        f"known to the script, so the selection's town could not be "
+                        f"checked against '{town}'. If {_sel_town!r} is '{town}', add "
+                        f"it to _PLYMOUTH_TOWN_ABBREVS; otherwise treat the parcel "
+                        f"as UNVERIFIED and confirm the town on the deed.")
 
             result["book"]           = row["book"]
             result["page"]           = row["page"]
