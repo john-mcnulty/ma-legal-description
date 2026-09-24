@@ -1,7 +1,32 @@
 #!/usr/bin/env python3
 """
 legal_desc_fetch.py — fast-path for Legal Description Search Workflow
-Version: 3.51
+Version: 3.52
+
+v3.52 changes (cross-reference KIND labels for Plymouth's terse codes):
+
+  The report's Cross-References table bucketed each instrument by SUBSTRING
+  needles only, which misfiled 40 of the 72 entries in Plymouth's published
+  instrument-code table (59 codes + the grid's 8-character truncations):
+  every "DIS xxx"/"REL xxx" code — a released UCC, tax lien, lis pendens,
+  attachment or execution — was labelled 'discharge' and fired the
+  MORTGAGE-discharge note; AFFT TAX (a federal tax lien affidavit) was
+  'probate'; ATT/EXON/JGMT/LISPN/TT/CR/trustee codes fell to 'other'.
+
+  1. New _CROSSREF_CODES: the whole table, matched as WHOLE TOKEN SEQUENCES
+     (longest first) before the needles — short codes like TT/CR cannot be
+     substring needles without firing inside unrelated words.
+  2. 'discharge' now means a MORTGAGE discharge only (DIS, DIS REL, REL);
+     other releases are 'release'; PR is 'partial_release'. New kinds:
+     foreclosure (CRTF ENTRY), redemption (CR), court_order (DCRE/ORDR),
+     trust (trustee certificates/appointments/declarations), easement
+     (split out of 'taking').
+  3. Certificate of Entry (CRTF ENTRY / "CERTIFICATE OF ENTRY" /
+     FORECLOS...) added to the OWNERSHIP-RELEVANT set: a foreclosure by
+     entry passes title to the lender after three years with no deed, so a
+     grantor hit of this type at the subject parcel now gets the "confirm
+     the current owners" note instead of the generic encumbrance wording.
+  Deed selection and every exit code are unchanged.
 
 v3.51 changes (item 50 — a Plymouth address pick crossed TOWN LINES and
 returned another town's deed at exit 0):
@@ -4011,6 +4036,9 @@ _OWNERSHIP_CHANGE_SUBSTR = (
     "DEATH", "DECEASED", "PROBATE", "ESTATE OF", "ADMINISTRAT", "EXECUT",
     "TAKING", "TRUSTEE", "GUARDIAN", "CONSERVATOR", "PARTITION",
     "DECREE", "ORDER", "DIVORCE", "SURVIVORSHIP", "HEIR",
+    # v3.52 — foreclosure by entry: a recorded Certificate of Entry starts
+    # the 3-year clock after which the lender holds title with NO deed.
+    "CERTIFICATE OF ENTRY", "FORECLOS",
 )
 _OWNERSHIP_CHANGE_CODES = {
     "TT", "TKG",                      # tax taking / taking
@@ -4019,6 +4047,7 @@ _OWNERSHIP_CHANGE_CODES = {
     "ACPT TR", "RSGN TR",             # acceptance / resignation of trustee
     "APPT ACPT TR", "APPT ACP",       # appointment & acceptance of a trustee
     "DCRE", "ORDR", "JGMT",           # decree / order / judgment
+    "CRTF ENTRY", "CRTF ENT",         # v3.52 certificate of entry (+8-char)
 }
 
 # Instruments that burden the parcel without changing who owns it. The user
@@ -4087,7 +4116,9 @@ def _significance_note(rid: str, deed_type: str, date: str, where: str,
             f"instrument type can change WHO OWNS the parcel or WHO MUST "
             f"SIGN — a death certificate vests a survivor with no deed ever "
             f"recorded; a trustee certificate/appointment/resignation changes "
-            f"the signer; a decree or order can vest or confirm title."
+            f"the signer; a decree or order can vest or confirm title; a "
+            f"certificate of entry starts a foreclosure by entry that "
+            f"passes title to the lender after three years with no deed."
             + _taking_caveat(deed_type)
             + " Confirm the CURRENT owners and signatories before drafting."
         )
@@ -9454,6 +9485,7 @@ def _alis_parse_lc_abstract_text(txt: str) -> dict:
 # Longest-first within each bucket; first hit wins, so "DISCHARGE" is tested
 # before "DIS" and "DECLARATION OF HOMESTEAD" before "DECLARATION".
 _CROSSREF_KINDS = (
+    ("partial_release", ("PARTIAL RELEASE",)),   # v3.52 — before RELEASE
     ("discharge",  ("DISCHARGE", "RELEASE", "SATISFACTION", "DIS REL",
                     "DIS", "REL")),
     ("homestead",  ("DECLARATION OF HOMESTEAD", "HOMESTEAD", "DCLN HMS", "HMS")),
@@ -9465,15 +9497,91 @@ _CROSSREF_KINDS = (
     ("lien",       ("MUNICIPAL LIEN", "TAX LIEN", "LIEN", "ATTACHMENT",
                     "ATTACH", "MLC")),
     ("plan",       ("PLAN",)),
-    ("taking",     ("TAKING", "TKG", "EASEMENT", "ESMT")),
+    ("taking",     ("TAKING", "TKG")),
+    ("easement",   ("EASEMENT", "ESMT")),
     ("notice",     ("NOTICE", "NOTC")),
 )
+
+# v3.52 — the terse Avenu/20-20 codes (Plymouth's published "INSTRUMENT CODES
+# WITH CORRESPONDING DESCRIPTIONS, effective November 3, 2003" — all 59, plus
+# the 8-character forms the grid truncates them to), matched as WHOLE TOKEN
+# SEQUENCES before the substring needles above. The needles alone misfiled
+# most of the table: every "DIS xxx"/"REL xxx" code landed in 'discharge'
+# (a released UCC, tax lien or lis pendens then fired the MORTGAGE-discharge
+# note), AFFT TAX (a FEDERAL TAX LIEN affidavit) landed in 'probate' via
+# "AFFT", and ATT/EXON/JGMT/LISPN/TT/CR fell through to 'other'. Short codes
+# like "TT" or "CR" cannot simply join the substring needles — they would
+# fire inside unrelated words — hence exact token matching here.
+#
+# 'discharge' is kept for MORTGAGE discharges only (DIS, DIS REL, REL), because
+# the note and the report treat that kind as a mortgage-payoff lead. Releases
+# of anything else are 'release'; a Partial Release (PR — usually a lender
+# releasing part of the land from a mortgage) is its own kind because it is a
+# lead on the mortgage but never a full discharge.
+_CROSSREF_CODES = {
+    # mortgage discharge (the only codes that feed the discharge note)
+    "DIS": "discharge", "DIS REL": "discharge", "REL": "discharge",
+    "PR": "partial_release",
+    # releases / discharges of something OTHER than a mortgage
+    "AFFT DIS": "release", "DIS ATT": "release", "DIS EXON": "release",
+    "DIS LISPN": "release", "DIS LISP": "release",
+    "REL TAX": "release", "REL UCC": "release",
+    # mortgage and its satellites
+    "MTG": "mortgage", "AMDT MTG": "mortgage", "SUBD MTG": "mortgage",
+    "SUBD": "mortgage", "MDFN AGRT": "mortgage", "MDFN AGR": "mortgage",
+    "CRTF ENTRY": "foreclosure", "CRTF ENT": "foreclosure",
+    "ASST": "assignment",
+    # liens, judgments, litigation, UCC fixture filings
+    "AFFT TAX": "lien", "ATT": "lien", "CRTF ATT": "lien",
+    "EXON": "lien", "EXTN EXON": "lien", "EXTN EXO": "lien",
+    "JGMT": "lien", "LISPN": "lien", "MLC": "lien",
+    "UCC": "lien", "CONTN UCC": "lien", "CONTN UC": "lien",
+    "AMDT UCC": "lien", "AMDT UC": "lien",
+    # takings and tax-title redemption
+    "TKG": "taking", "TT": "taking", "CR": "redemption",
+    "ESMT": "easement",
+    # conveyances
+    "DEED": "deed", "MDEED": "deed",
+    # ownership / signer changes
+    "DEATH CRTF": "death_cert", "DEATH CR": "death_cert",
+    "DCRE": "court_order", "ORDR": "court_order",
+    "TR CRTF": "trust", "ACPT TR": "trust", "APPT ACPT TR": "trust",
+    "APPT ACP": "trust", "RSGN TR": "trust", "DCLN TRUST": "trust",
+    "DCLN TRU": "trust", "AMDT TRUST": "trust", "AMDT TRU": "trust",
+    "DCLN HMSTD": "homestead", "DCLN HMS": "homestead",
+    "AFFT": "probate",
+    "NOTC": "notice", "NOTC CONTR": "notice", "NOTC CON": "notice",
+    "NOTC LSE": "notice", "NOTC OPTN": "notice", "NOTC OPT": "notice",
+    # deliberately 'other': 6D CRTF, AGRT, AMDT, CRTF, LSE, OPTN, OPTN AGRT,
+    # POA, VOTE, WAVR — surfaced as-is, never guessed into a bucket.
+}
+_CROSSREF_CODE_TOKENS = {tuple(c.split()): k for c, k in _CROSSREF_CODES.items()}
+_CROSSREF_CODE_MAXLEN = max(len(t) for t in _CROSSREF_CODE_TOKENS)
+
+
+def _crossref_code_kind(t: str) -> str | None:
+    """v3.52 — the kind of the LONGEST terse code appearing as whole tokens
+    in `t` (so "DIS LISPN" beats "DIS", "AFFT TAX" beats "AFFT"), or None."""
+    toks = re.findall(r"[A-Z0-9]+", t)
+    for n in range(min(_CROSSREF_CODE_MAXLEN, len(toks)), 0, -1):
+        for i in range(len(toks) - n + 1):
+            kind = _CROSSREF_CODE_TOKENS.get(tuple(toks[i:i + n]))
+            if kind:
+                return kind
+    return None
 
 
 def _classify_cross_reference(text: str) -> str:
     """v3.26 — bucket a cross-reference's instrument text. 'other' when
-    nothing matches: an unrecognised type is surfaced, never dropped."""
+    nothing matches: an unrecognised type is surfaced, never dropped.
+
+    v3.52 — terse Avenu codes are resolved first, as whole tokens, from
+    `_CROSSREF_CODES`; spelled-out labels (ALIS, and the spelled Avenu
+    forms such as "DISCHARGE OF MORTGAGE") fall through to the needles."""
     t = (text or "").upper()
+    kind = _crossref_code_kind(t)
+    if kind:
+        return kind
     for kind, needles in _CROSSREF_KINDS:
         if any(n in t for n in needles):
             return kind
