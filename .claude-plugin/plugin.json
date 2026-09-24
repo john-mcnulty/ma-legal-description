@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "ma-registry",
   "displayName": "MA Registry Tools",
-  "version": "0.5.10",
+  "version": "0.5.11",
   "description": "Finds the vesting deed for a Massachusetts property and extracts a paste-ready legal description from the county registry of deeds.",
   "author": {
     "name": "John McNulty",

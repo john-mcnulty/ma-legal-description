@@ -1,7 +1,35 @@
 #!/usr/bin/env python3
 """
 legal_desc_fetch.py — fast-path for Legal Description Search Workflow
-Version: 3.53
+Version: 3.54
+
+v3.54 changes (item 57 — extraction overlapped with the grantor check):
+
+  On Plymouth, Middlesex South and Suffolk the deed extraction (one API call
+  on the page images) ran in main() only after the runner returned, i.e.
+  strictly after the grantor check, although neither reads the other's
+  output: those grantor checks take their names from the INDEX, and nothing
+  after the image step changes the page list. Each runner now calls an
+  `on_images_ready` hook as soon as its images are saved; main() starts the
+  extraction on a worker thread (_ImageExtractionPrefetch) and joins it
+  before the stamp/address checks and the report draft.
+
+  1. The worker extracts into a SHADOW copy of the result and join() copies
+     back only the keys the extraction changed, so the runner's concurrent
+     writes (notes, grantor_check, status) are never clobbered.
+  2. If the page list or the section (Recorded/Land Court) changed after the
+     start, or the worker failed, the prefetch is discarded with a NOTE and
+     the extraction runs synchronously, exactly as before.
+  3. timings: the stage is labelled "(overlapped with grantor check)", keeps
+     its full `seconds`, and adds only `wall_seconds` (the wait) to
+     total_seconds.
+  Measured live on the item-56 audit parcel (Plymouth, 2 pages, 4 grantor
+  searches): 62.8 s -> 52.0 s; extraction 14.0 s fully hidden (0.0 s wait);
+  same deed, stamp and address verified, legal description byte-identical.
+  Middlesex South (condo unit, 3 pages): 33.5 s -> ~23 s over 3 runs each.
+  Suffolk Recorded Land: 37.1 s -> 30.0 s; Suffolk Registered Land: 35.3 s
+  -> 24.9 s, certificate and Land Court stamp checks unchanged.
+  Deed selection, extraction content and every exit code are unchanged.
 
 v3.53 changes (item 56 — a Plymouth town PLACEHOLDER was read as a town):
 
@@ -4456,6 +4484,7 @@ async def run_plymouth(
     target_book: str = "",
     target_page: str = "",
     verify_grantor_hit: str = "",
+    on_images_ready=None,
 ) -> dict:
     """
     Plymouth County Registry of Deeds — full workflow:
@@ -5330,6 +5359,17 @@ async def run_plymouth(
         # Checks every grantee on the deed as a potential Grantor, not just
         # the named seller.  Catches subsequent deeds by joint tenant co-owners.
         # -----------------------------------------------------------
+        # v3.54 (item 57) — the page images are final here and the grantor
+        # check below reads only index data, so hand the images to the caller
+        # now: main() starts the extraction API call on a worker thread and
+        # joins it after this runner returns.
+        if on_images_ready is not None and result["files"]:
+            try:
+                on_images_ready(result)
+            except Exception as e:
+                result["notes"].append(
+                    f"Early extraction not started (non-fatal): {e}")
+
         _tm.mark("STEP 5 - grantor check")
         all_grantor_rows: list[dict] = []   # v3.50 — read by --verify-grantor-hit
         try:
@@ -5883,6 +5923,7 @@ async def run_middlesex_south(
     headless: bool,
     street_number: str = "",
     street_name: str = "",
+    on_images_ready=None,
 ) -> dict:
     """
     Middlesex South District Registry of Deeds (masslandrecords.com) —
@@ -6134,6 +6175,17 @@ async def run_middlesex_south(
                     result["notes"].append(f"Page {page_num} saved ({method}): {p_path.name}")
                 else:
                     result["errors"].append(f"Page {page_num} download failed.")
+
+            # v3.54 (item 57) — the page images are final here and the grantor
+            # check below reads only index data, so hand the images to the caller
+            # now: main() starts the extraction API call on a worker thread and
+            # joins it after this runner returns.
+            if on_images_ready is not None and result["files"]:
+                try:
+                    on_images_ready(result)
+                except Exception as e:
+                    result["notes"].append(
+                        f"Early extraction not started (non-fatal): {e}")
 
             _tm.mark("STEP 4 - grantor check")
             # -----------------------------------------------------------
@@ -7150,6 +7202,7 @@ async def run_suffolk(
     office: str = "auto",
     force_address_search: bool = False,
     lien_sweep: bool = False,
+    on_images_ready=None,
 ) -> dict:
     """
     Suffolk County Registry of Deeds (masslandrecords.com/suffolk) — fast path
@@ -7734,6 +7787,17 @@ async def run_suffolk(
                     else:
                         result["errors"].append(
                             f"Page {page_num} download failed.")
+
+            # v3.54 (item 57) — the page images are final here and the grantor
+            # check below reads only index data, so hand the images to the caller
+            # now: main() starts the extraction API call on a worker thread and
+            # joins it after this runner returns.
+            if on_images_ready is not None and result["files"]:
+                try:
+                    on_images_ready(result)
+                except Exception as e:
+                    result["notes"].append(
+                        f"Early extraction not started (non-fatal): {e}")
 
             _tm.mark("STEP 6 - grantor check")
             # -----------------------------------------------------------
@@ -10992,30 +11056,140 @@ def _stamp_matches_selection(stamp: str, book, page, *,
     return "match" if (_n(book) in toks and _n(page) in toks) else "mismatch"
 
 
-def _timings_add_stage(result: dict, label: str, seconds: float) -> None:
+def _timings_add_stage(result: dict, label: str, seconds: float,
+                       wall_seconds: float = None) -> None:
     """
     v3.47 — append a stage measured OUTSIDE the runner (inline extraction
     happens in main(), after the runner has already finished its timings)
     to the finished timings block. Swallows everything: a timing bug must
     never be able to fail a run.
+
+    v3.54 (item 57) — `wall_seconds` is what the stage added to the run's
+    wall clock when that differs from its own duration: an extraction that
+    ran alongside the grantor check lists its full `seconds` but adds only
+    the time main() spent waiting for it to finish. Without this the total
+    would count the overlapped seconds twice and hide the saving.
     """
     try:
         t = result.get("timings")
         if not t:
             return
         stage = {"stage": label, "seconds": round(seconds, 2)}
+        if wall_seconds is not None:
+            stage["wall_seconds"] = round(wall_seconds, 2)
         t["stages"].append(stage)
-        t["total_seconds"] = round(t["total_seconds"] + stage["seconds"], 2)
+        add = seconds if wall_seconds is None else wall_seconds
+        t["total_seconds"] = round(t["total_seconds"] + add, 2)
         t["slowest"] = max(t["stages"], key=lambda s: s["seconds"])
     except Exception:
         pass
+
+
+class _ImageExtractionPrefetch:
+    """
+    v3.54 (item 57) — start a browser registry's deed extraction as soon as
+    the page images are on disk, so the Claude API call runs WHILE the
+    grantor check does, not after it.
+
+    Why this is safe: on Plymouth, Middlesex South and Suffolk the grantor
+    check takes its names from the INDEX (the named seller plus the detail
+    panel's grantees) and reads no extracted field, and nothing after the
+    image step changes result["files"]. ALIS already overlaps the other way
+    round (v3.16 prefetches grantor searches during extraction).
+
+    The worker never touches the live result. It extracts into a SHADOW
+    copy with its own notes list, because the runner is appending notes
+    and rewriting keys (grantor_check, status) on the other thread the
+    whole time. join() then copies back only the keys the extraction
+    itself changed, and appends its notes after the runner's. The files
+    list is snapshotted at start; if it no longer matches at join, the
+    prefetched fields describe different images and are thrown away —
+    the caller then extracts synchronously exactly as before.
+
+    Only the API call moves. The stamp, address and Land Court certificate
+    checks stay on the main thread after join(), so they still see the
+    runner's final book/page/document number.
+    """
+
+    def __init__(self) -> None:
+        self._pool = None
+        self._future = None
+        self._files = None
+        self._land_court = None
+
+    @property
+    def started(self) -> bool:
+        return self._future is not None
+
+    def start(self, result: dict) -> None:
+        """Called by a runner right after its image step. Never raises."""
+        try:
+            if self._future is not None or not result.get("files"):
+                return
+            files = list(result["files"])
+            shadow = dict(result)
+            shadow["files"] = files
+            shadow["notes"] = []
+            before = dict(shadow)
+            land_court = bool(result.get("land_court"))
+
+            def _work():
+                t0 = time.perf_counter()
+                _run_pdf_extraction(shadow, land_court=land_court)
+                changed = {k: v for k, v in shadow.items()
+                           if k != "notes" and (k not in before
+                                                or v is not before[k])}
+                return changed, shadow["notes"], time.perf_counter() - t0
+
+            self._files = files
+            self._land_court = land_court
+            self._pool = ThreadPoolExecutor(max_workers=1)
+            self._future = self._pool.submit(_work)
+        except Exception:
+            self._future = None     # join() reports not-started; caller runs it inline
+
+    def join(self, result: dict):
+        """
+        Wait for the worker and merge its output into `result`. Returns
+        (seconds_extracting, seconds_waited), or None when there is nothing
+        usable to merge — never started, failed, or stale — in which case
+        the caller must extract synchronously. Never raises.
+        """
+        if self._future is None:
+            return None
+        try:
+            t0 = time.perf_counter()
+            changed, notes, secs = self._future.result()
+            waited = time.perf_counter() - t0
+            if (list(result.get("files") or []) != self._files
+                    or bool(result.get("land_court")) != self._land_court):
+                result.setdefault("notes", []).append(
+                    "NOTE: the early (overlapped) extraction was discarded — "
+                    "the page images or the section (Recorded Land / Land "
+                    "Court) changed after it started; extracting again on "
+                    "the final selection.")
+                return None
+            result.update(changed)
+            result.setdefault("notes", []).extend(notes)
+            return secs, waited
+        except Exception as e:
+            result.setdefault("notes", []).append(
+                f"NOTE: the early (overlapped) extraction failed to complete "
+                f"({type(e).__name__}: {e}); extracting again inline.")
+            return None
+        finally:
+            try:
+                self._pool.shutdown(wait=False)
+            except Exception:
+                pass
 
 
 def _run_image_extraction(result: dict, *, extract_pdf: bool,
                           extraction_mode: str, mode_note,
                           street_number: str, street_name: str,
                           land_court: bool = False,
-                          stage_label: str = "STEP 6 - inline extraction") -> None:
+                          stage_label: str = "STEP 6 - inline extraction",
+                          prefetch: "_ImageExtractionPrefetch" = None) -> None:
     """
     v3.47 (47b) — inline extraction for a browser registry whose deed pages
     arrive as IMAGES. Same _run_pdf_extraction, same --extraction gating,
@@ -11051,9 +11225,19 @@ def _run_image_extraction(result: dict, *, extract_pdf: bool,
         # distinguishable from one read off the instrument.
         _panel_cert = result.get("certificate_of_title") if land_court else None
 
-        t0 = time.perf_counter()
-        _run_pdf_extraction(result, land_court=land_court)
-        _timings_add_stage(result, stage_label, time.perf_counter() - t0)
+        # v3.54 (item 57) — take the extraction the runner started while
+        # the grantor check ran; fall back to extracting here if it never
+        # started, failed, or went stale.
+        joined = prefetch.join(result) if prefetch is not None else None
+        if joined is not None:
+            secs, waited = joined
+            _timings_add_stage(
+                result, stage_label + " (overlapped with grantor check)",
+                secs, wall_seconds=waited)
+        else:
+            t0 = time.perf_counter()
+            _run_pdf_extraction(result, land_court=land_court)
+            _timings_add_stage(result, stage_label, time.perf_counter() - t0)
         if not result.get("legal_description"):
             return
 
@@ -11301,7 +11485,8 @@ def _finish_image_registry(result: dict, args, output_folder: Path, *,
                            street_number: str, street_name: str,
                            extract_pdf: bool, extraction_mode: str,
                            mode_note,
-                           stage_label: str = "STEP 6 - inline extraction") -> None:
+                           stage_label: str = "STEP 6 - inline extraction",
+                           prefetch: "_ImageExtractionPrefetch" = None) -> None:
     """
     v3.48 (item 42) — the common tail for a browser registry whose deed
     pages arrive as IMAGES: inline extraction, then the Step 6 report
@@ -11326,7 +11511,7 @@ def _finish_image_registry(result: dict, args, output_folder: Path, *,
         mode_note=mode_note, street_number=street_number,
         street_name=street_name,
         land_court=bool(result.get("land_court")),
-        stage_label=stage_label,
+        stage_label=stage_label, prefetch=prefetch,
     )
     try:
         _write_markdown_report(
@@ -15580,6 +15765,11 @@ def main() -> None:
                           "error_message": _PLAYWRIGHT_INSTALL_MSG}))
         sys.exit(1)
 
+    # v3.54 (item 57) — the browser registries start their extraction as
+    # soon as the page images are saved, so it runs during the grantor
+    # check instead of after it. Only when extraction will run at all.
+    _prefetch = _ImageExtractionPrefetch() if extract_pdf else None
+
     if args.registry == "plymouth":
         sn = args.street_number
         st = args.street
@@ -15600,6 +15790,7 @@ def main() -> None:
                 lien_sweep=args.lien_sweep,
                 target_book=args.book or "", target_page=args.page or "",
                 verify_grantor_hit=args.verify_grantor_hit or "",
+                on_images_ready=_prefetch.start if _prefetch else None,
             )
         )
         # v3.47 (47b) — inline extraction + report draft, exactly as the
@@ -15609,7 +15800,7 @@ def main() -> None:
         _finish_image_registry(
             result, args, output_folder, street_number=sn, street_name=st,
             extract_pdf=extract_pdf, extraction_mode=extraction_mode,
-            mode_note=_mode_note,
+            mode_note=_mode_note, prefetch=_prefetch,
         )
         _plymouth_extract_verified_hit(
             result, extract_pdf=extract_pdf, street_number=sn, street_name=st)
@@ -15649,6 +15840,7 @@ def main() -> None:
             run_middlesex_south(
                 args.last, args.first, args.base_name, output_folder,
                 args.headless, street_number=sn, street_name=st,
+                on_images_ready=_prefetch.start if _prefetch else None,
             )
         )
         # v3.48 (item 42) — inline extraction + report draft on the page
@@ -15657,7 +15849,7 @@ def main() -> None:
             result, args, output_folder, street_number=sn, street_name=st,
             extract_pdf=extract_pdf, extraction_mode=extraction_mode,
             mode_note=_mode_note,
-            stage_label="STEP 5 - inline extraction",
+            stage_label="STEP 5 - inline extraction", prefetch=_prefetch,
         )
     elif args.registry == "suffolk":
         # Suffolk is browser-only: masslandrecords sits behind Incapsula, which
@@ -15682,6 +15874,7 @@ def main() -> None:
                 office=args.office,
                 force_address_search=args.force_address_search,
                 lien_sweep=args.lien_sweep,
+                on_images_ready=_prefetch.start if _prefetch else None,
             )
         )
         # v3.48 (item 42) — inline extraction + report draft. The stamp
@@ -15691,7 +15884,7 @@ def main() -> None:
             result, args, output_folder, street_number=sn, street_name=st,
             extract_pdf=extract_pdf, extraction_mode=extraction_mode,
             mode_note=_mode_note,
-            stage_label="STEP 7 - inline extraction",
+            stage_label="STEP 7 - inline extraction", prefetch=_prefetch,
         )
     else:
         result = asyncio.run(run_stub(args.registry))
