@@ -1,7 +1,27 @@
 #!/usr/bin/env python3
 """
 legal_desc_fetch.py — fast-path for Legal Description Search Workflow
-Version: 3.52
+Version: 3.53
+
+v3.53 changes (item 56 — a Plymouth town PLACEHOLDER was read as a town):
+
+  Plymouth writes `SEEBK` ("see book") — and on older rows `NONE` — in the
+  Town cell of trust instruments. _PLYMOUTH_TOWNLESS_CODES already said so,
+  but the grantor-hit classifier never consulted it: the placeholder counted
+  as positive evidence of ANOTHER town (v3.37 located_elsewhere), so a
+  post-acquisition Trustee's Certificate — including one recorded the same
+  day as a deed into trust — was tagged "other town" and demoted out of
+  needs_review with no OWNERSHIP-RELEVANT note. Trustee certificates,
+  appointments and resignations are what decide WHO MUST SIGN.
+
+  1. The classifier reads a placeholder as a blank town (parcel unknown,
+     tagged "no address or town indexed").
+  2. PRE-acquisition placeholder rows stay out of review, as before, so the
+     fix can only ADD post-acquisition rows to the review set.
+  3. An ownership-change hit that could NOT be located to a parcel now gets
+     its own OWNERSHIP-RELEVANT note; the existing note fired only when the
+     index address matched the subject.
+  Deed selection and every exit code are unchanged.
 
 v3.52 changes (cross-reference KIND labels for Plymouth's terse codes):
 
@@ -3941,6 +3961,14 @@ def _plymouth_classify_grantor_hit(row: dict, st_num: str, st_word: str,
     """
     street = (row.get("street") or "").strip()
     town   = (row.get("town") or "").strip().upper()
+    # v3.53 (item 56) — `SEEBK` / `NONE` are PLACEHOLDERS the registry writes
+    # on trust instruments, not towns. Read as a town, a placeholder counted
+    # as positive evidence of ANOTHER town, so a same-day Trustee's
+    # Certificate was demoted out of needs_review — and trustee changes are
+    # exactly what decide WHO MUST SIGN. A placeholder now reads as blank.
+    townless_code = bool(town) and town in _PLYMOUTH_TOWNLESS_CODES
+    if townless_code:
+        town = ""
     town_match = bool(subject_town) and _town_matches_filter(subject_town.upper(), town)
 
     if _alis_address_matches(st_num, st_word, street):
@@ -4006,7 +4034,18 @@ def _plymouth_classify_grantor_hit(row: dict, st_num: str, st_word: str,
         or (significance == "ownership_change" and not pre_acq
             and not located_elsewhere)
     )
-    tag = _PLYMOUTH_HIT_TAGS[parcel] + (" | pre-acquisition" if pre_acq else "")
+    if townless_code and parcel == "unknown_same_town" and pre_acq:
+        # v3.53 (item 56) — before this fix a placeholder row was never in
+        # review; keep that for PRE-acquisition rows (a 1990s BKCY or an old
+        # trust's paperwork cannot convey the subject away) so the fix can
+        # only ADD post-acquisition rows, never flood the set with history.
+        needs_review = False
+    tag = _PLYMOUTH_HIT_TAGS[parcel]
+    if townless_code and parcel == "unknown_same_town":
+        # A blank town matches the subject town by substring, so the tier is
+        # right (cannot be excluded) but "— subject town" would overstate it.
+        tag = "parcel unknown (no address or town indexed)"
+    tag += " | pre-acquisition" if pre_acq else ""
     return {
         "parcel": parcel,
         "pre_acquisition": pre_acq,
@@ -4347,6 +4386,26 @@ def _plymouth_finalize_grantor_check(result: dict, rows: list, st_num: str,
                     "property but is not a conveyance — assess as an encumbrance "
                     "(homestead/lien/mortgage), not as a deed-out."
                 ))
+        # v3.53 (item 56) — the note above keys on a SUBJECT address, so an
+        # ownership-change instrument the index does not locate (a trustee
+        # certificate carries no address) reached needs_review in silence.
+        # Missing information is not a different parcel: say what it is.
+        for r in rows:
+            c = r["classification"]
+            if (c["parcel"] == "subject" or c["pre_acquisition"]
+                    or c.get("conveyance") or not c["needs_review"]
+                    or c.get("significance") != "ownership_change"):
+                continue
+            result["notes"].append(
+                f"OWNERSHIP-RELEVANT: grantor hit Bk{r['book']} "
+                f"Doc#{r['doc_number']} ({r['deed_type']} {r['recorded_date']}) "
+                f"could NOT be located to a parcel ({c['tag']}) — it may be at "
+                "the subject property. This instrument type can change WHO "
+                "OWNS the parcel or WHO MUST SIGN (a trustee certificate, "
+                "appointment or resignation changes the signer; a death "
+                "certificate vests a survivor with no deed). Read it and "
+                "confirm the CURRENT owners and signatories before drafting."
+            )
 
     if not rows:
         result["notes"].append(
