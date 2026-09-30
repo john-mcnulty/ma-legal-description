@@ -1,7 +1,36 @@
 #!/usr/bin/env python3
 """
 legal_desc_fetch.py — fast-path for Legal Description Search Workflow
-Version: 3.54
+Version: 3.55
+
+v3.55 changes (item 63 — ALIS abstracts + tripwire overlapped with extraction):
+
+  On Norfolk and Barnstable (HTTP engine) the grantor searches were already
+  prefetched during the extraction API call (v3.16), but the per-hit
+  registry ABSTRACTS that classify those hits, and the v3.46 Land Court
+  tripwire, still ran strictly after it. One multi-parcel abstract — a town
+  sewer taking listing 97 addresses — takes ~11 s server-side on its own,
+  so a clean run spent 15.5 s of 39.6 s in STEP 7 with every search already
+  in hand.
+
+  1. The STEP 4.5 worker now also fetches the abstracts for the prefetched
+     rows, chosen by the SAME rule STEP 7 uses (split out as
+     _alis_classify_abstract_targets) against the provisional acquisition
+     date. They go into a cache keyed by abstract URL — i.e. by instrument
+     — holding successful fetches only. An abstract belongs to the
+     instrument, not to the acquisition date or the section, so a cached
+     one cannot go stale; STEP 7 still decides which rows need an abstract
+     against the FINAL row and fetches any the cache lacks, and a fetch
+     that failed in the prefetch is retried live.
+  2. The Land Court tripwire reads only the subject address and town, never
+     the selected row; the selection decides only whether it runs. It now
+     starts in STEP 4.5 on its own Session and notes list, and STEP 6.5 uses
+     it only when the FINAL selection is still Recorded Land with no pin.
+     A retarget into Land Court discards it; a failure runs it live.
+  Measured live, same deeds / grantor-check output / tripwire before and
+  after (Norfolk): Recorded Land 30.9 s -> 25.8 s, Registered Land 31.2 s
+  -> 25.3 s. The gain grows with the slowest abstract; nothing is gained in
+  claude-code mode, where there is no extraction to hide behind.
 
 v3.54 changes (item 57 — extraction overlapped with the grantor check):
 
@@ -10177,25 +10206,20 @@ def _alis_grantor_hit_str(r: dict) -> str:
     return s
 
 
-def _alis_classify_fetch_abstracts(base_url: str, rows: list, acq_date: tuple,
-                                   town_code: str, town_name: str,
-                                   notes: list) -> None:
+def _alis_attach_abstract(r: dict, a: dict) -> None:
+    """v3.55 — hang a fetched (or empty) abstract on a grantor-hit row."""
+    r["_abstract"] = a
+    r["abstract_addresses"] = _alis_abstract_address_strings(a)
+    r["abstract_url"] = a.get("url") if a else None
+
+
+def _alis_classify_abstract_targets(rows: list, acq_date: tuple,
+                                    town_code: str, town_name: str):
     """
-    v3.23 — fetch registry abstracts, in parallel, for the grantor-check
-    rows whose classification an address can actually change:
-
-      (a) post-acquisition (or unparseable-date) conveyance hits — the
-          deed-out candidates; the address decides subject vs elsewhere;
-      (b) rows whose Town matches the subject town — the address moves them
-          out of unknown_same_town (the tier that forces needs_review).
-
-    Other-town non-conveyance and pre-acquisition rows classify to excluded
-    tiers with no address, so no GET is spent on them. Land Court rows are
-    included since v3.25 (LC09A/WSKYCD=D keying — same date+ctl fields).
-    Each fetched row gains `_abstract` (cached for STEP 8),
-    `abstract_addresses`, and `abstract_url`. Failures are aggregated into
-    ONE note — a per-row note per failure would flood a 300-hit run when
-    the registry hiccups.
+    v3.23 selection rule, split out in v3.55 so the STEP 4.5 prefetch and
+    the STEP 7 classifier pick rows by the SAME rule. Returns (todo,
+    over_cap): the rows still lacking an abstract whose classification an
+    address can change, highest priority first, capped.
     """
     need = []
     for r in rows:
@@ -10213,31 +10237,90 @@ def _alis_classify_fetch_abstracts(base_url: str, rows: list, acq_date: tuple,
             prio = 0 if (conv and post) else 1
             need.append((prio, (-rd[0], -rd[1], -rd[2]), r))
     need.sort(key=lambda t: (t[0], t[1]))
-    over_cap = len(need) - _ALIS_CLASSIFY_ABSTRACT_CAP
-    todo = [t[2] for t in need[:_ALIS_CLASSIFY_ABSTRACT_CAP]]
-    if not todo:
-        return
+    return ([t[2] for t in need[:_ALIS_CLASSIFY_ABSTRACT_CAP]],
+            len(need) - _ALIS_CLASSIFY_ABSTRACT_CAP)
+
+
+def _alis_fetch_abstracts_parallel(base_url: str, rows: list) -> dict:
+    """
+    v3.55 — fetch abstracts for `rows` in parallel (own Session per worker)
+    and set r["_abstract"] on each ({} on failure). Returns {url: abstract}
+    for the fetches that SUCCEEDED; a failure is never returned, so a later
+    live pass retries it instead of inheriting the miss.
+    """
+    got = {}
+    if not rows:
+        return got
 
     def _worker(chunk):
         s = requests.Session()
         for r in chunk:
             a = _alis_fetch_abstract_http(s, base_url, r)
             r["_abstract"] = a
-            r["abstract_addresses"] = _alis_abstract_address_strings(a)
-            r["abstract_url"] = a.get("url") if a else None
+            if a and a.get("url"):
+                got[a["url"]] = a
 
-    workers = min(_ALIS_CLASSIFY_WORKERS, len(todo))
-    chunks = [todo[i::workers] for i in range(workers)]
+    workers = min(_ALIS_CLASSIFY_WORKERS, len(rows))
+    chunks = [rows[i::workers] for i in range(workers)]
     with ThreadPoolExecutor(max_workers=workers) as pool:
         # list() so worker exceptions propagate to the caller's try/except.
         list(pool.map(_worker, chunks))
+    return got
 
-    with_addr = sum(1 for r in todo if r.get("abstract_addresses"))
+
+def _alis_classify_fetch_abstracts(base_url: str, rows: list, acq_date: tuple,
+                                   town_code: str, town_name: str,
+                                   notes: list,
+                                   abstract_cache: dict = None) -> None:
+    """
+    v3.23 — fetch registry abstracts, in parallel, for the grantor-check
+    rows whose classification an address can actually change:
+
+      (a) post-acquisition (or unparseable-date) conveyance hits — the
+          deed-out candidates; the address decides subject vs elsewhere;
+      (b) rows whose Town matches the subject town — the address moves them
+          out of unknown_same_town (the tier that forces needs_review).
+
+    Other-town non-conveyance and pre-acquisition rows classify to excluded
+    tiers with no address, so no GET is spent on them. Land Court rows are
+    included since v3.25 (LC09A/WSKYCD=D keying — same date+ctl fields).
+    Each fetched row gains `_abstract` (cached for STEP 8),
+    `abstract_addresses`, and `abstract_url`. Failures are aggregated into
+    ONE note — a per-row note per failure would flood a 300-hit run when
+    the registry hiccups.
+    """
+    # v3.55 (item 63) — attach any abstract the STEP 4.5 prefetch already
+    # fetched. An abstract is a property of the INSTRUMENT (keyed by its
+    # recording date + control number), not of the acquisition date or the
+    # section, so a prefetched one never goes stale; only WHICH rows need
+    # one depends on the final acquisition date, and that is decided below
+    # exactly as before. A row the prefetch did not cover is fetched live.
+    cached = []
+    if abstract_cache:
+        for r in rows:
+            if "_abstract" in r:
+                continue
+            a = abstract_cache.get(_alis_abstract_url(base_url, r))
+            if a:
+                _alis_attach_abstract(r, a)
+                cached.append(r)
+
+    todo, over_cap = _alis_classify_abstract_targets(rows, acq_date,
+                                                     town_code, town_name)
+    if not todo and not cached:
+        return
+    _alis_fetch_abstracts_parallel(base_url, todo)
+    for r in todo:
+        _alis_attach_abstract(r, r.get("_abstract") or {})
+
+    fetched = cached + todo
+    with_addr = sum(1 for r in fetched if r.get("abstract_addresses"))
     failed = sum(1 for r in todo if not r.get("_abstract"))
     notes.append(
-        f"Grantor-hit classification (v3.23): fetched {len(todo)} registry "
+        f"Grantor-hit classification (v3.23): fetched {len(fetched)} registry "
         f"abstract(s) ({with_addr} carried an address"
         + (f", {failed} failed/empty" if failed else "")
+        + (f"; {len(cached)} prefetched during extraction" if cached else "")
         + ")"
         + (f"; {over_cap} lower-priority row(s) beyond the "
            f"{_ALIS_CLASSIFY_ABSTRACT_CAP}-abstract cap classified from "
@@ -10248,7 +10331,8 @@ def _alis_classify_fetch_abstracts(base_url: str, rows: list, acq_date: tuple,
 
 
 def _alis_finalize_grantor_check(result: dict, rows: list, base_name: str,
-                                 town_code: str, base_url: str) -> None:
+                                 town_code: str, base_url: str,
+                                 abstract_cache: dict = None) -> None:
     """
     v3.23 — classify, order and summarise the ALIS grantor-check hits,
     mutating `result` in place (Plymouth v3.21 parity — same JSON shape:
@@ -10277,7 +10361,8 @@ def _alis_finalize_grantor_check(result: dict, rows: list, base_name: str,
         try:
             _alis_classify_fetch_abstracts(base_url, rows, acq_date,
                                            town_code, town_name,
-                                           result["notes"])
+                                           result["notes"],
+                                           abstract_cache=abstract_cache)
         except Exception as e:
             result["notes"].append(
                 f"Grantor-hit abstract fetch failed (non-fatal — hits with "
@@ -13613,11 +13698,64 @@ def run_alis_http(
                     f"failed (non-fatal, will search live): {e}"
                 )
 
+        # v3.55 (item 63) — fetch the grantor-hit ABSTRACTS for the rows
+        # just prefetched, still during extraction. STEP 7 used to fetch them
+        # only after extraction finished, and one multi-parcel abstract (a
+        # town sewer taking listing 97 addresses) takes ~11 s server-side on
+        # its own. Same selection rule as STEP 7 (_alis_classify_abstract_
+        # targets), applied to the provisional acquisition date; the rows are
+        # COPIED so nothing STEP 7 reads is mutated here. The cache holds
+        # successful fetches only and is keyed by abstract URL (= the
+        # instrument), so it cannot go stale: STEP 7 re-decides which rows
+        # need an abstract against the FINAL row and fetches any it lacks.
+        try:
+            ab_num, ab_word = _parse_street_from_base_name(base_name)
+            if ab_num and ab_word:
+                seen_urls, pf_rows = set(), []
+                for entry in prefetched.values():
+                    for r in entry["rows"]:
+                        u = _alis_abstract_url(base_url, r)
+                        if u and u not in seen_urls:
+                            seen_urls.add(u)
+                            pf_rows.append(dict(r))
+                todo, _ = _alis_classify_abstract_targets(
+                    pf_rows, _parse_deed_date(result.get("recorded_date") or ""),
+                    town, _parse_town_from_base_name(base_name))
+                abstract_cache.update(
+                    _alis_fetch_abstracts_parallel(base_url, todo))
+        except Exception as e:
+            prefetch_notes.append(
+                f"Grantor-hit abstract prefetch failed (non-fatal, will "
+                f"fetch live): {e}")
+
+    abstract_cache = {}
     try:
-        prefetch_pool = ThreadPoolExecutor(max_workers=1)
+        prefetch_pool = ThreadPoolExecutor(max_workers=2)
         prefetch_future = prefetch_pool.submit(_prefetch_grantor_searches)
     except Exception as e:
         result["notes"].append(f"Grantor-search prefetch not started (non-fatal): {e}")
+
+    # v3.55 (item 63) — the Land Court tripwire reads only the subject
+    # address and town (from --base-name), never the selected row; the
+    # selection decides only WHETHER it runs (Recorded Land, no pin). So it
+    # starts now, on its own Session and its own notes list, and STEP 6.5
+    # uses the answer only if the FINAL selection is still Recorded Land.
+    # A retarget into Land Court discards it; one out of Land Court runs it
+    # live, exactly as before.
+    tripwire_future, tripwire_notes = None, []
+    if (land_court_tripwire and prefetch_pool is not None
+            and not result.get("land_court") and not target_book):
+        def _prefetch_tripwire():
+            _n, _w = _parse_street_from_base_name(base_name)
+            _st = _street_words_from_base_name(base_name) or _w
+            return _alis_land_court_tripwire(requests.Session(), base_url,
+                                             _n, _st, town, tripwire_notes)
+        try:
+            tripwire_future = prefetch_pool.submit(_prefetch_tripwire)
+        except Exception as e:
+            result["notes"].append(
+                f"Land Court tripwire prefetch not started (non-fatal, will "
+                f"run live): {e}")
 
     _tm.mark("STEP 5 - PDF extraction")
     # -----------------------------------------------------------
@@ -13971,7 +14109,20 @@ def run_alis_http(
             "Land Court tripwire (v3.46): DISABLED for this run (--no-land-court-tripwire). "
             "No conclusion about registered land at this address."
         )
-    if land_court_tripwire and not result.get("land_court") and not target_book:
+    _tw_done = False
+    if (tripwire_future is not None and land_court_tripwire
+            and not result.get("land_court") and not target_book):
+        # v3.55 (item 63) — prefetched during extraction; still valid because
+        # the final selection is Recorded Land, which is all it depends on.
+        try:
+            result["land_court_tripwire"] = tripwire_future.result()
+            result["notes"].extend(tripwire_notes)
+            _tw_done = True
+        except Exception as _tw_exc:                      # noqa: BLE001
+            result["notes"].append(
+                f"Land Court tripwire prefetch failed ({_tw_exc}) — running it live.")
+    if (land_court_tripwire and not _tw_done and not result.get("land_court")
+            and not target_book):
         try:
             _tw_num, _tw_word = _parse_street_from_base_name(base_name)
             _tw_street = _street_words_from_base_name(base_name) or _tw_word
@@ -14198,7 +14349,8 @@ def run_alis_http(
             # .needs_review and .summary, and emits the subject /
             # possible-subject notes.
             _alis_finalize_grantor_check(result, grantor_rows, base_name,
-                                         town, base_url)
+                                         town, base_url,
+                                         abstract_cache=abstract_cache)
         elif result["grantor_check"].get("incomplete_searches"):
             # v3.20 — Keegan: a truncated check with zero hits in the rows
             # that DID come back is not a clean-title finding.
