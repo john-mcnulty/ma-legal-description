@@ -1,7 +1,75 @@
 #!/usr/bin/env python3
 """
 legal_desc_fetch.py — fast-path for Legal Description Search Workflow
-Version: 3.55
+Version: 3.56
+
+v3.56 changes (item 64 — faster, more accurate deed extraction; the
+description's end point; early co-owner searches; the registry busy page):
+
+  Chosen by a private 9-deed x 3-run benchmark (tools/extraction_benchmark.py)
+  against hand-verified transcriptions, then live A/B runs against v3.55.
+
+  1. MAIN EXTRACTION MODEL: claude-opus-4-8 -> claude-opus-5-5 at effort
+     "low" (median 13.2 s -> 9.5 s, ~17% cheaper per call). Accuracy was
+     equal on modern deeds and BETTER on a 1974 typed deed with a broken
+     middle initial ("H." read correctly 3/3; Opus 4.8 read "E."/"N." 2/3),
+     and on a live retarget Opus 4.8 once returned "legal description NOT
+     FOUND" where Opus 5.5 read it on every run. Opus 5.5 cannot switch
+     thinking off, so the per-model request shape now lives in
+     _model_request_kwargs(); an override back to claude-opus-4-8
+     reproduces the previous request exactly. The Claude 5 family also gets
+     the server-side refusal fallback. Sonnet 5.5 was faster still but
+     dropped words and whole paragraphs of the description — rejected.
+     Fixed on the way: `--model-main` never reached the main extraction
+     (the default was bound at import); only the environment variable
+     worked.
+  2. WHERE THE LEGAL DESCRIPTION ENDS (the user's rule, 2026-09-30). It
+     INCLUDES the premises, rights and encumbrances (together with /
+     subject to), condominium terms, and exceptions ("excepting the land
+     conveyed to ..."), and it EXCLUDES the source-of-title reference
+     ("For title, see", "Being the same premises", "Meaning and intending"
+     + the recording reference) and the grantor statements that are not
+     about the land (homestead, corporate excise tax, c.156D assets,
+     marital status). Excluded text is still CAPTURED: the source of title
+     verbatim in prior_deed_reference (the previous deed in the chain, for
+     the title-search workflows) and each grantor statement, verbatim and
+     typed, in the new `grantor_statements` list, which the report renders.
+     A rights clause after a recital is kept; a sentence that mixes the
+     description with the source of title is kept whole (never cut) and
+     also copied to prior_deed_reference; a condo unit deed starts at its
+     unit-identifying lines. Benchmark: run-to-run variation on the
+     boundary disappeared (3/3 identical on every deed that varied).
+  3. EARLY CO-OWNER SEARCHES (Norfolk, Barnstable). STEP 4.5 now prefetches
+     the whole grantor-search list that can be known before extraction —
+     seller, indexed grantee, every party the registry abstract names, and
+     each owner's deed-out net — in parallel; before, only the seller and
+     the seller's net were prefetched, one after the other, and every
+     co-owner waited for extraction. A parties-only call on Sonnet 5.5 runs
+     beside the main extraction (~3 s; 27/27 correct in the benchmark,
+     where Haiku 4.5 misread a 1974 deed's parties 3/3) and prefetches any
+     co-owner only the deed names. The list is built by one shared function
+     (_alis_build_grantor_name_pairs) at all three points, so a prefetched
+     search is consumed only when STEP 7 builds the identical search, and
+     the v3.29/v3.45 window and section guards still discard stale sets.
+     Its grantees are cross-checked against the main extraction's, first
+     and last name both ways; a disagreement is a WARNING. Also works with
+     no API: the abstract's co-owners are prefetched in claude-code mode.
+     Live, co-owner deed (Norfolk): 22.5 s -> 17 s, STEP 7 ~6.5 s -> ~0.
+  4. THE REGISTRY BUSY PAGE (found while testing 3, and it predates it).
+     Under load ALIS answers HTTP 200 with a ~600-byte "Land Recs -Error
+     Message" page ("The server is unable to handle this request at this
+     time"). Nothing recognised it, so it parsed as ZERO ROWS: two live runs
+     reported a grantor search as "0 row(s), ok" for names with 4 and 10
+     rows — a silent false clean. _alis_http_get now detects it, retries
+     with back-off, and raises AlisServerBusyError, so a grantor search
+     lands in incomplete_searches, an abstract reads "parcel unknown", and a
+     grantee search exits registry_unavailable (no Playwright fallback).
+     ALIS requests are also capped at 4 in flight per process. Stress test
+     (6 bursts): before, 17 of 30 searches silently returned 0; after, 22
+     correct and 8 raised, 0 silent.
+  Not changed: a deed whose run is bounded by a slow abstract (one listing
+  97 addresses takes ~11 s server-side) gains little, because the run
+  already waits for that fetch rather than for extraction.
 
 v3.55 changes (item 63 — ALIS abstracts + tripwire overlapped with extraction):
 
@@ -1803,6 +1871,8 @@ except ImportError:
     anthropic = None
 
 import base64
+import random
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 
@@ -8600,6 +8670,50 @@ def _alis_registry_unavailable_html(html: str) -> bool:
             and ("maintenance" in lowered or "backup" in lowered))
 
 
+class AlisServerBusyError(RuntimeError):
+    """
+    v3.56 (item 64) — the registry answered with its "server is unable to
+    handle this request at this time" page. See _alis_server_busy_html.
+    A RuntimeError on purpose: a grantor search that raises is recorded as
+    an ERROR and lands in `incomplete_searches` (v3.29), an abstract that
+    raises is "parcel unknown" (v3.20), and the grantee search falls back
+    as it does for any HTTP failure. Every one of those is the safe reading;
+    the unsafe one — "0 rows, nothing indexed" — is what this page used to
+    produce.
+    """
+
+
+def _alis_server_busy_html(html: str) -> bool:
+    """
+    v3.56 (item 64) — True if `html` is the ALIS "busy" page: a ~600-byte
+    HTTP 200 document titled "Land Recs -Error Message" whose only content
+    is a script alert, "The server is unable to handle this request at this
+    time", followed by history.go(-1). It has no results table, so every
+    row parser read it as ZERO ROWS.
+
+    Measured live 2026-09-30 on norfolkresearch.org: after a burst of
+    parallel searches and abstract fetches the registry served this page
+    for every request for a while (6 bursts: 2 clean, 1 partial, 3 wholly
+    empty). Two live runs that day reported a grantor search as
+    "0 row(s), ok" for names that return 4 and 10 rows — a silent false
+    clean on exactly the check this workflow exists for.
+    """
+    if not html or len(html) > 4096:
+        return False
+    lowered = html.lower()
+    return ("unable to handle this request" in lowered
+            or "land recs -error message" in lowered)
+
+
+# v3.56 (item 64) — at most this many ALIS requests in flight per process.
+# The v3.56 prefetch runs a run's whole grantor-search list and its
+# abstracts during extraction; unbounded, a burst of that plus the tripwire
+# is what the registry answers with its busy page. Four keeps the previous
+# release's peak (STEP 7's four-way search pool) as the ceiling.
+_ALIS_MAX_CONCURRENT = 4
+_ALIS_CONCURRENCY = threading.BoundedSemaphore(_ALIS_MAX_CONCURRENT)
+
+
 def _alis_http_get(session, url: str, params=None, timeout: int = 30,
                    retries: int = 3):
     """
@@ -8621,17 +8735,29 @@ def _alis_http_get(session, url: str, params=None, timeout: int = 30,
     last_err = None
     saw_maintenance = False
     last_was_conn_err = False
-    for attempt in range(retries):
+    last_was_busy = False
+    # v3.56 — the busy page gets extra attempts and a longer back-off: it
+    # clears on its own once the request rate drops, and every attempt here
+    # is cheaper than a grantor check reported INCOMPLETE.
+    attempts = retries
+    attempt = 0
+    while attempt < attempts:
         last_was_conn_err = False
+        last_was_busy = False
         try:
-            resp = session.get(url, params=params, headers=_ALIS_HTTP_HEADERS,
-                               timeout=timeout)
+            with _ALIS_CONCURRENCY:
+                resp = session.get(url, params=params,
+                                   headers=_ALIS_HTTP_HEADERS, timeout=timeout)
             if resp.status_code == 200:
                 ctype = resp.headers.get("Content-Type", "")
                 if ("html" in ctype
                         and _alis_registry_unavailable_html(resp.text)):
                     saw_maintenance = True
                     last_err = "registry maintenance page"
+                elif "html" in ctype and _alis_server_busy_html(resp.text):
+                    last_was_busy = True
+                    last_err = "registry busy page ('unable to handle this request')"
+                    attempts = max(attempts, retries + 2)
                 else:
                     return resp
             else:
@@ -8641,8 +8767,15 @@ def _alis_http_get(session, url: str, params=None, timeout: int = 30,
             last_err = str(e)
         except Exception as e:
             last_err = str(e)
-        if attempt < retries - 1:
-            time.sleep(1.5 * (attempt + 1))
+        attempt += 1
+        if attempt < attempts:
+            time.sleep((3.0 * attempt if last_was_busy else 1.5 * attempt)
+                       + random.uniform(0, 0.5))
+    if last_was_busy:
+        raise AlisServerBusyError(
+            f"Registry returned its BUSY page ('The server is unable to handle "
+            f"this request at this time') on {attempts} attempts. This is NOT "
+            f"an empty result — the request was not answered. URL: {url}")
     if saw_maintenance:
         raise AlisRegistryUnavailableError(
             f"Registry is offline for maintenance (nightly backup / periodic "
@@ -10512,13 +10645,36 @@ def _alis_finalize_grantor_check(result: dict, rows: list, base_name: str,
 # These are defaults, not pins. Override per run with --model-main /
 # --model-light, or set MA_REGISTRY_MODEL_MAIN / MA_REGISTRY_MODEL_LIGHT in
 # the environment, so a newer model can be adopted without editing the script.
-_EXTRACT_MODEL_MAIN_DEFAULT  = "claude-opus-4-8"
-_EXTRACT_MODEL_LIGHT_DEFAULT = "claude-haiku-4-5-20251001"
+#
+# v3.56 (item 64) — the main tier moved from claude-opus-4-8 to
+# claude-opus-5-5 at effort "low", chosen by a 9-deed x 3-rep benchmark
+# (private tools/extraction_benchmark.py): median 13.2 s -> 9.5 s, ~17%
+# cheaper per call, equal on modern deeds and BETTER on a 1974 typed deed
+# with a broken middle initial (read correctly 3/3 against 1/3 for 4.8).
+# Opus 5.5 thinking cannot be disabled; effort is the only control, and its
+# default ("medium") is slower — so the effort is set explicitly, per model,
+# in _model_request_kwargs(). Sonnet 5.5 was faster still but dropped words
+# and whole paragraphs of the description, so it is NOT a main-tier model.
+#
+# v3.56 — a third tier, PARTIES: a parties-only call (grantors/grantees)
+# that runs alongside the main extraction so the co-owner grantor searches
+# can start seconds earlier. Sonnet 5.5 was 27/27 correct at a 3 s median;
+# Haiku 4.5 misread the 1974 deed's parties 3/3 ("AILEEN", "JANE S."), so
+# the cheap tier is not good enough here.
+_EXTRACT_MODEL_MAIN_DEFAULT    = "claude-opus-5-5"
+_EXTRACT_MODEL_LIGHT_DEFAULT   = "claude-haiku-4-5-20251001"
+_EXTRACT_MODEL_PARTIES_DEFAULT = "claude-sonnet-5-5"
 
 _EXTRACT_MODEL_MAIN = os.environ.get(
     "MA_REGISTRY_MODEL_MAIN", _EXTRACT_MODEL_MAIN_DEFAULT)
 _EXTRACT_MODEL_LIGHT = os.environ.get(
     "MA_REGISTRY_MODEL_LIGHT", _EXTRACT_MODEL_LIGHT_DEFAULT)
+_EXTRACT_MODEL_PARTIES = os.environ.get(
+    "MA_REGISTRY_MODEL_PARTIES", _EXTRACT_MODEL_PARTIES_DEFAULT)
+
+# v3.56 — effort for the Claude 5 family (thinking always on for Opus 5.5).
+# "low" is what the benchmark measured; override for an experiment only.
+_EXTRACT_EFFORT = os.environ.get("MA_REGISTRY_EXTRACT_EFFORT", "low")
 
 _DEED_SCHEMA = {
     "type": "object",
@@ -10527,25 +10683,56 @@ _DEED_SCHEMA = {
             "type": ["string", "null"],
             "description": (
                 "The full legal description of the premises, transcribed "
-                "verbatim from the body of the deed: metes and bounds, lot "
-                "and plan references, condominium unit recitals including "
-                "the master deed reference, appurtenant rights, and any "
-                "'subject to' clauses that are part of the description. "
+                "verbatim from the body of the deed. "
+                "START with the words that introduce the premises, after "
+                "the granting clause and covenants (e.g. 'The land located "
+                "in ...', 'the land, with any buildings thereon situated in "
+                "... bounded and described as follows:', 'A certain parcel "
+                "of land ...'). On a condominium UNIT deed whose unit, "
+                "percentage interest, unit address and master deed are "
+                "identified in a header or inside the granting clause, "
+                "START at those unit-identifying lines instead, granting "
+                "clause included. "
+                "INCLUDE every part that describes the premises or the "
+                "rights and burdens that go with them: metes and bounds, "
+                "lot and plan references, area statements, condominium unit "
+                "recitals (master deed, unit, percentage interest, "
+                "appurtenant rights, restrictions, by-laws and rules), "
+                "easements and rights of way granted or reserved "
+                "('together with ...'), encumbrances ('subject to ...'), "
+                "any EXCEPTION or exclusion from the premises ('excepting "
+                "the land conveyed to ... by deed recorded at ...'), and "
+                "notes such as 'now known as ...'. "
+                "LEAVE OUT, even where they sit between parts of the "
+                "description: (1) the source-of-title reference — the "
+                "'For title, see ...', 'Being the same premises conveyed "
+                "to ...', or 'Meaning and intending to convey ...' sentence "
+                "and the recording reference that follows it — which goes "
+                "in prior_deed_reference; (2) grantor statements that are "
+                "not about the land — homestead release/waiver or "
+                "declaration, corporate excise tax recital, M.G.L. c.156D "
+                "'all or substantially all of its assets' statement, "
+                "marital-status statements, and similar — which go in "
+                "grantor_statements; (3) the testimonium, execution, "
+                "signature, witness, notary and acknowledgment blocks, and "
+                "any recording or excise stamp. "
+                "A rights, encumbrance or exception clause that comes AFTER "
+                "a source-of-title reference or a grantor statement is "
+                "still part of the description: skip only the excluded "
+                "sentence and keep going. If ONE sentence both describes "
+                "the premises (a plan, lot, easement or exception) and "
+                "recites the source of title, keep that whole sentence in "
+                "the description — never cut a sentence apart — and ALSO "
+                "put it in prior_deed_reference. If you cannot tell whether "
+                "a sentence is part of the description, INCLUDE it. "
                 "Preserve the original wording and punctuation EXACTLY — "
-                "do not correct apparent typos or unusual punctuation. "
+                "do not correct apparent typos or unusual punctuation, and "
+                "transcribe interlineated (typed-above-the-line) words where "
+                "they belong in the sentence. "
                 "Preserve the instrument's line breaks as newline "
                 "characters and its paragraph breaks as blank lines, so "
                 "the text can be checked line-for-line against the page "
                 "images. "
-                "STOP AT THE END OF THE DESCRIPTION. Do NOT include: the "
-                "homestead release or declaration; the execution, signature, "
-                "witness, notary or acknowledgment blocks; the recording or "
-                "excise stamp; or the derivation clause ('Meaning and "
-                "intending to convey the same premises conveyed to the "
-                "grantor by deed recorded at ...'), which is captured "
-                "separately in prior_deed_reference. Those follow the "
-                "description rather than forming part of it, and including "
-                "them makes the output vary between runs of the same deed. "
                 "Null only if no legal description appears."
             ),
         },
@@ -10646,9 +10833,44 @@ _DEED_SCHEMA = {
         "prior_deed_reference": {
             "type": ["string", "null"],
             "description": (
-                "The derivation clause: 'Being the same premises conveyed "
-                "to the grantor by deed ... recorded at Book NNNN, Page "
-                "NNN' (or a Land Court document/certificate reference)."
+                "The source-of-title reference, transcribed VERBATIM and "
+                "in full: the 'For title, see ...', 'Being the same "
+                "premises conveyed to ...' or 'Meaning and intending to "
+                "convey ...' sentence(s) together with the recording "
+                "reference of the deed into the grantor (Book/Page, or a "
+                "Land Court document/certificate number, and any date). If "
+                "the deed has more than one such sentence, include each. "
+                "Null if the deed has none."
+            ),
+        },
+        "grantor_statements": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["homestead", "corporate_excise_tax",
+                                 "c156d_assets", "marital_status", "other"],
+                    },
+                    "text": {"type": "string"},
+                },
+                "required": ["kind", "text"],
+                "additionalProperties": False,
+            },
+            "description": (
+                "Every statement by the grantor that is NOT about the land "
+                "and is therefore left out of legal_description, each "
+                "transcribed VERBATIM with its kind: 'homestead' (release, "
+                "waiver, or statement that the property is or is not "
+                "homestead property), 'corporate_excise_tax' (e.g. a "
+                "corporation or LLC reciting that the corporate excise tax "
+                "has been paid or is not a lien), 'c156d_assets' (the "
+                "M.G.L. c.156D 'does not constitute all or substantially "
+                "all of its assets' statement), 'marital_status', or "
+                "'other'. Do not include the source-of-title reference "
+                "(prior_deed_reference) or the signature/acknowledgment "
+                "blocks. Empty array if none."
             ),
         },
         "title_flags": {
@@ -10668,8 +10890,21 @@ _DEED_SCHEMA = {
         "legal_description", "property_address", "document_number",
         "certificate_of_title", "consideration", "signing_date",
         "recording_stamp", "grantors_full", "grantees_full", "tenancy",
-        "prior_deed_reference", "title_flags",
+        "prior_deed_reference", "grantor_statements", "title_flags",
     ],
+    "additionalProperties": False,
+}
+
+# v3.56 (item 64) — the parties-only call. The two properties are copied
+# from _DEED_SCHEMA so the wording (full names, capacity language) cannot
+# drift between the two calls that are cross-checked against each other.
+_PARTIES_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "grantors_full": _DEED_SCHEMA["properties"]["grantors_full"],
+        "grantees_full": _DEED_SCHEMA["properties"]["grantees_full"],
+    },
+    "required": ["grantors_full", "grantees_full"],
     "additionalProperties": False,
 }
 
@@ -10905,12 +11140,20 @@ _IMAGE_MEDIA_TYPES = {
 
 def _extract_pdf_fields(client, pdf_paths: list, schema: dict,
                         instruction: str,
-                        model: str = _EXTRACT_MODEL_MAIN) -> dict:
+                        model: str = None) -> dict:
     """
     Send the given pages of one instrument (PDFs, or page images since
     v3.47) to Claude with a structured-output schema and return the parsed
     field dict. Raises on API/parse failure — callers wrap.
+
+    v3.56 — `model` defaults to None and is resolved HERE, at call time.
+    It used to default to `_EXTRACT_MODEL_MAIN` in the signature, which
+    Python evaluates once at import — so `--model-main` (which rebinds the
+    global inside main()) never reached this function and the main deed
+    was always extracted on the import-time model. Only the environment
+    variable, read before the def, ever worked.
     """
+    model = model or _EXTRACT_MODEL_MAIN
     content = []
     for p in pdf_paths:
         data = base64.standard_b64encode(Path(p).read_bytes()).decode("utf-8")
@@ -10929,9 +11172,8 @@ def _extract_pdf_fields(client, pdf_paths: list, schema: dict,
             })
     content.append({"type": "text", "text": instruction})
 
-    response = client.messages.create(
-        model=model,
-        max_tokens=8000,
+    response = _messages_create(
+        client, model,
         system=_EXTRACT_SYSTEM,
         output_config={"format": {"type": "json_schema", "schema": schema}},
         messages=[{"role": "user", "content": content}],
@@ -10942,6 +11184,67 @@ def _extract_pdf_fields(client, pdf_paths: list, schema: dict,
         raise RuntimeError("extraction output truncated (max_tokens)")
     text = next(b.text for b in response.content if b.type == "text")
     return json.loads(text)
+
+
+def _model_request_kwargs(model: str) -> dict:
+    """
+    v3.56 (item 64) — the per-model request shape. The Claude 5 family
+    (Opus 5 / 5.5, Sonnet 5 / 5.5, Fable) thinks by default and is steered
+    by `output_config.effort`; Opus 5.5 rejects any attempt to switch
+    thinking off, so effort is the lever and it is set explicitly (its
+    default, "medium", is measurably slower than the "low" the benchmark
+    chose). Thinking tokens count against max_tokens, hence 16000.
+    Sonnet 5.5 is sent `between_tools` — its only thinking-off form — which
+    is how the parties call was benchmarked.
+
+    Every other model (Opus 4.x, Haiku 4.5, an older override) gets EXACTLY
+    the pre-v3.56 request: no thinking parameter, no effort, max_tokens
+    8000. An override back to claude-opus-4-8 therefore reproduces the
+    previous release byte for byte.
+    """
+    m = (model or "").lower()
+    if m.startswith(("claude-opus-5", "claude-sonnet-5", "claude-fable-5")):
+        kw = {"max_tokens": 16000, "effort": _EXTRACT_EFFORT}
+        if m.startswith("claude-sonnet-5"):
+            kw["thinking"] = {"type": "between_tools"}
+        return kw
+    return {"max_tokens": 8000}
+
+
+def _messages_create(client, model: str, *, output_config: dict, **kw):
+    """
+    v3.56 — one Messages API call with the per-model shape from
+    _model_request_kwargs(). On the Claude 5 family the server-side refusal
+    fallback is enabled (`fallbacks: "default"`): a safety classifier can
+    decline a request at HTTP 200 with stop_reason "refusal", and a deed is
+    a benign document that should be re-run on a fallback model rather
+    than fail the extraction. If the fallback beta itself is rejected (an
+    older SDK, a platform without it) the call is retried once without it,
+    so the fallback can only ever ADD resilience.
+    """
+    shape = _model_request_kwargs(model)
+    oc = dict(output_config)
+    if shape.get("effort"):
+        oc["effort"] = shape["effort"]
+    req = dict(model=model, max_tokens=shape["max_tokens"],
+               output_config=oc, **kw)
+    if shape.get("thinking"):
+        req["thinking"] = shape["thinking"]
+    if not shape.get("effort"):
+        return client.messages.create(**req)
+    try:
+        return client.beta.messages.create(
+            betas=["server-side-fallback-2026-07-01"], fallbacks="default",
+            **req)
+    except Exception as e:
+        # Only a rejection of the fallback PARAMETER is retried; every
+        # other failure (credit, auth, rate limit, 5xx) propagates unchanged
+        # so _extraction_fatal_reason and the SDK's own retries still see it.
+        msg = str(e).lower()
+        if getattr(e, "status_code", None) == 400 and (
+                "fallback" in msg or "beta" in msg):
+            return client.messages.create(**req)
+        raise
 
 
 def _extract_pdf_fields_light(client, pdf_paths: list, schema: dict,
@@ -10993,7 +11296,8 @@ def _mark_extraction_unavailable(result: dict, exc) -> None:
         )
 
 
-def _run_pdf_extraction(result: dict, land_court: bool) -> None:
+def _run_pdf_extraction(result: dict, land_court: bool,
+                        on_parties=None) -> None:
     """
     v3.10 — extract structured fields from the downloaded deed PDFs and the
     multi-candidate page-1 samples, concurrently. Mutates `result` in place:
@@ -11001,6 +11305,16 @@ def _run_pdf_extraction(result: dict, land_court: bool) -> None:
     top level, fills index nulls, and annotates candidate entries with
     "sample_extraction". Fails soft: on any error sets
     result["extraction_error"] and a fallback note; never raises.
+
+    v3.56 (item 64) — `on_parties`: when given (the ALIS engine passes it),
+    a PARTIES-ONLY call on _EXTRACT_MODEL_PARTIES runs alongside the main
+    call and `on_parties(fields)` is invoked the moment it returns, so the
+    co-owner grantor searches start ~3 s in instead of after the ~10 s main
+    extraction. The two calls' grantees are then cross-checked (a
+    disagreement is a WARNING — two independent readings of the same names
+    that differ is exactly what a human should look at), and if the MAIN
+    call fails the parties call's names still feed the co-owner check. The
+    parties call can never fail a run.
     """
     client, reason = _anthropic_client()
     if client is None:
@@ -11018,11 +11332,36 @@ def _run_pdf_extraction(result: dict, land_court: bool) -> None:
     )
 
     jobs = {}
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    with ThreadPoolExecutor(max_workers=5) as pool:
         jobs["deed"] = pool.submit(
             _extract_pdf_fields, client, result["files"], _DEED_SCHEMA,
             deed_instruction,
         )
+        parties_model = _EXTRACT_MODEL_PARTIES
+        if on_parties is not None and parties_model and parties_model.lower() != "none":
+            def _parties_job():
+                t0 = time.perf_counter()
+                # Bounded: this call exists to SAVE time, so it may never
+                # hold the run up (the pool below waits for every job). The
+                # benchmark's slowest parties call was ~7 s.
+                fields = _extract_pdf_fields(
+                    client.with_options(timeout=30.0, max_retries=1),
+                    result["files"], _PARTIES_SCHEMA,
+                    deed_instruction + " Only the parties are needed. List "
+                    "each grantor and each grantee as a SEPARATE array entry "
+                    "(one person or entity per entry), with that party's own "
+                    "capacity language.",
+                    model=parties_model)
+                secs = round(time.perf_counter() - t0, 2)
+                # Hand off BEFORE returning, inside the job, so the callback
+                # has finished (it only submits searches) by the time
+                # jobs["parties"].result() returns on the main thread.
+                try:
+                    on_parties(fields)
+                except Exception:
+                    pass
+                return fields, secs
+            jobs["parties"] = pool.submit(_parties_job)
         for i, cand in enumerate(result.get("multiple_deed_candidates") or []):
             # v3.14 — skip candidates already extracted (the auto-retarget
             # re-run extracts only the newly selected main deed).
@@ -11040,6 +11379,7 @@ def _run_pdf_extraction(result: dict, land_court: bool) -> None:
         try:
             fields = jobs["deed"].result()
             result["pdf_extraction"] = {"model": _EXTRACT_MODEL_MAIN, "fields": fields}
+            result["grantor_statements"] = fields.get("grantor_statements") or []
             result["legal_description"]  = fields.get("legal_description")
             result["signing_date"]       = fields.get("signing_date")
             result["grantors_full"]      = fields.get("grantors_full") or []
@@ -11071,6 +11411,26 @@ def _run_pdf_extraction(result: dict, land_court: bool) -> None:
             )
             _mark_extraction_unavailable(result, e)
 
+        # v3.56 (item 64) — the parties-only call.
+        if "parties" in jobs:
+            try:
+                p_fields, p_secs = jobs["parties"].result()
+                result["parties_extraction"] = {
+                    "model": parties_model, "seconds": p_secs,
+                    "grantors_full": p_fields.get("grantors_full") or [],
+                    "grantees_full": p_fields.get("grantees_full") or [],
+                }
+                _cross_check_parties(result)
+            except Exception as e:
+                result["notes"].append(
+                    f"Parties-only call ({parties_model}) failed (non-fatal — "
+                    f"the co-owner check uses the main extraction and the "
+                    f"registry abstract): {type(e).__name__}: {e}")
+                # Deliberately NOT _mark_extraction_unavailable: an account
+                # without access to the parties model (a 404) says nothing
+                # about the MAIN model, and latching it would silently skip
+                # the retarget re-extraction and every page-1 sample.
+
         # Candidate samples
         for i, cand in enumerate(result.get("multiple_deed_candidates") or []):
             job = jobs.get(f"cand{i}")
@@ -11081,6 +11441,82 @@ def _run_pdf_extraction(result: dict, land_court: bool) -> None:
             except Exception as e:
                 cand["sample_extraction"] = {"error": f"{type(e).__name__}: {e}"}
                 _mark_extraction_unavailable(result, e)
+
+
+def _cross_check_parties(result: dict) -> None:
+    """
+    v3.56 (item 64) — compare the grantee SURNAMES from the main extraction
+    with the parties-only call's. The two are independent readings of the
+    same page by different models; they agreed on 27/27 benchmark runs, so
+    a disagreement means a hard-to-read name (the 1974 benchmark deed had a
+    broken initial) and must be surfaced, never resolved silently.
+
+    When the main extraction produced no grantees (it failed, or the retry
+    path cleared it) the parties call's names are used for the co-owner
+    check — say so, since they came from the lighter call.
+    """
+    pe = result.get("parties_extraction") or {}
+    p_gr = pe.get("grantees_full") or []
+    m_gr = result.get("grantees_full") or []
+    if not p_gr:
+        return
+    if not m_gr:
+        result["notes"].append(
+            "Grantees for the co-owner check came from the parties-only call "
+            f"({pe.get('model')}) because the main extraction returned none: "
+            + "; ".join(p_gr))
+        return
+
+    def _split(names):
+        # A reader may return co-grantees as ONE entry ("A Smith and J
+        # Jones, as joint tenants"); split on the conjunction so each
+        # person is checked. Fragments that are not a person ("wife", "the
+        # SMITH REVOCABLE TRUST") parse to no first name and are skipped.
+        out = []
+        for g in names:
+            out.extend(x for x in re.split(r"\s+(?:and|&)\s+", g or "",
+                                            flags=re.I) if x.strip())
+        return out
+
+    def _people(names):
+        out = []
+        for g in _split(names):
+            last, first = _grantee_full_name_pair(g, [])
+            last = re.sub(r"[^A-Z]", "", (last or "").upper())
+            first = re.sub(r"[^A-Z]", "", (first or "").upper().split(" ")[0]
+                           if first else "")
+            if last and first:
+                out.append((last, first))
+        return out
+
+    def _words(names):
+        return set(re.findall(r"[A-Z]+", " ".join(names).upper()))
+
+    # Forward: every person the MAIN extraction read must appear, first name
+    # and surname, in the parties call's text (catches "AILEEN" for
+    # "ALLEN", or a co-owner the parties call dropped). Reverse: the same
+    # for every person the parties call read (catches a co-owner the main
+    # extraction dropped, including a same-surname spouse). Checking words in
+    # the other side's TEXT, not parsed pairs, keeps capacity language and
+    # combined entries from producing false alarms.
+    p_words, m_words = _words(p_gr), _words(m_gr)
+    missing = [f"{f} {l}" for l, f in _people(m_gr)
+               if l not in p_words or f not in p_words]
+    missing += [f"{f} {l}" for l, f in _people(p_gr)
+                if l not in m_words or f not in m_words]
+    if missing:
+        result["notes"].append(
+            "WARNING (v3.56 parties cross-check): the main extraction and the "
+            "parties-only call read the GRANTEES differently ("
+            + "; ".join(sorted(set(missing))) + ") — main: "
+            + "; ".join(m_gr) + " | parties call: " + "; ".join(p_gr)
+            + ". Confirm the grantee names on the deed image; the co-owner "
+            "grantor searches used the main extraction's reading.")
+    else:
+        result["notes"].append(
+            f"Parties cross-check: the parties-only call ({pe.get('model')}, "
+            f"{pe.get('seconds')} s) agrees with the main extraction on the "
+            "grantees.")
 
 
 def _stamp_matches_selection(stamp: str, book, page, *,
@@ -12782,7 +13218,11 @@ def _write_markdown_report(result: dict, base_name: str, seller_display: str,
         if result.get("tenancy"):
             L.append(f"  - (held {result['tenancy']})")
     if result.get("prior_deed_reference"):
-        L.append(f"- Prior Deed Reference: {result['prior_deed_reference']}")
+        # v3.56 — the recited source of title is kept OUT of the legal
+        # description and reported here verbatim: it names the purported
+        # previous deed in the chain, which the title-search workflows use.
+        L.append("- Source of Title (as recited in the deed — NOT part of "
+                 f"the legal description): {result['prior_deed_reference']}")
     # v3.48 (item 42) — the extracted address is the best source, but it can
     # be null on an instrument that states no address (a metes-and-bounds
     # deed, an old paper filing). Fall back to what the registry indexed
@@ -12803,6 +13243,34 @@ def _write_markdown_report(result: dict, base_name: str, seller_display: str,
                  "not indexed — confirm the parcel on the page images")
     if result.get("recording_stamp"):
         L.append(f"- Recording Stamp (verification): {result['recording_stamp']}")
+
+    # v3.56 (item 64) — grantor statements that follow the description are
+    # left out of the legal description but recorded here verbatim, because
+    # they are often how a right is released or waived, or how the grantee
+    # is protected from a lien (a corporation's excise-tax recital keeps
+    # that liability with the grantor instead of running with the land).
+    if "grantor_statements" in result or result.get("pdf_extraction"):
+        _gs_labels = {
+            "homestead": "Homestead",
+            "corporate_excise_tax": "Corporate excise tax",
+            "c156d_assets": "M.G.L. c.156D assets statement",
+            "marital_status": "Marital status",
+            "other": "Other grantor statement",
+        }
+        L += ["", "---", "", "## Grantor Statements (after the description)", ""]
+        _gs = result.get("grantor_statements") or []
+        if _gs:
+            L.append("Left out of the legal description; recorded here "
+                     "verbatim for the file.")
+            L.append("")
+            for st in _gs:
+                if isinstance(st, dict):
+                    L.append(f"- **{_gs_labels.get(st.get('kind'), 'Other grantor statement')}:** "
+                             f"{st.get('text')}")
+                else:
+                    L.append(f"- {st}")
+        else:
+            L.append("None found in the deed.")
     L += ["", "---", "", "## Title Flags / Notes", ""]
 
     flags = []
@@ -13192,6 +13660,207 @@ def _deliver_legal_description(result: dict, base_name: str,
         )
 
 
+def _alis_build_grantor_name_pairs(seller_last: str, seller_first: str,
+                                   row: dict, grantees: list, abstract: dict,
+                                   land_court: bool, notes: list) -> list:
+    """
+    v3.56 (item 64) — the grantor check's search list, moved verbatim out of
+    run_alis_http's STEP 7 so the SAME list can be built three times:
+
+      1. at STEP 4.5, from the registry abstract alone (no extraction yet),
+         so every party the abstract names — and each one's deed-out net —
+         is searched DURING extraction instead of after it;
+      2. when the parties-only call returns (seconds into extraction), for
+         any co-owner that only the deed itself names;
+      3. at STEP 7, with the final extraction, exactly as before.
+
+    Building one list three ways (rather than three similar lists) is what
+    makes the early searches safe: a prefetched set is consumed only when
+    its (last, first, document group) key matches a pair STEP 7 builds, and
+    the v3.29/v3.45 window and section guards still discard any set that
+    answers a different question. Pass a throwaway `notes` list for 1 and 2
+    — only STEP 7's notes belong in the result.
+
+    Returns the full name_pairs list (seller, indexed grantee, co-owners,
+    then the deed-out nets), each a tuple accepted by
+    _alis_grantor_check_http.
+    """
+    # v3.45 (item 29) — an EMPTY --first is this tool's ENTITY convention
+    # (the whole name goes in --last, per the Plymouth/Suffolk/ALIS
+    # invocations), NOT an unknown first name. `_pair_is_net`'s default
+    # rule is `not pair[1]`, so the seller's OWN pass was being
+    # classified as a broad deed-out NET whenever the seller was an
+    # entity — and a net is type-filtered to conveyances, on the
+    # reasoning that its hits are probably same-surname strangers.
+    #
+    # For an entity that reasoning is exactly inverted: the "surname" IS
+    # the complete, exact name of the seller, and its non-conveyance hits
+    # are the seller's OWN mortgages, municipal lien certificates,
+    # homesteads and liens. They were silently dropped. Live 2026-08-24:
+    # a run found the right 3 instruments (`rows_returned: 3`) and
+    # skipped all 3 as `rows_skipped_non_conveyance`, so
+    # `grantor_check.deeds` came back EMPTY. The deed-out answer was
+    # right, but the report showed none of the seller's encumbrances at
+    # the subject parcel — including an open six-figure mortgage.
+    #
+    # Marking the pair `is_net=False` explicitly is a no-op for an
+    # individual (a non-empty first name already evaluates False) and
+    # the fix for an entity.
+    _entity_seller = not seller_first.strip()
+    name_pairs = [(
+        seller_last.upper(), seller_first.upper(),
+        (f"{seller_last.upper()} (entity seller — full name)"
+         if _entity_seller else None),
+        None,          # doc_type: *ALL — the seller's own pass is never
+                       # restricted to the deed group
+        False,         # is_net: this is the NAMED SELLER, not a net
+    )]
+    idx_pair = _alis_indexed_name_pair((row or {}).get("name") or "")
+    if idx_pair[0] and idx_pair not in name_pairs:
+        name_pairs.append(idx_pair)
+
+    # v3.14 — co-owner names extracted from the deed itself. A co-owner
+    # with a different surname conveying alone was invisible to every
+    # existing search; on Land Court even same-surname co-owners were
+    # (the index shows one grantee + "(&AL)" and gets no broad search).
+    co_pairs = []
+
+    def _add_co_pair(co_last, co_first, label):
+        if not co_last:
+            return
+        covered = any(
+            p[0] == co_last and p[1] and co_first.startswith(p[1])
+            for p in name_pairs + co_pairs
+        )
+        if not covered:
+            co_pairs.append((co_last, co_first, label))
+
+    for g in grantees or []:
+        # v3.34 (item 19): pass notes so an individual's entry that
+        # yields no search name WARNS instead of vanishing — a garbage
+        # or unparseable name must never render as a clean search.
+        co_last, co_first = _grantee_full_name_pair(g, notes)
+        _add_co_pair(co_last, co_first,
+                     f"{co_last}, {co_first} (co-owner from deed)")
+
+    # v3.28 — the same names off the registry ABSTRACT, which needs no
+    # API and covers two cases the deed extraction cannot: a run whose
+    # extraction failed or was never enabled, and a co-owner REMOVED by
+    # the vesting deed (named only on its grantor side). See
+    # _alis_abstract_party_pairs.
+    for co_last, co_first, label in _alis_abstract_party_pairs(
+            abstract, notes):
+        _add_co_pair(co_last, co_first, label)
+
+    if co_pairs:
+        notes.append(
+            "Grantor check includes co-owner name(s) from the deed and "
+            "its registry abstract: "
+            + "; ".join(f"{p[0]}, {p[1]}" for p in co_pairs)
+        )
+    name_pairs.extend(co_pairs)
+
+    if not land_court:
+        # Broad surname search — catches same-surname joint owners.
+        # Skipped on Land Court (Kowalczyk: namesake noise buries the
+        # seller's real instruments).
+        # -----------------------------------------------------------
+        # THE DEED-OUT NET (v3.38, replacing the always-on full
+        # surname-only pass). Skipped on Land Court either way
+        # (namesake noise buries the seller's real instruments).
+        #
+        # WHY IT CHANGED. Measured: the surname-only pass returned
+        # 188 rows to keep 28 (and 154 to keep 24 on another run) and
+        # was essentially the ENTIRE grantor-check runtime — 53s of a
+        # 94s run, 42s of a 57s run — while the named-seller and
+        # co-owner passes returned 4-6 rows each.
+        #
+        # WHAT IT UNIQUELY CAUGHT, and what replaces it. Both
+        # platforms PREFIX-match, so a full-name search already
+        # reaches longer index spellings ("PENN" finds "PENNE").
+        # Prefix matching runs one way only, so a full-name search
+        # genuinely misses an instrument indexed with an INITIAL
+        # ("SMITH, J") or a misspelled first name. Surname + first
+        # INITIAL catches both — "SMITH, J" reaches "J", "JOHN",
+        # "JON" — at a fraction of the rows. Restricted to the deed
+        # group server-side, because a deed-out net has no business
+        # fetching mortgages. (Note what NEITHER form rescues: a
+        # misspelled SURNAME. That is the address search's job.)
+        #
+        # The one thing surname-only still had: an UNKNOWN
+        # same-surname co-owner. Since v3.28 the registry abstract
+        # enumerates every party on both sides, so we normally know
+        # the owners by name — which is why the full pass is now a
+        # FALLBACK, fired only when that enumeration failed and the
+        # net is actually load-bearing.
+        # -----------------------------------------------------------
+        known_owners = [(seller_last.upper(), seller_first.upper())]
+        known_owners += [(p[0], p[1]) for p in co_pairs]
+        net_pairs = []
+        for o_last, o_first in known_owners:
+            if not (o_last and o_first):
+                continue
+            init = (o_last, o_first[0])
+            if init in {(p[0], p[1]) for p in name_pairs + net_pairs}:
+                continue
+            net_pairs.append((
+                o_last, init[1],
+                f"{o_last}, {init[1]}* (deed-out net, deed group)",
+                _ALIS_DEED_GROUP, True,
+            ))
+
+        # Fallback: no owner name yielded an initial — the party list
+        # could not be enumerated at all (no abstract, extraction
+        # failed, entity seller). THIS is when the broad net earns its
+        # keep, so fire the full surname-only pass and say why.
+        if not net_pairs and _entity_seller:
+            # v3.45 (item 29) — for an ENTITY the fallback net would
+            # re-run the seller's own query: same surname, same empty
+            # first name, only narrowed to the deed group. The seller's
+            # own pass (above) is a strict SUPERSET of it — all document
+            # types, unfiltered — so the net adds nothing but a round
+            # trip, and its "hits may be strangers" framing is wrong for
+            # a name that IS the seller.
+            notes.append(
+                "Grantor check: entity seller — the deed-out net was NOT "
+                "run separately because the seller's own full-name pass "
+                f"({seller_last.upper()}) is the same query, unrestricted "
+                "by document type. Its hits are the SELLER'S OWN "
+                "instruments (mortgages, MLCs, homesteads, liens are all "
+                "kept), not same-surname strangers. Note the standing "
+                "limitation: neither pass reaches a MISSPELLED entity "
+                "name in the index — use the address search for that."
+            )
+        elif not net_pairs:
+            net_pairs.append((
+                seller_last.upper(), "",
+                f"{seller_last.upper()} (surname only — FALLBACK: owner "
+                f"names could not be enumerated)",
+                _ALIS_DEED_GROUP, True,
+            ))
+            notes.append(
+                "Grantor check: no owner first name was available, so the "
+                "deed-out net fell back to a FULL surname-only search "
+                "(deed group). This is the broad pass — its hits may be "
+                "same-surname strangers; verify the grantor's first name "
+                "before flagging one."
+            )
+        else:
+            notes.append(
+                "Grantor check deed-out net (v3.38): searched "
+                + "; ".join(f"{p[0]}, {p[1]}*" for p in net_pairs)
+                + " restricted to the deed group. Surname+initial is a "
+                "PREFIX match, so it reaches initial-only and "
+                "misspelled-first-name index entries; it does NOT reach "
+                "a misspelled SURNAME (use the address search) or an "
+                "unknown same-surname co-owner with a different initial."
+            )
+        for np_ in net_pairs:
+            if (np_[0], np_[1]) not in {(p[0], p[1]) for p in name_pairs}:
+                name_pairs.append(np_)
+    return name_pairs
+
+
 def run_alis_http(
     registry_label: str,
     base_url: str,
@@ -13298,6 +13967,7 @@ def run_alis_http(
         "tenancy": None,
         "prior_deed_reference": None,
         "title_flags": [],
+        "grantor_statements": [],
         "deed_property_address_pdf": None,
         "recording_stamp": None,
         # v3.28 — set when an extraction failure will recur for the rest of
@@ -13640,56 +14310,75 @@ def run_alis_http(
     # -----------------------------------------------------------
     prefetched, prefetch_notes = {}, []
     prefetch_pool = prefetch_future = None
+    # v3.56 (item 64) — more than one worker now feeds `prefetched`: the
+    # STEP 4.5 pass (every name the registry abstract gives us) and, seconds
+    # later, the parties-only extraction call (any co-owner only the deed
+    # names). The lock guards only the "who claimed which search" set, so
+    # no search is ever run twice; the dict writes themselves are single
+    # assignments of fresh keys.
+    prefetch_lock = threading.Lock()
+    prefetch_claimed = set()
+    extra_prefetch_futures = []
 
-    def _prefetch_grantor_searches():
-        psession = requests.Session()
-        # v3.38 — prefetch the named seller (all types) and the SELLER'S
-        # deed-out net (surname + first initial, deed group). The retired
-        # surname-only pass used to be prefetched here, and because it
-        # returned 150-190 rows it did not finish during extraction — the
-        # grantor check then blocked on it, which is where 53s of a 94s run
-        # actually went. Co-owner nets are searched live; they are cheap.
-        # v3.45 (item 29b) — SNAPSHOT the section ONCE, at the top, and use
-        # this local everywhere below. `result["land_court"]` is mutated on
-        # the MAIN thread by the v3.14 auto-retarget, which since v3.44 can
-        # move the selected deed ACROSS sections; reading the dict separately
-        # for the search and for the bookkeeping let the two disagree, so a
-        # Land Court result set got recorded as a Recorded Land one and the
-        # staleness guard could not see it.
-        pf_land_court = bool(result["land_court"])
-        pairs = [(seller_last.upper(), seller_first.upper(), "*ALL")]
-        if not pf_land_court and seller_first.strip():
-            pairs.append((seller_last.upper(), seller_first.upper()[0],
-                          _ALIS_DEED_GROUP))
-        # v3.29 — window from the row selected SO FAR. A later auto-retarget
-        # can move to an earlier deed, which would make this window too late;
-        # the window rides along in the entry and _alis_grantor_check_http
-        # discards and re-searches any prefetched set that is too narrow.
-        pf_window = _grantor_window_start(
-            _parse_deed_date(result.get("recorded_date") or ""))
-        pf_param = _alis_date_param(pf_window)
-        for last, first, pf_doc_type in pairs:
+    # v3.45 (item 29b) — SNAPSHOT the section ONCE and use this local
+    # everywhere below. `result["land_court"]` is mutated on the MAIN thread
+    # by the v3.14 auto-retarget, which since v3.44 can move the selected
+    # deed ACROSS sections; reading the dict separately for the search and
+    # for the bookkeeping let the two disagree, so a Land Court result set
+    # got recorded as a Recorded Land one and the staleness guard could not
+    # see it.
+    pf_land_court = bool(result["land_court"])
+    # v3.29 — window from the row selected SO FAR. A later auto-retarget
+    # can move to an earlier deed, which would make this window too late;
+    # the window rides along in the entry and _alis_grantor_check_http
+    # discards and re-searches any prefetched set that is too narrow.
+    pf_window = _grantor_window_start(
+        _parse_deed_date(result.get("recorded_date") or ""))
+    pf_param = _alis_date_param(pf_window)
+    pf_row = dict(row)
+
+    def _pf_key(pair):
+        # Same identity as _alis_grantor_check_http's _pair_key: the
+        # document group is part of what a search IS (v3.38).
+        return (pair[0], pair[1],
+                pair[3] if len(pair) > 3 and pair[3] else "*ALL")
+
+    def _prefetch_pairs(pairs):
+        """
+        v3.56 — search every pair not already claimed, IN PARALLEL (the
+        pre-v3.56 prefetch ran its two searches back to back), then fetch
+        the grantor-hit abstracts for the rows just found (v3.55).
+        """
+        with prefetch_lock:
+            todo, seen = [], set()
+            for p in pairs:
+                k = _pf_key(p)
+                if k not in prefetch_claimed and k not in seen:
+                    seen.add(k)
+                    todo.append(k)
+            prefetch_claimed.update(todo)
+        if not todo:
+            return
+
+        def _one(key):
+            last, first, pf_doc_type = key
             try:
                 # v3.20 — the truncation flag rides along so the grantor
                 # check can trigger its town-scoped retry on capped
                 # prefetched searches too.
                 meta = {}
                 rows = _alis_search_http(
-                    psession, base_url, last, first, "R", town=grantor_town,
-                    land_court=pf_land_court, doc_type=pf_doc_type,
-                    date_from=pf_param, notes=prefetch_notes, meta=meta,
+                    requests.Session(), base_url, last, first, "R",
+                    town=grantor_town, land_court=pf_land_court,
+                    doc_type=pf_doc_type, date_from=pf_param,
+                    notes=prefetch_notes, meta=meta,
                 )
-                prefetched[(last, first, pf_doc_type)] = {
+                prefetched[key] = {
                     "rows": rows,
                     "truncated": meta.get("truncated", False),
                     "window": pf_window,
-                    # v3.45 (item 29b) — record WHICH SECTION these rows came
-                    # from. Since v3.44 the grantee search spans Recorded Land
-                    # and Land Court, so an auto-retarget can move the selected
-                    # deed ACROSS sections after this prefetch has run. Without
-                    # this the grantor check would serve Land Court rows for a
-                    # Recorded Land deed (or vice versa) and report the result
-                    # as the seller's grantor history.
+                    # v3.45 (item 29b) — record WHICH SECTION these rows
+                    # came from, so a cross-section retarget discards them.
                     "land_court": pf_land_court,
                 }
             except Exception as e:
@@ -13697,6 +14386,9 @@ def run_alis_http(
                     f"Grantor-search prefetch for '{last}, {first or '(surname only)'}' "
                     f"failed (non-fatal, will search live): {e}"
                 )
+
+        with ThreadPoolExecutor(max_workers=min(4, len(todo))) as ex:
+            list(ex.map(_one, todo))
 
         # v3.55 (item 63) — fetch the grantor-hit ABSTRACTS for the rows
         # just prefetched, still during extraction. STEP 7 used to fetch them
@@ -13711,26 +14403,62 @@ def run_alis_http(
         try:
             ab_num, ab_word = _parse_street_from_base_name(base_name)
             if ab_num and ab_word:
-                seen_urls, pf_rows = set(), []
-                for entry in prefetched.values():
-                    for r in entry["rows"]:
+                seen_urls, pf_rows = set(abstract_cache), []
+                for key in todo:
+                    for r in (prefetched.get(key) or {}).get("rows") or []:
                         u = _alis_abstract_url(base_url, r)
                         if u and u not in seen_urls:
                             seen_urls.add(u)
                             pf_rows.append(dict(r))
-                todo, _ = _alis_classify_abstract_targets(
+                targets, _ = _alis_classify_abstract_targets(
                     pf_rows, _parse_deed_date(result.get("recorded_date") or ""),
                     town, _parse_town_from_base_name(base_name))
                 abstract_cache.update(
-                    _alis_fetch_abstracts_parallel(base_url, todo))
+                    _alis_fetch_abstracts_parallel(base_url, targets))
         except Exception as e:
             prefetch_notes.append(
                 f"Grantor-hit abstract prefetch failed (non-fatal, will "
                 f"fetch live): {e}")
 
+    def _prefetch_grantor_searches():
+        # v3.56 (item 64) — prefetch the WHOLE STEP 7 search list that can
+        # be known before extraction: the named seller, the exact indexed
+        # grantee, every party the registry abstract names (v3.28), and each
+        # known owner's deed-out net (v3.38). Before v3.56 only the seller
+        # and the seller's own net were prefetched, and every co-owner was
+        # searched after extraction finished. The list comes from the same
+        # builder STEP 7 uses, so the keys match exactly; notes from this
+        # build are discarded — STEP 7 rebuilds and reports.
+        _prefetch_pairs(_alis_build_grantor_name_pairs(
+            seller_last, seller_first, pf_row, [], result.get("abstract"),
+            pf_land_court, []))
+
+    def _on_parties(fields):
+        """
+        v3.56 (item 64) — called from the parties-only extraction call the
+        moment it returns (typically ~3 s into a ~10 s main extraction).
+        Rebuilds the search list with the deed's own grantees and prefetches
+        any search the abstract could not have produced — a co-owner named
+        only on the instrument. Everything already claimed is skipped.
+        """
+        if prefetch_pool is None:
+            return
+        try:
+            pairs = _alis_build_grantor_name_pairs(
+                seller_last, seller_first, pf_row,
+                fields.get("grantees_full") or [], result.get("abstract"),
+                pf_land_court, [])
+            fut = prefetch_pool.submit(_prefetch_pairs, pairs)
+            with prefetch_lock:
+                extra_prefetch_futures.append(fut)
+        except Exception as e:
+            prefetch_notes.append(
+                f"Co-owner prefetch from the parties call not started "
+                f"(non-fatal, will search live): {e}")
+
     abstract_cache = {}
     try:
-        prefetch_pool = ThreadPoolExecutor(max_workers=2)
+        prefetch_pool = ThreadPoolExecutor(max_workers=4)
         prefetch_future = prefetch_pool.submit(_prefetch_grantor_searches)
     except Exception as e:
         result["notes"].append(f"Grantor-search prefetch not started (non-fatal): {e}")
@@ -13766,7 +14494,11 @@ def run_alis_http(
     # were sequential anyway, so the reorder costs nothing.
     # -----------------------------------------------------------
     if extract_pdf and result["files"]:
-        _run_pdf_extraction(result, land_court=result["land_court"])
+        # v3.56 (item 64) — the parties-only call rides along and hands the
+        # deed's grantees to _on_parties the moment it returns, so a
+        # co-owner the abstract did not name is searched during extraction.
+        _run_pdf_extraction(result, land_court=result["land_court"],
+                            on_parties=_on_parties)
     elif not extract_pdf:
         # v3.27 — in claude-code mode this is a MODE, not a failure: the
         # mode note was already emitted by _resolve_extraction_mode and
@@ -14005,10 +14737,14 @@ def run_alis_http(
                     result["grantees_full"] = []
                     result["tenancy"] = None
                     result["prior_deed_reference"] = None
+                    result["grantor_statements"] = []
                     result["title_flags"] = []
                     result["deed_property_address_pdf"] = None
                     result["recording_stamp"] = None
                     result.pop("pdf_extraction", None)
+                    # v3.56 — the parties call read the WRONG deed too; its
+                    # grantees must not stand in for the retargeted deed's.
+                    result.pop("parties_extraction", None)
                     # v3.22 — the retarget can now fire without extraction
                     # ever having run; only re-extract if it is enabled.
                     # v3.28 — and not once extraction is known to be down.
@@ -14151,185 +14887,29 @@ def run_alis_http(
             prefetch_future.result()
         except Exception as e:
             result["notes"].append(f"Grantor-search prefetch failed (non-fatal): {e}")
+        # v3.56 (item 64) — and the co-owner searches the parties call
+        # started. They began seconds into extraction, so by now they are
+        # normally done; anything unfinished or failed is searched live.
+        with prefetch_lock:
+            _extra = list(extra_prefetch_futures)
+        for _f in _extra:
+            try:
+                _f.result()
+            except Exception as e:
+                result["notes"].append(
+                    f"Co-owner prefetch failed (non-fatal, searched live): {e}")
         prefetch_pool.shutdown(wait=False)
         result["notes"].extend(prefetch_notes)
 
     grantor_rows = []
     try:
         lc = result["land_court"]
-        # v3.45 (item 29) — an EMPTY --first is this tool's ENTITY convention
-        # (the whole name goes in --last, per the Plymouth/Suffolk/ALIS
-        # invocations), NOT an unknown first name. `_pair_is_net`'s default
-        # rule is `not pair[1]`, so the seller's OWN pass was being
-        # classified as a broad deed-out NET whenever the seller was an
-        # entity — and a net is type-filtered to conveyances, on the
-        # reasoning that its hits are probably same-surname strangers.
-        #
-        # For an entity that reasoning is exactly inverted: the "surname" IS
-        # the complete, exact name of the seller, and its non-conveyance hits
-        # are the seller's OWN mortgages, municipal lien certificates,
-        # homesteads and liens. They were silently dropped. Live 2026-08-24:
-        # a run found the right 3 instruments (`rows_returned: 3`) and
-        # skipped all 3 as `rows_skipped_non_conveyance`, so
-        # `grantor_check.deeds` came back EMPTY. The deed-out answer was
-        # right, but the report showed none of the seller's encumbrances at
-        # the subject parcel — including an open six-figure mortgage.
-        #
-        # Marking the pair `is_net=False` explicitly is a no-op for an
-        # individual (a non-empty first name already evaluates False) and
-        # the fix for an entity.
-        _entity_seller = not seller_first.strip()
-        name_pairs = [(
-            seller_last.upper(), seller_first.upper(),
-            (f"{seller_last.upper()} (entity seller — full name)"
-             if _entity_seller else None),
-            None,          # doc_type: *ALL — the seller's own pass is never
-                           # restricted to the deed group
-            False,         # is_net: this is the NAMED SELLER, not a net
-        )]
-        idx_pair = _alis_indexed_name_pair(row.get("name") or "")
-        if idx_pair[0] and idx_pair not in name_pairs:
-            name_pairs.append(idx_pair)
-
-        # v3.14 — co-owner names extracted from the deed itself. A co-owner
-        # with a different surname conveying alone was invisible to every
-        # existing search; on Land Court even same-surname co-owners were
-        # (the index shows one grantee + "(&AL)" and gets no broad search).
-        co_pairs = []
-
-        def _add_co_pair(co_last, co_first, label):
-            if not co_last:
-                return
-            covered = any(
-                p[0] == co_last and p[1] and co_first.startswith(p[1])
-                for p in name_pairs + co_pairs
-            )
-            if not covered:
-                co_pairs.append((co_last, co_first, label))
-
-        for g in result.get("grantees_full") or []:
-            # v3.34 (item 19): pass notes so an individual's entry that
-            # yields no search name WARNS instead of vanishing — a garbage
-            # or unparseable name must never render as a clean search.
-            co_last, co_first = _grantee_full_name_pair(g, result["notes"])
-            _add_co_pair(co_last, co_first,
-                         f"{co_last}, {co_first} (co-owner from deed)")
-
-        # v3.28 — the same names off the registry ABSTRACT, which needs no
-        # API and covers two cases the deed extraction cannot: a run whose
-        # extraction failed or was never enabled, and a co-owner REMOVED by
-        # the vesting deed (named only on its grantor side). See
-        # _alis_abstract_party_pairs.
-        for co_last, co_first, label in _alis_abstract_party_pairs(
-                result.get("abstract"), result["notes"]):
-            _add_co_pair(co_last, co_first, label)
-
-        if co_pairs:
-            result["notes"].append(
-                "Grantor check includes co-owner name(s) from the deed and "
-                "its registry abstract: "
-                + "; ".join(f"{p[0]}, {p[1]}" for p in co_pairs)
-            )
-        name_pairs.extend(co_pairs)
-
-        if not lc:
-            # Broad surname search — catches same-surname joint owners.
-            # Skipped on Land Court (Kowalczyk: namesake noise buries the
-            # seller's real instruments).
-            # -----------------------------------------------------------
-            # THE DEED-OUT NET (v3.38, replacing the always-on full
-            # surname-only pass). Skipped on Land Court either way
-            # (namesake noise buries the seller's real instruments).
-            #
-            # WHY IT CHANGED. Measured: the surname-only pass returned
-            # 188 rows to keep 28 (and 154 to keep 24 on another run) and
-            # was essentially the ENTIRE grantor-check runtime — 53s of a
-            # 94s run, 42s of a 57s run — while the named-seller and
-            # co-owner passes returned 4-6 rows each.
-            #
-            # WHAT IT UNIQUELY CAUGHT, and what replaces it. Both
-            # platforms PREFIX-match, so a full-name search already
-            # reaches longer index spellings ("PENN" finds "PENNE").
-            # Prefix matching runs one way only, so a full-name search
-            # genuinely misses an instrument indexed with an INITIAL
-            # ("SMITH, J") or a misspelled first name. Surname + first
-            # INITIAL catches both — "SMITH, J" reaches "J", "JOHN",
-            # "JON" — at a fraction of the rows. Restricted to the deed
-            # group server-side, because a deed-out net has no business
-            # fetching mortgages. (Note what NEITHER form rescues: a
-            # misspelled SURNAME. That is the address search's job.)
-            #
-            # The one thing surname-only still had: an UNKNOWN
-            # same-surname co-owner. Since v3.28 the registry abstract
-            # enumerates every party on both sides, so we normally know
-            # the owners by name — which is why the full pass is now a
-            # FALLBACK, fired only when that enumeration failed and the
-            # net is actually load-bearing.
-            # -----------------------------------------------------------
-            known_owners = [(seller_last.upper(), seller_first.upper())]
-            known_owners += [(p[0], p[1]) for p in co_pairs]
-            net_pairs = []
-            for o_last, o_first in known_owners:
-                if not (o_last and o_first):
-                    continue
-                init = (o_last, o_first[0])
-                if init in {(p[0], p[1]) for p in name_pairs + net_pairs}:
-                    continue
-                net_pairs.append((
-                    o_last, init[1],
-                    f"{o_last}, {init[1]}* (deed-out net, deed group)",
-                    _ALIS_DEED_GROUP, True,
-                ))
-
-            # Fallback: no owner name yielded an initial — the party list
-            # could not be enumerated at all (no abstract, extraction
-            # failed, entity seller). THIS is when the broad net earns its
-            # keep, so fire the full surname-only pass and say why.
-            if not net_pairs and _entity_seller:
-                # v3.45 (item 29) — for an ENTITY the fallback net would
-                # re-run the seller's own query: same surname, same empty
-                # first name, only narrowed to the deed group. The seller's
-                # own pass (above) is a strict SUPERSET of it — all document
-                # types, unfiltered — so the net adds nothing but a round
-                # trip, and its "hits may be strangers" framing is wrong for
-                # a name that IS the seller.
-                result["notes"].append(
-                    "Grantor check: entity seller — the deed-out net was NOT "
-                    "run separately because the seller's own full-name pass "
-                    f"({seller_last.upper()}) is the same query, unrestricted "
-                    "by document type. Its hits are the SELLER'S OWN "
-                    "instruments (mortgages, MLCs, homesteads, liens are all "
-                    "kept), not same-surname strangers. Note the standing "
-                    "limitation: neither pass reaches a MISSPELLED entity "
-                    "name in the index — use the address search for that."
-                )
-            elif not net_pairs:
-                net_pairs.append((
-                    seller_last.upper(), "",
-                    f"{seller_last.upper()} (surname only — FALLBACK: owner "
-                    f"names could not be enumerated)",
-                    _ALIS_DEED_GROUP, True,
-                ))
-                result["notes"].append(
-                    "Grantor check: no owner first name was available, so the "
-                    "deed-out net fell back to a FULL surname-only search "
-                    "(deed group). This is the broad pass — its hits may be "
-                    "same-surname strangers; verify the grantor's first name "
-                    "before flagging one."
-                )
-            else:
-                result["notes"].append(
-                    "Grantor check deed-out net (v3.38): searched "
-                    + "; ".join(f"{p[0]}, {p[1]}*" for p in net_pairs)
-                    + " restricted to the deed group. Surname+initial is a "
-                    "PREFIX match, so it reaches initial-only and "
-                    "misspelled-first-name index entries; it does NOT reach "
-                    "a misspelled SURNAME (use the address search) or an "
-                    "unknown same-surname co-owner with a different initial."
-                )
-            for np_ in net_pairs:
-                if (np_[0], np_[1]) not in {(p[0], p[1]) for p in name_pairs}:
-                    name_pairs.append(np_)
+        name_pairs = _alis_build_grantor_name_pairs(
+            seller_last, seller_first, row,
+            result.get("grantees_full")
+            or (result.get("parties_extraction") or {}).get("grantees_full")
+            or [],
+            result.get("abstract"), lc, result["notes"])
 
         grantor_rows = _alis_grantor_check_http(
             session, base_url, name_pairs, town=grantor_town,
@@ -15503,7 +16083,7 @@ def _deliver_only(prior: dict, args, output_folder: Path,
 def main() -> None:
     # Declared up front: --model-main/--model-light rebind these below, and
     # Python rejects a `global` that appears after the name is first used.
-    global _EXTRACT_MODEL_MAIN, _EXTRACT_MODEL_LIGHT
+    global _EXTRACT_MODEL_MAIN, _EXTRACT_MODEL_LIGHT, _EXTRACT_MODEL_PARTIES
 
     # v3.31 — `--doctor` is handled before the main parser because that
     # parser requires --registry/--last/--first/--base-name/--output, and a
@@ -15645,6 +16225,13 @@ def main() -> None:
                         help="Model for page-1 sample extractions (default: "
                              "%(default)s). Also settable via "
                              "MA_REGISTRY_MODEL_LIGHT.")
+    parser.add_argument("--model-parties", default=_EXTRACT_MODEL_PARTIES,
+                        help="v3.56: model for the parties-only call that runs "
+                             "alongside the main extraction on Norfolk and "
+                             "Barnstable so the co-owner grantor searches can "
+                             "start early (default: %(default)s). Also settable "
+                             "via MA_REGISTRY_MODEL_PARTIES; pass 'none' to "
+                             "disable the call.")
     parser.add_argument("--copy", action="store_true",
                         help="v3.19: on success, copy the paste-ready legal "
                              "description to the system clipboard "
@@ -15672,6 +16259,7 @@ def main() -> None:
     # declaration at the top of main().
     _EXTRACT_MODEL_MAIN = args.model_main
     _EXTRACT_MODEL_LIGHT = args.model_light
+    _EXTRACT_MODEL_PARTIES = args.model_parties
 
     # v3.31 — refuse unsubstituted `${user_config.*}` placeholders before
     # anything is created on disk. See _unresolved_placeholders.
@@ -15809,6 +16397,20 @@ def main() -> None:
                             "maintenance). No search was performed — do NOT "
                             "treat this as deed-not-found. Retry when the "
                             "registry is back online."],
+                        "errors": [str(e)]}
+            except AlisServerBusyError as e:
+                # v3.56 (item 64) — the busy page escaped the run (it hit the
+                # grantee search or the deed download, where there is no
+                # partial answer to keep). Same reasoning as maintenance: a
+                # Playwright fallback would load the same busy page — an
+                # alert and history.go(-1) — and read it as zero rows.
+                return {"status": "registry_unavailable", "engine": "http",
+                        "notes": [
+                            "REGISTRY BUSY: the registry answered 'The server is "
+                            "unable to handle this request at this time' on "
+                            "every retry. The search was NOT answered — do NOT "
+                            "treat this as deed-not-found. Wait a few minutes "
+                            "and re-run."],
                         "errors": [str(e)]}
             except Exception as e:
                 result = {"status": "error", "engine": "http",
