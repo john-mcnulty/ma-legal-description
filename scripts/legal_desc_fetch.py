@@ -1,7 +1,44 @@
 #!/usr/bin/env python3
 """
 legal_desc_fetch.py — fast-path for Legal Description Search Workflow
-Version: 3.57
+Version: 3.58
+
+v3.58 changes (item 65c — redundant prefix searches in the ALIS grantor check):
+
+  Both ALIS name boxes are PREFIX-matched, so two of the grantor check's
+  searches added no rows. (1) The exact indexed grantee spelling
+  ("SMITH, JOHN Q") is no longer searched when the seller's own first name
+  is a prefix of it — the "SMITH, JOHN" search already returns its rows; a
+  note says so when the spellings differ. Entity sellers are unaffected.
+  (2) Co-owners from the registry abstract are searched by their FIRST
+  given-name token ("MARY E" -> "MARY"), matching the deed-sourced
+  co-owner names, so the early (abstract-only) build, the parties-call
+  build and STEP 7 produce ONE key and the early search is reused instead
+  of a second, late search gating STEP 7. A keyless run now searches
+  abstract co-owners by first token too — wider, never narrower.
+
+v3.58 also (65c follow-up — a generational suffix inside an abstract surname):
+
+  The registry abstract can list one co-owner twice, once as
+  "SMITH, JOHN (JR.&AL)" and once as "SMITH,JR., JOHN". The second split
+  at its first comma into first name "JR., JOHN", so a co-owner search
+  ran on a name that matches nothing (0 rows; v3.57 searched "JR., JOHN",
+  the first-token rule above made it "JR.,"). _alis_abstract_party_pairs
+  now drops a leading JR/SR/II/III/IV from the first name (and a trailing
+  one from the surname), so the pair is "SMITH, JOHN" and de-duplicates.
+  A first name that is ONLY a suffix is left alone, because an empty first
+  name means a surname-only search.
+
+v3.58 also (item 67 — the registry's "Confirm You Are Not A Robot" page):
+
+  On 2026-10-19 Barnstable began serving a CAPTCHA interstitial to every
+  visitor. It is an HTTP 200 page with no results table, so a grantee
+  search read it as zero rows and exited deed_not_found for a deed that
+  exists. _alis_robot_check_html() now detects it on every ALIS request
+  (HTTP and Playwright); it is never retried or answered, and raises
+  AlisRobotCheckError, a subclass of AlisRegistryUnavailableError, so the
+  run exits registry_unavailable and a grantor search lands in
+  incomplete_searches.
 
 v3.57 changes (item 66 — six Plymouth grid town codes were unknown):
 
@@ -8694,6 +8731,39 @@ def _alis_registry_unavailable_html(html: str) -> bool:
             and ("maintenance" in lowered or "backup" in lowered))
 
 
+class AlisRobotCheckError(AlisRegistryUnavailableError):
+    """
+    v3.58 (item 67) — the registry served its "Confirm You Are Not A Robot"
+    page instead of the request. A subclass of AlisRegistryUnavailableError
+    so every path that already refuses to read an outage as zero rows
+    (grantor search -> `incomplete_searches`, abstract -> parcel unknown,
+    grantee search -> `registry_unavailable`, no Playwright fallback)
+    applies unchanged; the dispatch catches it first only to say why.
+    """
+
+
+def _alis_robot_check_html(html: str) -> bool:
+    """
+    v3.58 (item 67) — True if `html` is the ALIS "Confirm You Are Not A
+    Robot" interstitial: a ~5 KB HTTP 200 page with <form id="Robot">, a
+    WSROBOT checkbox and WSHTNM=WW400R98, and no results table — so every
+    row parser read it as ZERO ROWS.
+
+    Seen live 2026-10-19 on search.barnstabledeeds.org for every query, and
+    in an ordinary browser after "Search Registry Records" (site-wide, not
+    aimed at scripts). A grantee search reported "No results in Land Court"
+    and exited deed_not_found in 4 s for a deed that exists. Never retried
+    and never answered: it does not clear on its own, and getting past it
+    is not this tool's decision.
+    """
+    if not html or len(html) > 20000:
+        return False
+    lowered = html.lower()
+    return ("not a robot" in lowered
+            or 'name="wsrobot"' in lowered
+            or 'id="robot"' in lowered)
+
+
 class AlisServerBusyError(RuntimeError):
     """
     v3.56 (item 64) — the registry answered with its "server is unable to
@@ -8774,6 +8844,11 @@ def _alis_http_get(session, url: str, params=None, timeout: int = 30,
                                    headers=_ALIS_HTTP_HEADERS, timeout=timeout)
             if resp.status_code == 200:
                 ctype = resp.headers.get("Content-Type", "")
+                if "html" in ctype and _alis_robot_check_html(resp.text):
+                    raise AlisRobotCheckError(
+                        f"Registry served its 'Confirm You Are Not A Robot' "
+                        f"page instead of the request. This is NOT an empty "
+                        f"result — nothing was searched. URL: {url}")
                 if ("html" in ctype
                         and _alis_registry_unavailable_html(resp.text)):
                     saw_maintenance = True
@@ -8786,6 +8861,8 @@ def _alis_http_get(session, url: str, params=None, timeout: int = 30,
                     return resp
             else:
                 last_err = f"HTTP {resp.status_code}"
+        except AlisRobotCheckError:
+            raise
         except requests.exceptions.ConnectionError as e:
             last_was_conn_err = True
             last_err = str(e)
@@ -12319,6 +12396,20 @@ def _alis_abstract_party_pairs(abstract: dict, notes: list = None) -> list:
                         "abstract parser needs a new terminating label."
                     )
                 continue
+            # v3.58 — a generational suffix written INTO the surname. The
+            # abstract can list one person twice, once as "SMITH, JOHN
+            # (JR.&AL)" and once as "SMITH,JR., JOHN"; the second splits at
+            # its first comma into first name "JR., JOHN", and a search on
+            # that (or on "JR.," after the first-token rule) returns zero
+            # rows. The grid indexes the person as "SMITH, JOHN (JR.&AL)",
+            # so the suffix is dropped and the pair becomes "SMITH, JOHN",
+            # which de-duplicates against the other entry. Also covers
+            # "SMITH JR, JOHN" (suffix as the surname's last word).
+            # Never strip a first name down to nothing: an empty first name
+            # means "entity / surname-only search" to the grantor check.
+            first = (re.sub(r"^(?:JR|SR|II|III|IV)\b\.?,?\s*", "", first).strip()
+                     or first)
+            last = re.sub(r"[\s,]+(?:JR|SR|II|III|IV)\.?,?$", "", last).strip()
             # The abstract punctuates initials where the results grid does
             # not — "KEEGAN, RICHARD H." vs "KEEGAN, RICHARD H". Searching
             # the punctuated form finds nothing, so drop the trailing dots
@@ -13740,8 +13831,25 @@ def _alis_build_grantor_name_pairs(seller_last: str, seller_first: str,
         False,         # is_net: this is the NAMED SELLER, not a net
     )]
     idx_pair = _alis_indexed_name_pair((row or {}).get("name") or "")
-    if idx_pair[0] and idx_pair not in name_pairs:
+    # Item 65c — the name box is PREFIX-matched, so the seller's own pass
+    # ("SMITH, JOHN") already returns every row of the indexed spelling
+    # ("SMITH, JOHN Q"): same surname, same document group, and the
+    # indexed first name merely extends the supplied one. Searching both
+    # cost a second paginated search to add 0 rows (and the old tuple
+    # comparison never matched even an IDENTICAL name, because the seller
+    # pair is a 5-tuple). Same coverage rule _add_co_pair has always applied
+    # to co-owners. An entity seller (empty first name) is never "covered".
+    _idx_covered = bool(
+        idx_pair[0] == seller_last.upper() and seller_first.strip()
+        and idx_pair[1].startswith(seller_first.upper()))
+    if idx_pair[0] and not _idx_covered and idx_pair not in name_pairs:
         name_pairs.append(idx_pair)
+    elif _idx_covered and idx_pair[1] != seller_first.upper():
+        notes.append(
+            f"Grantor check: the indexed grantee name '{idx_pair[0]}, "
+            f"{idx_pair[1]}' was not searched separately — the name box is "
+            f"prefix-matched, so the '{seller_last.upper()}, "
+            f"{seller_first.upper()}' search already returns its rows.")
 
     # v3.14 — co-owner names extracted from the deed itself. A co-owner
     # with a different surname conveying alone was invisible to every
@@ -13774,6 +13882,19 @@ def _alis_build_grantor_name_pairs(seller_last: str, seller_first: str,
     # _alis_abstract_party_pairs.
     for co_last, co_first, label in _alis_abstract_party_pairs(
             abstract, notes):
+        # Item 65c — search the abstract's co-owners by their FIRST given-
+        # name token, exactly as _grantee_full_name_pair does for the deed's
+        # ("MARY E" -> "MARY"). The name box is prefix-matched, so the
+        # bare token is a strict superset. Before this the STEP 4.5 prefetch
+        # (abstract only) searched "MARY E", the parties call then started
+        # a SECOND, late search for "MARY", and STEP 7 used only the
+        # latter — one wasted search plus one that gated the grantor check.
+        # With one spelling the three builds produce the same key.
+        tok = (co_first.split() or [""])[0]
+        if tok != co_first:
+            label = label.replace(f"{co_last}, {co_first}",
+                                  f"{co_last}, {tok}")
+            co_first = tok
         _add_co_pair(co_last, co_first, label)
 
     if co_pairs:
@@ -15343,6 +15464,14 @@ async def run_barnstable(
                         "retry later.")
                     await browser.close()
                     return result
+                if _alis_robot_check_html(await page.content()):
+                    result["status"] = "registry_unavailable"
+                    result["errors"].append(
+                        "REGISTRY UNAVAILABLE: the registry served its "
+                        "'Confirm You Are Not A Robot' page (v3.58). Nothing "
+                        "was searched — do NOT treat as deed-not-found.")
+                    await browser.close()
+                    return result
                 if _alis_registry_unavailable_html(await page.content()):
                     result["status"] = "registry_unavailable"
                     result["errors"].append(
@@ -15590,6 +15719,14 @@ async def run_norfolk(
                         "REGISTRY UNAVAILABLE: connection refused/failed "
                         "(hard-down outage). Do NOT treat as deed-not-found; "
                         "retry later.")
+                    await browser.close()
+                    return result
+                if _alis_robot_check_html(await page.content()):
+                    result["status"] = "registry_unavailable"
+                    result["errors"].append(
+                        "REGISTRY UNAVAILABLE: the registry served its "
+                        "'Confirm You Are Not A Robot' page (v3.58). Nothing "
+                        "was searched — do NOT treat as deed-not-found.")
                     await browser.close()
                     return result
                 if _alis_registry_unavailable_html(await page.content()):
@@ -16410,6 +16547,19 @@ def main() -> None:
                 )
                 if _mode_note:
                     result.setdefault("notes", []).insert(0, _mode_note)
+            except AlisRobotCheckError as e:
+                # v3.58 (item 67) — before the parent class, only so the
+                # note says what happened. Same handling: exit 1, no
+                # Playwright fallback (a browser gets the same page).
+                return {"status": "registry_unavailable", "engine": "http",
+                        "notes": [
+                            "REGISTRY UNAVAILABLE: the registry is showing a "
+                            "'Confirm You Are Not A Robot' page to every "
+                            "visitor. No search was performed — do NOT treat "
+                            "this as deed-not-found. Search this registry by "
+                            "hand in a browser, or re-run once the page is "
+                            "gone."],
+                        "errors": [str(e)]}
             except AlisRegistryUnavailableError as e:
                 # No Playwright fallback: the browser would load the same
                 # maintenance page and parse it as zero rows — a false
