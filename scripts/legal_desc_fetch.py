@@ -1,7 +1,22 @@
 #!/usr/bin/env python3
 """
 legal_desc_fetch.py — fast-path for Legal Description Search Workflow
-Version: 3.56
+Version: 3.57
+
+v3.57 changes (item 66 — six Plymouth grid town codes were unknown):
+
+  A HANOVER search returned a same-numbered street in PLYMOUTH at exit 0.
+  The subject's rows carried the grid code 'HNVR', which
+  _PLYMOUTH_TOWN_ABBREVS did not know, so no row matched the town and the
+  address pick took the other town's row (the CRITICAL town-mismatch note
+  fired, as designed). The same runs showed five more unknown codes, all
+  added at once rather than one wrong parcel at a time: HANOVER -> HNVR,
+  HANSON -> HNSN, BROCKTON -> BRKTN, ROCKLAND -> RKLD, PLYMPTON -> PLMTN,
+  EAST BRIDGEWATER -> E BRI. Each was confirmed from live grid rows and
+  matches exactly one of the 27 towns. Live re-run with no --town: the
+  correct deed. Still unharvested: ABINGTON, BRIDGEWATER, HULL,
+  MATTAPOISETT, NORWELL, PEMBROKE, ROCHESTER, WAREHAM, WEST BRIDGEWATER
+  (SCITUATE matches as a substring).
 
 v3.56 changes (item 64 — faster, more accurate deed extraction; the
 description's end point; early co-owner searches; the registry busy page):
@@ -2130,6 +2145,15 @@ _PLYMOUTH_TOWN_ABBREVS: dict[str, str] = {
     # out for 2.5 months. The LAKEVILLE gap returned a MARION deed at exit 0.
     "LAKEVILLE":     "LKVL",   # confirmed 2026-07-08 (harvest); 2026-09-22 run
     "MARION":        "MRION",  # confirmed 2026-07-08 (harvest)
+    # v3.57 (item 66) — the HANOVER gap returned a same-numbered street in
+    # PLYMOUTH at exit 0 (2026-10-19). All six were added together, each
+    # confirmed from live grid rows by a street or party in that town.
+    "HANOVER":       "HNVR",   # confirmed 2026-10-19 (subject rows)
+    "HANSON":        "HNSN",   # confirmed (live grid rows)
+    "BROCKTON":      "BRKTN",  # confirmed (live grid rows)
+    "ROCKLAND":      "RKLD",   # confirmed 2026-10-19 (live grid row)
+    "PLYMPTON":      "PLMTN",  # confirmed (grantee PLYMPTON TOWN OF)
+    "EAST BRIDGEWATER": "E BRI",  # confirmed 2026-10-19 (live grid row)
 }
 
 # v3.51 — the 27 Plymouth County municipalities, as the GRID spells them
