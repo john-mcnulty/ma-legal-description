@@ -1,7 +1,22 @@
 #!/usr/bin/env python3
 """
 legal_desc_fetch.py — fast-path for Legal Description Search Workflow
-Version: 3.58
+Version: 3.59
+
+v3.59 changes (item 68 — a CAPTCHA-blocked run says so plainly):
+
+  v3.58 stopped at the registry's "Confirm You Are Not A Robot" page but
+  reported it as registry_unavailable, the label the nightly backup and
+  the busy page use, and a CAPTCHA that hit only the grantor check left an
+  ordinary "success" with an INCOMPLETE check. Now: a new status,
+  blocked_by_captcha (exit 1), with captcha_blocked / captcha_stage, and a
+  SEARCH BLOCKED message first in the notes (_captcha_block_message). Any
+  robot page any thread sees is recorded (_alis_captcha_mark), so a
+  CAPTCHA caught mid-run still decides the status. before_deed_found: no
+  search, nothing returned. after_deed_found: the report draft gets a
+  "SEARCH BLOCKED BY A CAPTCHA — TITLE NOT VERIFIED" banner and the
+  paste-ready .txt / clipboard delivery is skipped. Never falls back to
+  Playwright (a browser gets the same page).
 
 v3.58 changes (item 65c — redundant prefix searches in the ALIS grantor check):
 
@@ -8764,6 +8779,56 @@ def _alis_robot_check_html(html: str) -> bool:
             or 'id="robot"' in lowered)
 
 
+# v3.59 (item 68) — every robot page any thread sees during a run is
+# recorded here, so a CAPTCHA that hit only a grantor search or an abstract
+# (where the error is caught and the run carries on) still decides the
+# run's status. Reset at the start of each run_alis_http().
+_ALIS_CAPTCHA_LOCK = threading.Lock()
+_ALIS_CAPTCHA_SEEN = {"seen": False, "url": None}
+
+
+def _alis_captcha_reset() -> None:
+    with _ALIS_CAPTCHA_LOCK:
+        _ALIS_CAPTCHA_SEEN["seen"] = False
+        _ALIS_CAPTCHA_SEEN["url"] = None
+
+
+def _alis_captcha_mark(url: str) -> None:
+    with _ALIS_CAPTCHA_LOCK:
+        if not _ALIS_CAPTCHA_SEEN["seen"]:
+            _ALIS_CAPTCHA_SEEN["url"] = url
+        _ALIS_CAPTCHA_SEEN["seen"] = True
+
+
+def _alis_captcha_seen() -> bool:
+    with _ALIS_CAPTCHA_LOCK:
+        return bool(_ALIS_CAPTCHA_SEEN["seen"])
+
+
+def _captcha_block_message(registry: str, deed_found: bool = False) -> str:
+    """
+    v3.59 (item 68) — the one message a CAPTCHA-blocked run leads with,
+    worded so it cannot be read as a search that ran and found nothing.
+    `deed_found` is the partway case: the deed was read before the CAPTCHA
+    appeared, but the ownership / deed-out check did not finish.
+    """
+    reg = (registry or "").strip()
+    reg = f"the {reg} Registry of Deeds" if reg else "the Registry of Deeds"
+    head = (f"SEARCH BLOCKED — {reg} is showing a CAPTCHA ('Confirm You Are "
+            f"Not A Robot') to every visitor. The plugin is designed to stop "
+            f"at a CAPTCHA and not proceed with the search")
+    if not deed_found:
+        return (head + ", so no search was performed and no results are "
+                "being returned. This is not a 'no deed found' result.")
+    return (head + ", so the search stopped partway through. The vesting "
+            "deed and its legal description were read before the CAPTCHA "
+            "appeared, but the check that the seller still owns the property "
+            "and has not deeded it out was NOT completed. TITLE IS NOT "
+            "VERIFIED, and no paste-ready legal description is delivered; "
+            "the report draft is kept for reference only. This is not a "
+            "'no deed found' result.")
+
+
 class AlisServerBusyError(RuntimeError):
     """
     v3.56 (item 64) — the registry answered with its "server is unable to
@@ -8845,6 +8910,7 @@ def _alis_http_get(session, url: str, params=None, timeout: int = 30,
             if resp.status_code == 200:
                 ctype = resp.headers.get("Content-Type", "")
                 if "html" in ctype and _alis_robot_check_html(resp.text):
+                    _alis_captcha_mark(url)
                     raise AlisRobotCheckError(
                         f"Registry served its 'Confirm You Are Not A Robot' "
                         f"page instead of the request. This is NOT an empty "
@@ -13296,6 +13362,18 @@ def _write_markdown_report(result: dict, base_name: str, seller_display: str,
         "> Title Flags / Notes section (judgment calls are tagged) before",
         "> delivering. Remove this banner when finalized.",
         "",
+    ]
+    if result.get("captcha_blocked"):
+        # v3.59 (item 68) — first thing in the report, above the description.
+        _msg = _captcha_block_message(result.get("registry"), deed_found=True)
+        _msg = _msg.split(" — ", 1)[-1]
+        L += [
+            "> **SEARCH BLOCKED BY A CAPTCHA — TITLE NOT VERIFIED.**",
+            ">",
+            "> " + _msg[:1].upper() + _msg[1:],
+            "",
+        ]
+    L += [
         "---",
         "",
         "## LEGAL DESCRIPTION",
@@ -14063,6 +14141,7 @@ def run_alis_http(
                                   document number on Land Court)
     """
     grantor_town = grantor_town if grantor_town is not None else town
+    _alis_captcha_reset()   # v3.59 (item 68)
     result = {
         "status": "error",
         "engine": "http",
@@ -15373,6 +15452,19 @@ def run_alis_http(
     result["status"] = "success" if result["files"] else "error"
     if not result["files"] and not result["errors"]:
         result["errors"].append("No files downloaded.")
+    # v3.59 (item 68) — a CAPTCHA hit a later request (a grantor search, an
+    # abstract) after the deed was read. Those errors are caught so the run
+    # carries on, which used to leave an ordinary "success" with an
+    # INCOMPLETE grantor check — an inconclusive-looking result. Say what
+    # happened first, in the notes and at the top of the report, then
+    # downgrade the status after the report is written (the report needs
+    # the deed fields; delivery of the paste-ready text is skipped).
+    _captcha_partway = _alis_captcha_seen() and result["status"] == "success"
+    if _captcha_partway:
+        result["captcha_blocked"] = True
+        result["captcha_stage"] = "after_deed_found"
+        result["notes"].insert(0, _captcha_block_message(
+            result.get("registry") or registry_label, deed_found=True))
 
     # v3.31 — finalise timings here rather than at the return, because the
     # report footer below reads them. Report rendering is therefore the one
@@ -15388,6 +15480,8 @@ def run_alis_http(
         )
     except Exception as e:
         result["notes"].append(f"Report draft failed (non-fatal): {e}")
+    if _captcha_partway:
+        result["status"] = "blocked_by_captcha"
     return result
 
 
@@ -15465,11 +15559,14 @@ async def run_barnstable(
                     await browser.close()
                     return result
                 if _alis_robot_check_html(await page.content()):
-                    result["status"] = "registry_unavailable"
+                    result["status"] = "blocked_by_captcha"
+                    result["captcha_blocked"] = True
+                    result["captcha_stage"] = "before_deed_found"
+                    result.setdefault("notes", []).insert(
+                        0, _captcha_block_message(result.get("registry")))
                     result["errors"].append(
-                        "REGISTRY UNAVAILABLE: the registry served its "
-                        "'Confirm You Are Not A Robot' page (v3.58). Nothing "
-                        "was searched — do NOT treat as deed-not-found.")
+                        "Registry served its 'Confirm You Are Not A Robot' "
+                        "page (v3.58/v3.59).")
                     await browser.close()
                     return result
                 if _alis_registry_unavailable_html(await page.content()):
@@ -15722,11 +15819,14 @@ async def run_norfolk(
                     await browser.close()
                     return result
                 if _alis_robot_check_html(await page.content()):
-                    result["status"] = "registry_unavailable"
+                    result["status"] = "blocked_by_captcha"
+                    result["captcha_blocked"] = True
+                    result["captcha_stage"] = "before_deed_found"
+                    result.setdefault("notes", []).insert(
+                        0, _captcha_block_message(result.get("registry")))
                     result["errors"].append(
-                        "REGISTRY UNAVAILABLE: the registry served its "
-                        "'Confirm You Are Not A Robot' page (v3.58). Nothing "
-                        "was searched — do NOT treat as deed-not-found.")
+                        "Registry served its 'Confirm You Are Not A Robot' "
+                        "page (v3.58/v3.59).")
                     await browser.close()
                     return result
                 if _alis_registry_unavailable_html(await page.content()):
@@ -16548,17 +16648,14 @@ def main() -> None:
                 if _mode_note:
                     result.setdefault("notes", []).insert(0, _mode_note)
             except AlisRobotCheckError as e:
-                # v3.58 (item 67) — before the parent class, only so the
-                # note says what happened. Same handling: exit 1, no
+                # v3.58 (item 67) — before the parent class. Exit 1, no
                 # Playwright fallback (a browser gets the same page).
-                return {"status": "registry_unavailable", "engine": "http",
-                        "notes": [
-                            "REGISTRY UNAVAILABLE: the registry is showing a "
-                            "'Confirm You Are Not A Robot' page to every "
-                            "visitor. No search was performed — do NOT treat "
-                            "this as deed-not-found. Search this registry by "
-                            "hand in a browser, or re-run once the page is "
-                            "gone."],
+                # v3.59 (item 68) — its own status and a plain message.
+                return {"status": "blocked_by_captcha", "engine": "http",
+                        "captcha_blocked": True,
+                        "captcha_stage": "before_deed_found",
+                        "registry": label,
+                        "notes": [_captcha_block_message(label)],
                         "errors": [str(e)]}
             except AlisRegistryUnavailableError as e:
                 # No Playwright fallback: the browser would load the same
@@ -16589,6 +16686,18 @@ def main() -> None:
             except Exception as e:
                 result = {"status": "error", "engine": "http",
                           "notes": [], "errors": [f"HTTP engine failed: {e}"]}
+            # v3.59 (item 68) — a CAPTCHA the run caught and carried on past
+            # (e.g. one search section) must never surface as deed_not_found
+            # or error, and must never fall back to Playwright.
+            if result.get("status") == "blocked_by_captcha":
+                return result   # the partway case, already labelled
+            if _alis_captcha_seen() and result.get("status") != "success":
+                result["notes"] = ([_captcha_block_message(label)]
+                                   + list(result.get("notes") or []))
+                result.update({"status": "blocked_by_captcha",
+                               "captcha_blocked": True,
+                               "captcha_stage": "before_deed_found"})
+                return result
             if args.engine == "http" or result.get("status") in ("success", "deed_not_found"):
                 return result
             http_errors = "; ".join(result.get("errors") or []) or "unknown error"
