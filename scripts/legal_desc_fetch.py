@@ -1,7 +1,26 @@
 #!/usr/bin/env python3
 """
 legal_desc_fetch.py — fast-path for Legal Description Search Workflow
-Version: 3.59
+Version: 3.60
+
+v3.60 changes (item 71 — a non-conveyance is never reported as a deed-out):
+
+  An instrument at the subject parcel that is NOT a conveyance could still
+  draw "CRITICAL ... the seller has deeded the subject parcel out", on two
+  ALIS paths that skipped the v3.36 three-way instrument class: the
+  --verify-grantor-hit verdict (it reused the page-1 sampler's note, which
+  assumes a conveyance), and the page-1 sampler itself, which samples
+  UNRECOGNISED types by design. Live: a conservation commission Order of
+  Conditions (type ORDER) and its Certificate of Compliance were each
+  reported as a deed-out, while the same run's classifier had them right.
+  Plymouth's verified-hit verdict had the milder form (an unrecognised type
+  went to CRITICAL). All three now share _verified_hit_subject_note():
+  conveyance -> CRITICAL (unchanged); non-conveyance -> the v3.38
+  significance note or an encumbrance NOTE; unrecognised -> a WARNING to
+  read it, quoting the extraction's first title flag. A deed at the subject
+  is still CRITICAL on every path. Also: ALIS grantor_hit_verification now
+  carries `status`/`requested` (it read null), including `not_found`.
+
 
 v3.59 changes (item 68 — a CAPTCHA-blocked run says so plainly):
 
@@ -4372,6 +4391,59 @@ def _significance_note(rid: str, deed_type: str, date: str, where: str,
             f"parcel runs with the land — read it and disclose it."
         )
     return None
+
+
+def _verified_hit_subject_note(cite: str, deed_type: str, date: str,
+                               address: str, desc: str = "",
+                               title_flags=None, verified: bool = True) -> str:
+    """
+    v3.60 (item 71) — the note for a --verify-grantor-hit instrument whose
+    extracted address IS the subject property. Shared by ALIS and Plymouth.
+
+    Before this, the ALIS path sent every subject-address verification
+    through the deed-out wording ("conveys the SUBJECT property — the seller
+    has deeded the subject parcel out") with no look at the instrument
+    type, and Plymouth upgraded anything not positively non-conveyance —
+    including an UNRECOGNISED type — to CRITICAL. A wetlands Order of
+    Conditions (type ORDER) and its Certificate of Compliance were both
+    reported as deed-outs of the subject parcel, while the same run's
+    classifier had correctly called them unclassified / an encumbrance.
+    Verification reads MORE of the instrument than the classifier, so it
+    must never reach a harsher verdict on less evidence.
+
+    Same three tiers as the grantor-hit classifier (v3.36):
+      conveyance     -> CRITICAL deed-out (unchanged)
+      non_conveyance -> the v3.38 significance note, else an encumbrance NOTE
+      unknown        -> WARNING: read it; quotes the extraction's first
+                        title flag, which is usually what the instrument is
+    """
+    cls = _classify_instrument(deed_type or "")
+    who = "verified grantor hit" if verified else "grantor hit"
+    where = f" — {'extracted' if verified else 'sampled'} address '{address}'"
+    if cls == "conveyance":
+        return (
+            f"CRITICAL: {who} {cite} ({deed_type} {date}) is a "
+            f"conveyance at the SUBJECT property{where} — the seller has "
+            "deeded the subject parcel out. Stop and resolve before closing."
+        )
+    if cls == "non_conveyance":
+        return _significance_note(
+            f"{cite} (verified)" if verified else cite, deed_type, date, where, desc or ""
+        ) or (
+            f"NOTE: {who} {cite} ({deed_type} {date}) is at the "
+            f"SUBJECT property{where} but is not a conveyance — assess it as "
+            "an encumbrance (mortgage/homestead/lien/order), not a deed-out."
+        )
+    flags = [f for f in (title_flags or []) if isinstance(f, str) and f.strip()]
+    reading = (f" The extraction reads it as: {flags[0].strip()!r}."
+               if flags else "")
+    return (
+        f"WARNING: {who} {cite} has UNRECOGNISED type "
+        f"{deed_type!r} ({date}) at the SUBJECT property{where} — NOT "
+        "classified, and NOT reported as a deed-out." + reading +
+        " Read the instrument to decide whether it conveys, encumbers or "
+        "runs with the land, and add the type to the script vocabulary."
+    )
 
 
 def _taking_caveat(deed_type: str) -> str:
@@ -10312,7 +10384,16 @@ def _alis_hit_address_note(result: dict, r: dict, address, st_num: str,
             f"{ref} to fetch and read the full instrument. [{what}]"
         )
         return
-    if _alis_address_matches(st_num, st_word, address):
+    if (_alis_address_matches(st_num, st_word, address)
+            and _classify_instrument(r.get("doc_type") or "") != "conveyance"):
+        # v3.60 (item 71) — the page-1 sampler deliberately samples
+        # UNRECOGNISED types too (v3.36), so a non-conveyance can reach this
+        # point; it must not get the deed-out wording below. A wetlands
+        # Order of Conditions (type ORDER) did, on the sampler path.
+        result["notes"].append(_verified_hit_subject_note(
+            rid, r.get("doc_type") or "", r.get("date_received") or "",
+            address, r.get("doc_desc") or "", verified=False))
+    elif _alis_address_matches(st_num, st_word, address):
         result["notes"].append(
             f"CRITICAL: grantor hit {rid} ({r['doc_type']} "
             f"{r['date_received']}) conveys the SUBJECT property "
@@ -12149,12 +12230,11 @@ def _plymouth_extract_verified_hit(result: dict, *, extract_pdf: bool,
                 f"different parcel. READ: {names}")
         elif street_number and street_name and _alis_address_matches(
                 street_number, street_name, addr):
-            sev = ("CRITICAL" if _classify_instrument(ver.get("doc_type") or "")
-                   != "non_conveyance" else "NOTE")
-            result["notes"].append(
-                f"{sev}: verified grantor hit {cite} "
-                f"({ver.get('doc_type')}) is at the SUBJECT property — "
-                f"extracted address '{addr}'.")
+            # v3.60 (item 71) — three-way, shared with ALIS. An UNRECOGNISED
+            # type used to land on CRITICAL here.
+            result["notes"].append(_verified_hit_subject_note(
+                cite, ver.get("doc_type") or "", ver.get("recorded_date") or "",
+                addr, title_flags=fields.get("title_flags")))
         elif street_name and _alis_street_word_matches(street_name, addr):
             result["notes"].append(
                 f"WARNING: verified grantor hit {cite}: extracted address "
@@ -15221,6 +15301,9 @@ def run_alis_http(
                     target_hit = r
                     break
             if target_hit is None:
+                result["grantor_hit_verification"] = {
+                    "status": "not_found", "requested": verify_grantor_hit,
+                    "files": [], "extraction": None}
                 result["notes"].append(
                     f"--verify-grantor-hit {verify_grantor_hit} did not match "
                     "any grantor-check hit. Hits found: "
@@ -15233,7 +15316,13 @@ def run_alis_http(
                     session, base_url, target_hit, base_name, output_folder,
                     result["notes"], result["errors"], label=_hit_label(target_hit),
                 )
+                # v3.60 (item 71) — `status`/`requested` as on Plymouth (the
+                # SKILL.md contract); ALIS never set them, so status read null.
                 result["grantor_hit_verification"] = {
+                    "status": ("downloaded" if vfetch["ok"]
+                               else "download_incomplete" if vfetch["files"]
+                               else "download_failed"),
+                    "requested": verify_grantor_hit,
                     **_hit_meta(target_hit),
                     "files": vfetch["files"],
                     "extraction": None,
@@ -15429,9 +15518,24 @@ def run_alis_http(
                         else:
                             result["grantor_hit_verification"]["extraction"] = fields
                             if "error" not in fields:
-                                _hit_address_note(
-                                    target_hit, fields.get("property_address"),
-                                    "full extraction via --verify-grantor-hit")
+                                v_addr = fields.get("property_address")
+                                if (st_num and st_word and v_addr
+                                        and _alis_address_matches(st_num, st_word, v_addr)):
+                                    # v3.60 (item 71) — at the subject parcel the
+                                    # verdict depends on WHAT the instrument is;
+                                    # _alis_hit_address_note assumes a conveyance
+                                    # (it was written for the page-1 sampler,
+                                    # which only ever samples conveyance types).
+                                    result["notes"].append(_verified_hit_subject_note(
+                                        _alis_row_id(target_hit),
+                                        target_hit.get("doc_type") or "",
+                                        target_hit.get("date_received") or "",
+                                        v_addr, target_hit.get("doc_desc") or "",
+                                        fields.get("title_flags")))
+                                else:
+                                    _hit_address_note(
+                                        target_hit, v_addr,
+                                        "full extraction via --verify-grantor-hit")
         elif not extract_pdf and need_extract:
             # v3.27 — name the files: in claude-code mode these are an
             # instruction, not a warning. Only hits whose registry abstract
