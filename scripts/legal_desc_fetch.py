@@ -1,7 +1,56 @@
 #!/usr/bin/env python3
 """
 legal_desc_fetch.py — fast-path for Legal Description Search Workflow
-Version: 3.60
+Version: 3.61
+
+v3.61 changes (item 70 — Plymouth never saves the wrong image as a success):
+
+  Three ways a Plymouth image download could save something other than the
+  requested page and still report success, found by cross-checking every
+  image of a 778-instrument county sweep:
+
+  * A placeholder saved as a page. The viewer's <img> holds a 32x32
+    loading.gif until the page render arrives, and its src was read after a
+    fixed delay. _download_viewer_image() now waits for the rendered page
+    (_plymouth_wait_viewer_image) and every body passes
+    _page_image_problem() before it is written: a GIF, an HTML page, a
+    body under 5 KB or an image under 300 px is refused. Page turns wait
+    for the NEXT page's src instead of a fixed 2 s, so the previous page
+    is not saved twice; a byte-identical repeat is warned about.
+
+  * Another instrument's image saved under the requested Book/Page. The
+    viewer shows whatever document the SESSION last opened and names no
+    Book/Page of its own (measured live). --verify-grantor-hit opened its
+    instrument in the context that had just viewed the vesting deed, so a
+    hit with no viewable image could come back as the vesting deed's
+    pages, "downloaded". Each attempt now runs in its own browser context;
+    a missing image tab or a viewer that never renders fails as "image not
+    available online"; and no saved page may be byte-identical to a page
+    of the vesting deed (if one is, the files are deleted).
+
+  * A row clicked by a stale ctl. _open_detail_panel's "expected book"
+    wait looked for the book number anywhere in the page text, which the
+    results grid itself satisfies. _plymouth_confirm_panel() now reads the
+    detail panel's own header (Doc. # and Book/Page) and requires the
+    selected instrument before parties are read or images opened — on the
+    main run and on --verify-grantor-hit. A mismatch is retried once after
+    re-locating the row, then stops the run with no images. It also
+    separates several documents recorded on one old book page.
+
+  Town codes: the last ten grid codes are in _PLYMOUTH_TOWN_ABBREVS
+  (ABGTN, BRI, HULL, MTPST, NRWL, PMBRK, RCHTR, SCIT, WRHM, W BRI), so all
+  27 municipalities resolve. _town_matches_filter() compares two exactly
+  named Plymouth towns as towns: the substring test read the code 'BRI'
+  (Bridgewater) as a match for EAST and WEST BRIDGEWATER.
+
+  Middlesex South and Suffolk (same platform) get the panel check too,
+  through _avenu_panel_guard(): Book/Page on Recorded Land, the document
+  number on Land Court, and _msouth_download_viewer_image() refuses a
+  placeholder body. Their runners already waited for the rendered page.
+  A successful check is written to the notes ("Detail panel confirmed as
+  the selected instrument ...") on all three registries, and a panel that
+  holds none of the expected fields is "unreadable", never a confirmation.
+
 
 v3.60 changes (item 71 — a non-conveyance is never reported as a deed-out):
 
@@ -2201,6 +2250,7 @@ def _norfolk_resolve_town(town_arg: str, base_name: str) -> tuple[str, list[str]
 # Plymouth County properties (multi-result name search); single-result runs
 # accept any unrecognized abbreviation and log a NOTE prompting the addition.
 # Add new entries as observed from WARNING/NOTE messages in run output.
+# v3.61 — the table now holds all 27 municipalities.
 _PLYMOUTH_TOWN_ABBREVS: dict[str, str] = {
     "CARVER":        "CRVR",   # confirmed 2026-05-14 (address-search result row)
     "DUXBURY":       "DXBY",   # confirmed 2026-05-11 (grantor check output)
@@ -2225,6 +2275,19 @@ _PLYMOUTH_TOWN_ABBREVS: dict[str, str] = {
     "ROCKLAND":      "RKLD",   # confirmed 2026-10-19 (live grid row)
     "PLYMPTON":      "PLMTN",  # confirmed (grantee PLYMPTON TOWN OF)
     "EAST BRIDGEWATER": "E BRI",  # confirmed 2026-10-19 (live grid row)
+    # v3.61 (item 70) — the last ten, completing all 27 municipalities. Every
+    # code was read off live grid rows in a county-wide 2026-09-21..10-22
+    # date-range search (778 rows; each code seen on 9 to 48 rows).
+    "ABINGTON":      "ABGTN",
+    "BRIDGEWATER":   "BRI",
+    "HULL":          "HULL",
+    "MATTAPOISETT":  "MTPST",
+    "NORWELL":       "NRWL",
+    "PEMBROKE":      "PMBRK",
+    "ROCHESTER":     "RCHTR",
+    "SCITUATE":      "SCIT",
+    "WAREHAM":       "WRHM",
+    "WEST BRIDGEWATER": "W BRI",
 }
 
 # v3.51 — the 27 Plymouth County municipalities, as the GRID spells them
@@ -2243,6 +2306,257 @@ _PLYMOUTH_TOWNS: tuple[str, ...] = (
 # Grid town cells that carry no town at all. `_town_matches_filter` must never
 # see an empty code: "" is a substring of every town name, so it "matches".
 _PLYMOUTH_TOWNLESS_CODES = frozenset({"", "NONE", "SEEBK"})
+
+# v3.61 (item 70) — the Towns-dropdown spelling of a grid town name.
+_PLYMOUTH_TOWN_ALIASES: dict[str, str] = {"MIDDLEBORO": "MIDDLEBOROUGH"}
+
+
+def _plymouth_town_of(s: str) -> str:
+    """
+    v3.61 (item 70) — the Plymouth County town that `s` names EXACTLY (a
+    full town name, the dropdown spelling, or a grid code), else "". A
+    partial or unknown string returns "" and is left to the substring test.
+    """
+    s = " ".join((s or "").upper().split())
+    if s in _PLYMOUTH_TOWNS:
+        return s
+    if s in _PLYMOUTH_TOWN_ALIASES:
+        return _PLYMOUTH_TOWN_ALIASES[s]
+    # Read the table live (it is small): a code is known only while its
+    # entry exists.
+    return next((full for full, code in _PLYMOUTH_TOWN_ABBREVS.items()
+                 if code == s), "")
+
+
+# v3.61 (item 70) — a saved page image must be a real page. The viewer's
+# <img> shows a 32x32 'loading.gif' until the page render arrives, and that
+# placeholder was being saved as a deed page and reported as a success.
+_PAGE_IMAGE_MIN_BYTES = 5000
+_PAGE_IMAGE_MIN_PIXELS = 300   # the viewer's default thumbnail is ~527x682
+
+
+def _image_dimensions(body: bytes):
+    """(width, height) read from a GIF / PNG / JPEG header, else None."""
+    try:
+        if body[:6] in (b"GIF87a", b"GIF89a"):
+            return (int.from_bytes(body[6:8], "little"),
+                    int.from_bytes(body[8:10], "little"))
+        if body[:8] == b"\x89PNG\r\n\x1a\n":
+            return (int.from_bytes(body[16:20], "big"),
+                    int.from_bytes(body[20:24], "big"))
+        if body[:2] == b"\xff\xd8":
+            i = 2
+            while i + 9 < len(body):
+                if body[i] != 0xFF:
+                    i += 1
+                    continue
+                marker = body[i + 1]
+                if marker == 0xFF:          # fill byte
+                    i += 1
+                    continue
+                if marker in (0x01, 0xD8) or 0xD0 <= marker <= 0xD7:
+                    i += 2                  # markers with no length field
+                    continue
+                seg = int.from_bytes(body[i + 2:i + 4], "big")
+                if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                              0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                    return (int.from_bytes(body[i + 7:i + 9], "big"),
+                            int.from_bytes(body[i + 5:i + 7], "big"))
+                if seg < 2:
+                    return None
+                i += 2 + seg
+    except Exception:
+        pass
+    return None
+
+
+def _page_image_problem(body: bytes) -> str:
+    """
+    v3.61 (item 70) — why `body` is NOT a usable page image, or "" if it is.
+    Unknown formats pass on size alone (TIFF pages exist on this platform).
+    """
+    if not body or len(body) < _PAGE_IMAGE_MIN_BYTES:
+        return f"only {len(body or b'')} bytes"
+    if body[:6] in (b"GIF87a", b"GIF89a"):
+        return "a GIF (the viewer's loading placeholder), not a page scan"
+    head = body[:300].lstrip().lower()
+    if head.startswith(b"<!doctype") or head.startswith(b"<html"):
+        return "an HTML page, not an image"
+    dims = _image_dimensions(body)
+    if dims and max(dims) < _PAGE_IMAGE_MIN_PIXELS:
+        return f"only {dims[0]}x{dims[1]} px"
+    return ""
+
+
+def _file_md5(path) -> str:
+    import hashlib
+    try:
+        return hashlib.md5(Path(path).read_bytes()).hexdigest()
+    except Exception:
+        return ""
+
+
+_VIEWER_IMG_READY_JS = (
+    "() => { const i = document.querySelector('#ImageViewer1_docImage');"
+    " return !!(i && i.src && i.src.includes('ACSResource')"
+    " && i.complete && i.naturalWidth > 100); }"
+)
+_VIEWER_IMG_SRC_JS = (
+    "() => { const i = document.querySelector('#ImageViewer1_docImage');"
+    " return i ? i.src : null; }"
+)
+
+
+async def _plymouth_wait_viewer_image(page: Page, timeout_ms: int = 15000,
+                                      previous_src: str = "") -> bool:
+    """
+    v3.61 (item 70) — wait until the viewer shows a rendered page: an
+    ACSResource src (not loading.gif), loaded, and — after a page turn —
+    different from `previous_src`. False on timeout; never raises.
+    """
+    waited = 0
+    while waited <= timeout_ms:
+        try:
+            if await page.evaluate(_VIEWER_IMG_READY_JS):
+                if not previous_src or (
+                        await page.evaluate(_VIEWER_IMG_SRC_JS)) != previous_src:
+                    return True
+        except Exception:
+            pass
+        await page.wait_for_timeout(250)
+        waited += 250
+    return False
+
+
+async def _plymouth_panel_identity(page: Page) -> dict:
+    """
+    v3.61 (item 70) — which instrument the detail panel is showing, read
+    from the panel's own header table (Doc. # | Rec Date | ... | Book/Page).
+    Returns {"doc": str, "book": str, "page": str}; {} if it cannot be read.
+    """
+    try:
+        text = await page.inner_text('[id*="DocDetails"]', timeout=2000)
+    except Exception:
+        return {}
+    return _plymouth_parse_panel_identity(text)
+
+
+def _plymouth_parse_panel_identity(text: str) -> dict:
+    """The header row and the value row under it, as tab-separated text."""
+    lines = [ln for ln in (text or "").splitlines() if ln.strip()]
+    rec = {}
+    for i, ln in enumerate(lines[:-1]):
+        heads = [c.strip() for c in ln.split("\t")]
+        if "Doc. #" in heads and "Book/Page" in heads:
+            vals = [c.strip().replace(" ", "") for c in lines[i + 1].split("\t")]
+            if len(vals) == len(heads):
+                rec = dict(zip(heads, vals))
+            break
+    if not rec:
+        return {}
+    bk, _, pg = (rec.get("Book/Page") or "").partition("/")
+    doc = (rec.get("Doc. #") or "").strip()
+    if not doc and not bk.strip():
+        return {}
+    return {"doc": doc, "book": bk.strip().lstrip("0"),
+            "page": pg.strip().lstrip("0")}
+
+
+def _plymouth_panel_mismatch(ident: dict, book: str = "", pg: str = "",
+                             doc: str = "") -> str:
+    """"" when the panel identity agrees with every expected value given."""
+    bad = []
+    for label, want, got in (("Doc #", doc, ident.get("doc")),
+                             ("Book", book, ident.get("book")),
+                             ("Page", pg, ident.get("page"))):
+        want = str(want or "").strip().lstrip("0")
+        got = str(got or "").strip().lstrip("0")
+        if want and got and want != got:
+            bad.append(f"{label} {got} (expected {want})")
+    return ", ".join(bad)
+
+
+def _plymouth_panel_compared(ident: dict, book: str = "", pg: str = "",
+                             doc: str = "") -> list:
+    """The expected values the panel actually HAD a value to compare with."""
+    return [label for label, want, got in (
+                ("Doc #", doc, ident.get("doc")),
+                ("Book", book, ident.get("book")),
+                ("Page", pg, ident.get("page")))
+            if str(want or "").strip() and str(got or "").strip()]
+
+
+async def _plymouth_confirm_panel(page: Page, book: str = "", pg: str = "",
+                                  doc: str = "", timeout_ms: int = 8000) -> tuple:
+    """
+    v3.61 (item 70) — confirm the detail panel shows the instrument that was
+    clicked BEFORE its images are opened. The image viewer carries no
+    Book/Page or document number of its own (measured live), so the panel is
+    the only place the identity can be checked — and a row clicked by a
+    stale ctl after a pager walk opens some other instrument's panel.
+
+    Polls, because the panel is an AJAX re-render and the previous row's
+    panel can still be on screen. Returns (status, detail):
+      "ok"         the panel names the expected instrument (detail says
+                   what was compared, for the run notes)
+      "mismatch"   the panel names a DIFFERENT instrument (detail says which)
+      "unreadable" the panel header could not be read, or it held none of
+                   the expected fields — nothing was compared, so this is
+                   never reported as a confirmation
+    """
+    waited, ident, bad, compared = 0, {}, "", []
+    while waited <= timeout_ms:
+        ident = await _plymouth_panel_identity(page)
+        if ident:
+            bad = _plymouth_panel_mismatch(ident, book, pg, doc)
+            compared = _plymouth_panel_compared(ident, book, pg, doc)
+            if not bad and compared:
+                return "ok", (
+                    "Detail panel confirmed as the selected instrument ("
+                    + "/".join(compared) + " match: Doc # "
+                    + (ident.get("doc") or "n/a") + ", Book/Page "
+                    + ((ident.get("book") or "") + "/" + (ident.get("page") or "")
+                       if ident.get("book") else "n/a") + ").")
+        await page.wait_for_timeout(400)
+        waited += 400
+    if not ident or (not bad and not compared):
+        return "unreadable", ""
+    return "mismatch", bad
+
+
+async def _avenu_panel_guard(page: Page, result: dict, book: str = "",
+                             pg: str = "", doc: str = "",
+                             timeout_ms: int = 20000) -> bool:
+    """
+    v3.61 (item 70) — the same detail-panel identity check for the
+    masslandrecords registries (Middlesex South, Suffolk), whose panel has
+    the same header row. Pass Book/Page for Recorded Land and the document
+    number for Land Court (a Land Court panel's Book/Page is the
+    registration book, not something the grid row carries).
+
+    Returns False — after appending an error — when the panel names a
+    DIFFERENT instrument; the caller must stop without opening images.
+    An unreadable header is a WARNING and returns True.
+    """
+    status, bad = await _plymouth_confirm_panel(
+        page, book=book, pg=pg, doc=doc, timeout_ms=timeout_ms)
+    if status == "mismatch":
+        want = (f"Bk {book}/Pg {pg}" if book else f"Doc {doc}")
+        result["errors"].append(
+            f"The detail panel opened for a DIFFERENT instrument than the "
+            f"one selected ({want}): panel shows {bad}. No images were "
+            "downloaded — they would have been another document's. Re-run "
+            "the search.")
+        return False
+    if status == "unreadable":
+        result["notes"].append(
+            "WARNING: the detail panel's Doc #/Book/Page header could not "
+            "be read, so the instrument was NOT confirmed before its images "
+            "were opened — check the recording stamp against the selected "
+            "instrument.")
+    if status == "ok":
+        result["notes"].append(bad)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -2263,7 +2577,15 @@ async def _download_viewer_image(page: Page, output_path: Path) -> str:
     failing the run. The caller reports the method per page, and warns when
     any page was not the hi-res render.
     Returns: 'hires_src_download' | 'src_download' | 'screenshot' | 'failed'
+
+    v3.61 (item 70) — the <img> shows a 32x32 loading.gif until the render
+    arrives; reading its src too early saved that placeholder as a page and
+    reported success. Now waits for the rendered page, and every body is
+    checked by _page_image_problem() before it is written. A page that
+    never renders returns 'failed' — no screenshot of a placeholder.
     """
+    if not await _plymouth_wait_viewer_image(page):
+        return "failed"
     src = None
     try:
         # .src (property) is already absolute; the attribute may be relative.
@@ -2287,7 +2609,7 @@ async def _download_viewer_image(page: Page, output_path: Path) -> str:
                 resp = await page.request.get(hi)
                 if resp.ok:
                     body = await resp.body()
-                    if len(body) > 5000:  # sanity: not an error page / placeholder
+                    if not _page_image_problem(body):
                         output_path.write_bytes(body)
                         return "hires_src_download"
             except Exception:
@@ -2296,8 +2618,10 @@ async def _download_viewer_image(page: Page, output_path: Path) -> str:
         try:
             response = await page.request.get(src)
             if response.ok:
-                output_path.write_bytes(await response.body())
-                return "src_download"
+                body = await response.body()
+                if not _page_image_problem(body):
+                    output_path.write_bytes(body)
+                    return "src_download"
         except Exception:
             pass
 
@@ -2305,7 +2629,9 @@ async def _download_viewer_image(page: Page, output_path: Path) -> str:
     if img_el:
         try:
             await img_el.screenshot(path=str(output_path))
-            return "screenshot"
+            if not _page_image_problem(output_path.read_bytes()):
+                return "screenshot"
+            output_path.unlink()
         except Exception:
             pass
 
@@ -2453,19 +2779,32 @@ async def _plymouth_book_search(page: Page, book: str, pg: str,
 async def _plymouth_open_and_download_instrument(
     context, book: str, pg: str, base_name: str, label: str,
     output_folder: Path, notes: list, errors: list,
+    other_files: list = None,
 ) -> dict:
     """
     v3.50 — Book Search one instrument in a FRESH page, open its detail
     panel, and download every page image at the 2000 px render. Used by
     --verify-grantor-hit. Returns {"rows", "detail", "files", "ok"}.
     One retry in a new page on a search timeout.
+
+    v3.61 (item 70) — this could save ANOTHER instrument's image under the
+    requested Bk/Pg and return ok. The image viewer shows whatever document
+    the SESSION last opened, and names no Book/Page of its own; when the
+    requested instrument has no viewable image, a session that had already
+    viewed a document (here: the vesting deed, in the shared context) served
+    that earlier document again. Three guards:
+      * every attempt runs in its OWN browser context, so the session has
+        no earlier document to fall back to;
+      * the detail panel must name the requested Bk/Pg before the image tab
+        is opened (_plymouth_confirm_panel), and the image tab must exist;
+      * no saved page may be byte-identical to one of `other_files` (the
+        vesting deed's pages) — if one is, everything is deleted and the
+        download fails as "image not available".
     """
     out = {"rows": [], "detail": None, "files": [], "ok": False}
+    other_hashes = {h for h in (_file_md5(f) for f in (other_files or [])) if h}
     for attempt in (1, 2):
-        # Attempt 2 runs in a NEW browser context: the intermittent Book
-        # Search timeouts were per-session and cleared with a fresh session.
-        ctx = context if attempt == 1 else await context.browser.new_context(
-            accept_downloads=True)
+        ctx = await context.browser.new_context(accept_downloads=True)
         vpage = await ctx.new_page()
         try:
             rows = await _plymouth_book_search(vpage, book, pg)
@@ -2474,28 +2813,48 @@ async def _plymouth_open_and_download_instrument(
                 notes.append(f"Book Search found NO instrument at Bk {book}/Pg {pg}.")
                 return out
             live_ctl = rows[0]["ctl"]
-            if await _open_detail_panel(vpage, ctl=live_ctl, expected_book=book):
-                out["detail"] = await _read_detail_panel(vpage)
+            if not await _open_detail_panel(vpage, ctl=live_ctl, expected_book=book):
+                raise RuntimeError("the detail panel did not open")
+            status, bad = await _plymouth_confirm_panel(vpage, book=book, pg=pg)
+            if status == "mismatch":
+                raise RuntimeError(
+                    f"the detail panel shows a different instrument: {bad}")
+            if status == "ok":
+                notes.append(f"{label}: {bad}")
+            if status == "unreadable":
+                notes.append(
+                    f"WARNING: {label}: the detail panel's Doc #/Book/Page "
+                    "header could not be read, so the instrument was NOT "
+                    "confirmed before its images were opened — check the "
+                    "saved pages against the recording stamp.")
+            out["detail"] = await _read_detail_panel(vpage)
             link = await vpage.query_selector('a[href*="TabController1$ImageViewertabitem"]')
-            if link:
-                await link.click()
-                await vpage.wait_for_timeout(1500)
+            if not link:
+                errors.append(
+                    f"{label}: Bk {book}/Pg {pg} has no image tab — the "
+                    "image is not available online. Nothing was saved.")
+                return out
+            await link.click()
+            await vpage.wait_for_timeout(1500)
             await vpage.goto(PLYMOUTH_VIEWER, wait_until="domcontentloaded", timeout=30000)
             await vpage.wait_for_selector("#ImageViewer1_docImage", timeout=20000)
-            await vpage.wait_for_timeout(1500)
+            if not await _plymouth_wait_viewer_image(vpage, timeout_ms=20000):
+                errors.append(
+                    f"{label}: the viewer never rendered an image for Bk "
+                    f"{book}/Pg {pg} — the image is not available online. "
+                    "Nothing was saved.")
+                return out
             total = await _parse_page_count(vpage)
             for n in range(1, total + 1):
                 if n > 1:
-                    before = await vpage.evaluate(
-                        "() => document.querySelector('#ImageViewer1_docImage').src")
+                    before = await vpage.evaluate(_VIEWER_IMG_SRC_JS)
                     await vpage.click("#ImageViewer1_BtnNext")
-                    for _ in range(40):
-                        await vpage.wait_for_timeout(250)
-                        now = await vpage.evaluate(
-                            "() => document.querySelector('#ImageViewer1_docImage').src")
-                        if now != before:
-                            break
-                    await vpage.wait_for_timeout(700)
+                    if not await _plymouth_wait_viewer_image(
+                            vpage, timeout_ms=15000, previous_src=before):
+                        errors.append(
+                            f"{label}: page {n} never rendered (the viewer "
+                            f"stayed on page {n - 1}); not saved.")
+                        break
                 path = output_folder / f"{base_name} - {label}_p{n}.jpg"
                 method = await _download_viewer_image(vpage, path)
                 if method == "failed":
@@ -2503,6 +2862,23 @@ async def _plymouth_open_and_download_instrument(
                 else:
                     out["files"].append(str(path))
                     notes.append(f"{label}: page {n} saved ({method}): {path.name}")
+            if other_hashes and any(
+                    _file_md5(f) in other_hashes for f in out["files"]):
+                for f in out["files"]:
+                    try:
+                        Path(f).unlink()
+                    except Exception:
+                        pass
+                out["files"] = []
+                notes[:] = [x for x in notes
+                            if not x.startswith(f"{label}: page ")]
+                errors.append(
+                    f"{label}: the viewer served a page that is BYTE-IDENTICAL "
+                    f"to a page of the vesting deed instead of Bk {book}/Pg "
+                    f"{pg} — the requested image is not available online and "
+                    "the viewer showed another document. The files were "
+                    "deleted; nothing was verified.")
+                return out
             out["ok"] = bool(out["files"]) and len(out["files"]) == total
             return out
         except Exception as e:
@@ -2515,8 +2891,7 @@ async def _plymouth_open_and_download_instrument(
         finally:
             try:
                 await vpage.close()
-                if ctx is not context:
-                    await ctx.close()
+                await ctx.close()
             except Exception:
                 pass
     return out
@@ -3441,7 +3816,17 @@ def _town_matches_filter(tf: str, t: str) -> bool:
     3. Reverse lookup (abbreviation passed as tf, full name in grid) — safety net.
 
     Both `tf` and `t` must already be uppercased by the caller.
+
+    v3.61 (item 70) — when BOTH sides name a Plymouth County town exactly
+    (a full name or a grid code), they are compared as towns and the
+    substring test is not reached. The substring test alone read the grid
+    code 'BRI' (Bridgewater) as a match for EAST BRIDGEWATER and WEST
+    BRIDGEWATER, because 'BRI' is a substring of both names.
     """
+    tf_town = _plymouth_town_of(tf)
+    t_town = _plymouth_town_of(t)
+    if tf_town and t_town:
+        return tf_town == t_town
     if tf in t or t in tf:
         return True
     abbrev = _PLYMOUTH_TOWN_ABBREVS.get(tf)
@@ -5467,6 +5852,40 @@ async def run_plymouth(
             _tm.mark("STEP 3 - detail panel")
             panel_opened = await _open_detail_panel(page, ctl=row["ctl"], expected_book=row["book"])
             if panel_opened:
+                # v3.61 (item 70) — the panel must name the SELECTED
+                # instrument before its parties are read or its images
+                # opened. A row clicked by a stale ctl opens another
+                # instrument's panel, and the viewer that follows carries
+                # no Book/Page of its own to catch it.
+                _want = dict(book=row.get("book"), pg=row.get("page"),
+                             doc=row.get("doc_number"))
+                _pstat, _pbad = await _plymouth_confirm_panel(page, **_want)
+                if _pstat == "mismatch":
+                    _ctl2 = await _plymouth_ensure_row_visible(
+                        page, row, _replay_search)
+                    if _ctl2 and await _open_detail_panel(
+                            page, ctl=_ctl2, expected_book=row["book"]):
+                        row["ctl"] = _ctl2
+                        _pstat, _pbad = await _plymouth_confirm_panel(
+                            page, **_want)
+                if _pstat == "mismatch":
+                    result["errors"].append(
+                        f"The detail panel opened for a DIFFERENT instrument "
+                        f"than the one selected (Bk {row.get('book')}/Pg "
+                        f"{row.get('page')}, Doc# {row.get('doc_number')}): "
+                        f"panel shows {_pbad}. No images were downloaded — "
+                        "they would have been another document's. Re-run; if "
+                        "it repeats, pin the deed with --book/--page.")
+                    await browser.close()
+                    return result
+                if _pstat == "ok":
+                    result["notes"].append(_pbad)
+                if _pstat == "unreadable":
+                    result["notes"].append(
+                        "WARNING: the detail panel's Doc #/Book/Page header "
+                        "could not be read, so the instrument was NOT "
+                        "confirmed before its images were opened — rely on "
+                        "the recording-stamp check below.")
                 detail = await _read_detail_panel(page)
                 result["grantors"]     = detail["grantors"]
                 result["grantees"]     = detail["grantees"]
@@ -5546,9 +5965,17 @@ async def run_plymouth(
             await page.goto(PLYMOUTH_VIEWER, wait_until="domcontentloaded", timeout=30000)
             try:
                 await page.wait_for_selector("#ImageViewer1_docImage", timeout=20000)
-                await page.wait_for_timeout(1500)  # let image fully render
             except Exception:
                 result["errors"].append("Image viewer did not load #ImageViewer1_docImage.")
+                await browser.close()
+                return result
+            # v3.61 (item 70) — wait for the rendered page itself (the <img>
+            # holds a loading.gif placeholder first), not a fixed 1.5 s.
+            if not await _plymouth_wait_viewer_image(page, timeout_ms=20000):
+                result["errors"].append(
+                    "The image viewer never rendered a page image (it stayed "
+                    "on its loading placeholder) — the image may not be "
+                    "available online. Nothing was saved.")
                 await browser.close()
                 return result
 
@@ -5556,11 +5983,20 @@ async def run_plymouth(
             result["total_pages_in_viewer"] = total_pages
 
             # All pages — loop from 1 through total_pages
+            _page_hashes: dict = {}
             for page_num in range(1, total_pages + 1):
                 if page_num > 1:
                     try:
+                        _prev_src = await page.evaluate(_VIEWER_IMG_SRC_JS)
                         await page.click("#ImageViewer1_BtnNext")
-                        await page.wait_for_timeout(2000)
+                        # v3.61 — wait for the NEXT page's render; a fixed
+                        # 2 s could save the previous page a second time.
+                        if not await _plymouth_wait_viewer_image(
+                                page, timeout_ms=15000, previous_src=_prev_src):
+                            result["errors"].append(
+                                f"Page {page_num} never rendered (the viewer "
+                                f"stayed on page {page_num - 1}); not saved.")
+                            break
                     except Exception as e:
                         result["notes"].append(f"Page {page_num} navigation error (stopping): {e}")
                         break
@@ -5569,6 +6005,16 @@ async def run_plymouth(
                 if method != "failed":
                     result["files"].append(str(p_path))
                     result["notes"].append(f"Page {page_num} saved ({method}): {p_path.name}")
+                    _h = _file_md5(p_path)
+                    if _h and _h in _page_hashes:
+                        result["notes"].append(
+                            f"WARNING: page {page_num} is BYTE-IDENTICAL to "
+                            f"page {_page_hashes[_h]} — the registry served "
+                            "the same image twice. A page of this instrument "
+                            "may be missing from the saved set; compare the "
+                            "page count in the registry viewer.")
+                    elif _h:
+                        _page_hashes[_h] = page_num
                 else:
                     result["errors"].append(f"Page {page_num} download failed.")
 
@@ -5795,7 +6241,8 @@ async def run_plymouth(
                 label = f"grantor_hit_Bk{vb}_Pg{vp}"
                 fetched = await _plymouth_open_and_download_instrument(
                     context, vb, vp, base_name, label, output_folder,
-                    result["notes"], result["errors"])
+                    result["notes"], result["errors"],
+                    other_files=list(result["files"]))
                 det = fetched.get("detail") or {}
                 result["grantor_hit_verification"] = {
                     "status": ("downloaded" if fetched["ok"]
@@ -6100,7 +6547,8 @@ async def _msouth_download_viewer_image(page: Page, output_path: Path) -> str:
             resp = await page.request.get(hi)
             if resp.ok:
                 body = await resp.body()
-                if len(body) > 5000:  # sanity: not an error page / placeholder
+                # v3.61 (item 70) — not a placeholder / error page
+                if not _page_image_problem(body):
                     output_path.write_bytes(body)
                     return "hires_src_download"
         except Exception:
@@ -6109,8 +6557,10 @@ async def _msouth_download_viewer_image(page: Page, output_path: Path) -> str:
         try:
             resp = await page.request.get(src)
             if resp.ok:
-                output_path.write_bytes(await resp.body())
-                return "src_download"
+                body = await resp.body()
+                if not _page_image_problem(body):
+                    output_path.write_bytes(body)
+                    return "src_download"
         except Exception:
             pass
     img_el = await page.query_selector("#ImageViewer1_docImage")
@@ -6331,6 +6781,11 @@ async def run_middlesex_south(
             panel_opened = await _open_detail_panel(page, ctl=row["ctl"], expected_book=row["book"])
             detail_pages = ""
             if panel_opened:
+                # v3.61 (item 70) — confirm the panel is the selected row's.
+                if not await _avenu_panel_guard(
+                        page, result, book=row["book"], pg=row["page"]):
+                    await browser.close()
+                    return result
                 parties = await _read_detail_panel(page)   # parties + references
                 msouth  = await _msouth_read_detail(page)  # header table
                 result["grantors"]        = parties["grantors"]
@@ -7904,6 +8359,15 @@ async def run_suffolk(
                     expected_book="" if is_lc else (row["book"] or ""),
                     anchor_col=panel_anchor)
                 if panel_opened:
+                    # v3.61 (item 70) — confirm the panel is the selected
+                    # row's: Book/Page on Recorded Land, Doc # on Land Court.
+                    if not await _avenu_panel_guard(
+                            page, result,
+                            book="" if is_lc else (row.get("book") or ""),
+                            pg="" if is_lc else (row.get("page") or ""),
+                            doc=(row.get("doc_number") or "") if is_lc else ""):
+                        await browser.close()
+                        return result
                     parties = await _read_detail_panel(page)   # parties + references
                     det = await _suffolk_read_detail(page)     # header + blocks
                     result["grantors"] = parties["grantors"]
